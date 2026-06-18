@@ -1,0 +1,148 @@
+# Portfolio Watch Flow Lite
+
+## What this playbook shows
+
+This playbook is an interactive flowchart for a portfolio watch automation. It
+uses the agreed high-level pipeline as the node structure, and now includes the
+first implemented automation details inside each node panel.
+
+The target workflow is a low-noise portfolio analyst for discretionary
+investors who want help monitoring their real portfolio, the events that may
+affect it, and the attribution behind material moves. It separates:
+
+- portfolio state
+- exposure context
+- event-first portfolio impact analysis
+- holding-first anomaly attribution
+- final LLM alert decision
+- notification and learning state
+
+## Data and refresh
+
+The public playbook page is a design guide and implementation reference. It
+does not directly render any private portfolio feed.
+
+In a deployed Alva account, the implemented automation is a private feed:
+
+- Feed: configurable, default `portfolio-watch-automation`
+- Feed id: assigned by Alva after creation
+- Connected account: supplied through `env.args.accountId` or `env.args.connectedAccountId`
+- Cronjob: assigned by Alva after scheduling
+- Schedule: hourly, `0 * * * *`
+- Push behavior: quiet runs write `<|SKIP_NOTIFICATION|>`; visible alerts are
+  sent only when the decision layer selects material, non-repeated findings.
+
+The feed persists portfolio snapshots, position rows, raw event records,
+event candidates, qualified/selected events, computed anomalies, anomaly
+attributions, alert decisions, and a `notify/message` push sidecar.
+
+Current production price / portfolio basis:
+
+- Broker snapshot is used for quantities, cash, account state, and raw audit
+  values.
+- The broker snapshot is read by deterministic code through the read-only
+  Alva connected-account portfolio API; portfolio ingest does not use Alva Ask.
+- Holdings are marked to latest 1min extended-hours price when coverage exists, so
+  anomaly gates, portfolio move contribution context, weights, and NAV use the
+  current watch basis rather than stale broker close marks.
+- Option holdings keep the option contract as the held `symbol`, but price /
+  volume anomaly and per-ticker event search use the underlying equity as
+  `marketDataSymbol`. The option contract is not valued from the underlying
+  stock price.
+- `oneDayPct` / `currentMovePct` use the latest 1min extended-hours basis described by
+  `oneDayBasis`; `lastClosedOneDayPct` is kept only as completed daily-bar
+  context.
+- Asset anomaly checks use one attribution lane per asset. Any price or volume
+  trigger opens one asset-level attribution task; the system does not create
+  separate price and volume attributions for the same asset. Anomalies are
+  worth reporting even when attribution is weak; weak or guessed attribution
+  must be labeled clearly instead of being presented as certainty.
+- Volume anomaly checks use hourly cumulative volume rather than daily bars or
+  single-hour spikes: US-listed equities/ETFs and options on US equities use
+  regular-session cumulative volume up to the latest regular-session hourly
+  bar, capped at the 16:00 ET market close after hours. Direct crypto assets
+  use UTC-day cumulative volume.
+- Portfolio valuation uses connected-account quantity and cash, then computes
+  current value from Arrays latest 1min price when available. Broker current price,
+  market value, cost basis, realized P&L, and unrealized P&L are not used or
+  persisted in the current automation version.
+- Macro context is fetched once per run with `sourceDate`, `sourceAgeHours`,
+  and `fetchedAtHkt`; date-level macro endpoints are used as attribution
+  context, not as proof of intraday freshness.
+- Pi event search has two lanes. Market-breaking discovery starts from code-ranked
+  Arrays indexed X top-engagement tweets over the latest 90-minute window, not
+  portfolio-holdings queries and not Grok text search. Pi judges whether supplied
+  hot tweets are investment-related breaking-news anchors; Brave expands/confirms
+  source links only for qualifying X anchors. Theme / industry source coverage
+  now also starts inside the Pi agent: Alva Ask first extracts current holding
+  themes from the latest portfolio each run, code supplies current holdings,
+  current theme context, supported Arrays market-news topics, source-text-aware
+  tools, indexed X discovery context, and budgets. Pi maps each theme to supported topics or
+  `no_supported_topic`, calls `searchArraysMarketNewsTopic` inside the agent
+  loop when useful, and returns holding-linked events with `related_holdings[]`
+  or portfolio-level macro/policy/risk events with `risk_factors` and
+  `portfolio_relevance_basis`. Source-returned tickers are context only, not
+  automatic mappings. Pi may still run supplemental Brave theme_news searches
+  when useful.
+- Mark-to-market movement is explicitly not treated as a user trade and is
+  context only unless the asset also has a current anomaly trigger.
+- `cashChangeUsd` is tracked separately from cash percentage drift, so
+  price-driven NAV denominator moves do not masquerade as cash actions.
+- Pure denominator weight drift is not emitted as a per-position change unless
+  the holding's own quantity or market value moved materially.
+- Theme exposure is supplied as context to the analyst. Theme allocation
+  changes do not create standalone candidates; event exposure impact is
+  estimated inside the Alva Ask analyst finding.
+- `prior_alert_history` sent to the analyst is a past-7-day user-visible run
+  timeline. Empty runs only show the run time and `userReceivedPush=false`;
+  pushed runs carry the user-facing notification message and selected IDs.
+  Suppressed/no-push reasoning stays in audit history and is not used as prior
+  alert history.
+- Broker snapshot staleness is surfaced as a coverage warning when the
+  connected-account `asOfMs` is older than 12h.
+- Snapshot / price-signal schema changes create a quiet migration baseline so
+  the automation does not push a false delta after code changes.
+
+## Validation expectations
+
+Before adapting this template for a new account, the Alva Skill Agent should do
+a dry run against the user's connected portfolio, then inspect `audit.run_log`,
+`analysis.decision`, and `notify.message`. A successful quiet run should persist
+portfolio state, raw events, event candidates, final statuses, and the skip
+sentinel without exposing broker cost basis or P&L.
+
+## Blind spots
+
+This is the first production version. Current blind spots:
+
+- Option greeks / IV and option-contract valuation are not wired yet. Option
+  holdings use their underlying equity for price/volume anomaly and per-ticker
+  event search, but the option contract itself remains unpriced until an
+  option-specific valuation source is added.
+- ETF look-through exposure is not yet wired.
+- Per-asset X search is no longer part of the deterministic source loop. Market-wide X discovery happens through code calling `/api/v1/social-feeds/x/search` without `q`, paging backward through the latest 90-minute indexed window up to 5 pages of 200 original/quote posts, ranking unique rows by engagement, and passing up to 25 top rows into the Pi event-search loop. Pi does not plan/refine Grok or text-search queries. For indexed-X breaking-news rows, Pi should first try to attach `source_event_time` from the original / official source; if that is unavailable, it can use the earliest credible media/source link. Source-expansion Brave lookup uses `result_filter="web"` and is not constrained to the recent event window.
+- Broad macro/theme/topic events are represented once with `affectedSymbols[]`,
+  `affectedThemes[]`, and optional `riskFactors`. For Pi events, affected
+  symbols come only from Pi-returned `related_holdings[]`, not code-side
+  ticker/theme matching; however, an event is no longer dropped merely because
+  `related_holdings[]` is empty when it has a credible portfolio-level
+  macro/policy/risk relevance basis.
+- Crypto-specific derivatives/on-chain attribution is not yet wired generically.
+  Direct crypto assets and crypto-related equities can still be monitored through
+  price, volume, market news, and theme/event attribution.
+- Hourly cumulative-volume profiles currently depend on available hourly kline
+  coverage; if an asset lacks enough same-point historical samples, volume
+  fields are persisted as null rather than estimated.
+- Broad macro/policy/risk events can now become portfolio-level candidates
+  even when no exact holding symbol is present, as long as Pi supplies
+  risk-factor context and a portfolio relevance basis.
+- Sector / theme mapping is now extracted every run by Alva Ask from the latest
+  portfolio snapshot. If that call fails or returns incomplete JSON, the
+  automation records a warning and uses prior/fallback themes only for
+  continuity.
+- Source records without source timestamps can still reach analyst review if
+  they are non-duplicate. The analyst must
+  use source time labels, fetch time, first/last seen time, and dedupe status
+  conservatively instead of overstating freshness.
+- The public design guide intentionally does not expose private portfolio
+  feed data.

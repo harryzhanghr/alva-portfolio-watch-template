@@ -1,0 +1,4433 @@
+// @ts-nocheck
+const http = require("net/http");
+const secret = require("secret-manager");
+const { ask } = require("@alva/alvaask");
+const { Feed, feedPath, makeDoc, str, num } = require("@alva/feed");
+const env = require("env");
+
+const ARGS = (env && env.args) || {};
+const FEED_NAME = ARGS.feedName || "portfolio-watch-automation";
+const ACCOUNT_ID = ARGS.accountId || ARGS.connectedAccountId || "";
+const OWNER_USERNAME = ARGS.ownerUsername || ARGS.username || "";
+const RUN_SOURCE = ARGS.runSource || "manual_or_unspecified";
+const ALVA_API_BASE = ARGS.alvaApiBase || "https://api-llm.prd.alva.ai";
+const ARRAYS_BASE = "https://data-tools.prd.space.id";
+const SKIP = "<|SKIP_NOTIFICATION|>";
+
+const CONFIG = {
+  timezone: "Asia/Hong_Kong",
+  snapshotMarkVersion: "arrays_current_value_v2_latest_1min",
+  priceSignalVersion: "asset_anomaly_v5_latest_1min_z2_no_5d_trigger",
+  volumeSignalVersion: "hourly_cumulative_volume_v3_us_equity_rth",
+  themeExtractionVersion: "portfolio_theme_extraction_v1_alva_ask",
+  latestPriceInterval: "1min",
+  latestPriceLookbackHours: 36,
+  latestPriceLimit: 2400,
+  breakingNewsEnabled: true,
+  maxBreakingNewsRecords: 8,
+  maxBreakingNewsBraveCalls: 2,
+  indexedXLookbackMinutes: 90,
+  maxIndexedXTweetsFetch: 200,
+  maxIndexedXTweetFetchPages: 5,
+  maxIndexedXTweetsForPi: 25,
+  maxTopicNewsToolCalls: 16,
+  maxTopicNewsRowsPerTopic: 50,
+  maxThemeNewsRowsPerQuery: 5,
+  maxThemeNewsSearchAttemptsPerTheme: 2,
+  portfolioSnapshotStaleWarningHours: 12,
+  eventOverlapMinutes: 30,
+  defaultWindowMinutes: 90,
+  firstRunWindowHours: 24,
+  earningsCandidateLookaheadDays: 10,
+  maxPromptEvents: 100,
+  maxPromptCandidates: 50,
+  maxAnalystPromptChars: 1000000,
+  maxPiPromptContextChars: 1000000,
+  priorAlertTimelineDays: 7,
+  maxPriorAlertTimelineRows: 200,
+  maxAlertHistoryRows: 240,
+  eventSourceLimits: {
+    marketNewsFetch: 50,
+    priceTargetFetch: 50,
+  },
+  materiality: {
+    quantityEpsilon: 0.00001,
+    positionMvMovePct: 0.03,
+    positionMvMoveUsd: 25000,
+    allocationMovePts: 0.015,
+    portfolioValueMovePct: 0.015,
+    portfolioValueMoveUsd: 50000,
+    cashMoveUsd: 25000,
+    cashMovePts: 0.03,
+    priceOneDayPct: 5,
+    priceZScore: 2,
+    cumulativeVolumeMultiple: 2,
+    volumeMinBaselineSamples: 3,
+    volumeLookbackSamples: 24,
+    minAllocationForEvent: 0.02,
+    minAllocationForNews: 0.03,
+    portfolioMoveContributionPts: 0.0025,
+    themeExposureHigh: 0.35,
+    themeExposureChangePts: 0.02,
+  },
+  fallbackThemeMap: ARGS.fallbackThemeMap || {},
+  aliases: ARGS.aliases || {},
+};
+
+const SUPPORTED_MARKET_NEWS_TOPICS = [
+  "BLOCKCHAIN",
+  "EARNINGS",
+  "ECONOMY_FISCAL",
+  "ECONOMY_MACRO",
+  "ECONOMY_MONETARY",
+  "ENERGY_TRANSPORTATION",
+  "FINANCE",
+  "FINANCIAL_MARKETS",
+  "IPO",
+  "LIFE_SCIENCES",
+  "MANUFACTURING",
+  "MERGERS_AND_ACQUISITIONS",
+  "REAL_ESTATE",
+  "RETAIL_WHOLESALE",
+  "TECHNOLOGY",
+];
+
+const feed = new Feed({
+  path: feedPath(FEED_NAME),
+  name: "Portfolio Watch Automation",
+  description:
+    "Hourly connected-portfolio analyst that persists portfolio state, event records, event/anomaly assessments, and quiet-run notification decisions.",
+});
+
+feed.def("portfolio", {
+  snapshot: makeDoc("Portfolio Snapshot", "Run-level normalized portfolio state, deltas, and exposure context", [
+    str("accountId"),
+    num("totalValue"),
+    num("cash"),
+    num("cashAllocation"),
+    num("holdingCount"),
+    str("topHoldings"),
+    str("portfolioDeltaJson"),
+    str("themeExposureJson"),
+    str("coverageWarningsJson"),
+    str("rawJson"),
+    num("asOfMs"),
+    num("runAtMs"),
+  ]),
+  positions: makeDoc("Portfolio Positions", "Per-position normalized state for the current run", [
+    str("accountId"),
+    str("instrumentId"),
+    str("symbol"),
+    str("assetClass"),
+    str("side"),
+    num("quantity"),
+    num("currentPrice"),
+    num("marketValue"),
+    num("weight"),
+    str("currency"),
+    str("instrumentDetailsJson"),
+    str("themesJson"),
+    num("runAtMs"),
+  ]),
+});
+
+feed.def("event", {
+  items: makeDoc("Event Items", "Normalized source records used by the automation", [
+    str("eventKey"),
+    str("sourceType"),
+    str("symbol"),
+    str("title"),
+    str("summary"),
+    str("url"),
+    str("source"),
+    str("dedupeStatus"),
+    str("metadataJson"),
+    num("publishedAtMs"),
+    num("firstSeenAtMs"),
+    num("lastSeenAtMs"),
+    num("runAtMs"),
+  ]),
+});
+
+feed.def("finding", {
+  records: makeDoc("Analyst Assessments", "Event-impact assessments and anomaly attributions with selected/suppressed outcomes", [
+    str("findingId"),
+    str("findingType"),
+    str("primaryAsset"),
+    str("summary"),
+    str("dedupeKey"),
+    str("selected"),
+    str("suppressionReason"),
+    str("payloadJson"),
+    num("runAtMs"),
+  ]),
+});
+
+feed.def("analysis", {
+  decision: makeDoc("Alert Decision", "Final low-noise notification decision and run context", [
+    str("accountId"),
+    str("runSource"),
+    str("alertDecision"),
+    str("urgency"),
+    str("reason"),
+    str("skipReason"),
+    str("notificationMessage"),
+    str("selectedFindingIdsJson"),
+    str("suppressedFindingIdsJson"),
+    str("messageSectionsJson"),
+    str("currentPortfolioDeltaJson"),
+    str("priorAlertHistoryJson"),
+    str("rawEventsJson"),
+    str("eventCandidatesJson"),
+    str("qualifiedEventsJson"),
+    str("selectedEventsJson"),
+    str("anomaliesJson"),
+    str("anomalyAttributionsJson"),
+    str("finalStatusesJson"),
+    str("searchExpansionTraceJson"),
+    str("candidateSummaryJson"),
+    str("candidateAuditJson"),
+    str("anomalySignalsJson"),
+    str("rawAnalystJson"),
+    num("runAtMs"),
+  ]),
+});
+
+feed.def("notify", {
+  message: makeDoc("Notification Message", "Push sidecar; quiet runs emit the skip sentinel", [
+    str("title"),
+    str("body"),
+  ]),
+});
+
+feed.def("audit", {
+  run_log: makeDoc("Run Audit Log", "One row per automation run with replayable step-by-step processing details", [
+    str("accountId"),
+    str("runSource"),
+    str("status"),
+    str("alertDecision"),
+    str("shouldPush"),
+    str("skipReason"),
+    str("stepLogJson"),
+    str("dataFetchSummaryJson"),
+    str("llmDecisionJson"),
+    str("outputSummaryJson"),
+    str("persistSummaryJson"),
+    str("rawEventsJson"),
+    str("eventCandidatesJson"),
+    str("qualifiedEventsJson"),
+    str("selectedEventsJson"),
+    str("anomaliesJson"),
+    str("anomalyAttributionsJson"),
+    str("finalStatusesJson"),
+    str("searchExpansionTraceJson"),
+    str("candidateAuditJson"),
+    str("anomalySignalsJson"),
+    str("notificationPreview"),
+    str("warningsJson"),
+    num("runStartedAtMs"),
+    num("runCompletedAtMs"),
+    num("durationMs"),
+    num("runAtMs"),
+  ]),
+  persist_delta: makeDoc("Persist Delta", "Per-run append/update summary for each persisted feed output or KV state key", [
+    str("accountId"),
+    str("runSource"),
+    str("fileKey"),
+    str("fileLabel"),
+    str("storageType"),
+    str("operation"),
+    num("recordsAdded"),
+    str("deltaSummary"),
+    str("deltaJson"),
+    str("latestPointerJson"),
+    num("runAtMs"),
+  ]),
+});
+
+function amount(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "object" && typeof value.amount === "number") return value.amount;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function clean(value, maxLen) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!maxLen || text.length <= maxLen) return text;
+  return text.slice(0, maxLen - 1).trim() + "...";
+}
+
+function round(value, digits) {
+  if (!Number.isFinite(value)) return null;
+  const m = Math.pow(10, digits);
+  return Math.round(value * m) / m;
+}
+
+function fmtPct(value) {
+  if (!Number.isFinite(value)) return "n/a";
+  return (value * 100).toFixed(1) + "%";
+}
+
+function fmtMove(value) {
+  if (!Number.isFinite(value)) return "n/a";
+  return (value >= 0 ? "+" : "") + value.toFixed(1) + "%";
+}
+
+function fmtMoney(value) {
+  if (!Number.isFinite(value)) return "n/a";
+  const sign = value < 0 ? "-" : "";
+  const abs = Math.abs(value);
+  if (abs >= 1e6) return sign + "$" + (abs / 1e6).toFixed(2) + "m";
+  if (abs >= 1e3) return sign + "$" + Math.round(abs / 1e3) + "k";
+  return sign + "$" + abs.toFixed(0);
+}
+
+function hkt(ms) {
+  if (!Number.isFinite(ms)) return "n/a";
+  const d = new Date(ms + 8 * 60 * 60 * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    d.getUTCFullYear() + "-" +
+    pad(d.getUTCMonth() + 1) + "-" +
+    pad(d.getUTCDate()) + " " +
+    pad(d.getUTCHours()) + ":" +
+    pad(d.getUTCMinutes()) + " HKT"
+  );
+}
+
+function sanitizeAlertTimelineRow(row) {
+  row = row || {};
+  const runAtMs = Number(row.runAtMs || row.date || row.timestamp || 0);
+  if (!Number.isFinite(runAtMs) || runAtMs <= 0) return null;
+  const explicitPush = row.userReceivedPush === true || row.user_received_push === true || row.alertDecision === "push";
+  const rawMessage = clean(row.notificationMessage || row.notification_message || row.messagePreview || row.message || "", 900);
+  const userReceivedPush = !!(explicitPush && rawMessage);
+  return {
+    runAtMs,
+    runAtHkt: row.runAtHkt || row.run_at_hkt || hkt(runAtMs),
+    userReceivedPush,
+    notificationMessage: userReceivedPush ? rawMessage : "",
+    selectedFindingIds: userReceivedPush ? uniqueCompactStrings(row.selectedFindingIds || row.selected_finding_ids || [], 140) : [],
+    selectedDedupeKeys: userReceivedPush ? uniqueCompactStrings(row.selectedDedupeKeys || row.selected_dedupe_keys || [], 180) : [],
+    tickers: userReceivedPush ? uniqueSymbols(row.tickers || row.symbols || row.assets || []) : [],
+    summary: userReceivedPush ? clean(row.summary || row.reason || "", 300) : "",
+  };
+}
+
+function sanitizeAlertTimeline(history, runAtMs) {
+  const cutoffMs = runAtMs - (CONFIG.priorAlertTimelineDays + 1) * 24 * 60 * 60 * 1000;
+  const rows = (history || [])
+    .map(sanitizeAlertTimelineRow)
+    .filter((row) => row && row.runAtMs >= cutoffMs && row.runAtMs <= runAtMs + 5 * 60 * 1000)
+    .sort((a, b) => a.runAtMs - b.runAtMs);
+  return rows.slice(-CONFIG.maxAlertHistoryRows);
+}
+
+function priorAlertTimelineForAnalyst(history, runAtMs) {
+  const cutoffMs = runAtMs - CONFIG.priorAlertTimelineDays * 24 * 60 * 60 * 1000;
+  return sanitizeAlertTimeline(history, runAtMs)
+    .filter((row) => row.runAtMs >= cutoffMs && row.runAtMs < runAtMs)
+    .slice(-CONFIG.maxPriorAlertTimelineRows)
+    .map((row) => ({
+      runAtMs: row.runAtMs,
+      runAtHkt: row.runAtHkt,
+      userReceivedPush: row.userReceivedPush,
+      notificationMessage: row.userReceivedPush ? row.notificationMessage : "",
+      selectedFindingIds: row.userReceivedPush ? row.selectedFindingIds : [],
+      selectedDedupeKeys: row.userReceivedPush ? row.selectedDedupeKeys : [],
+      tickers: row.userReceivedPush ? row.tickers : [],
+      summary: row.userReceivedPush ? row.summary : "",
+    }));
+}
+
+function compactJson(value, maxLen) {
+  let text = "{}";
+  try {
+    text = JSON.stringify(value);
+  } catch (_) {
+    text = "{}";
+  }
+  if (!maxLen || text.length <= maxLen) return text;
+  const truncationNote = {
+    truncated: true,
+    originalType: Array.isArray(value) ? "array" : typeof value,
+  };
+  if (Array.isArray(value)) {
+    const kept = [];
+    for (const item of value) {
+      const marker = {
+        ...truncationNote,
+        originalCount: value.length,
+        omittedCount: Math.max(0, value.length - kept.length - 1),
+      };
+      const candidate = JSON.stringify([...kept, item, marker]);
+      if (candidate.length > maxLen) break;
+      kept.push(item);
+    }
+    const marker = {
+      ...truncationNote,
+      originalCount: value.length,
+      omittedCount: Math.max(0, value.length - kept.length),
+    };
+    let result = JSON.stringify([...kept, marker]);
+    while (result.length > maxLen && kept.length > 0) {
+      kept.pop();
+      marker.omittedCount = Math.max(0, value.length - kept.length);
+      result = JSON.stringify([...kept, marker]);
+    }
+    if (result.length <= maxLen) return result;
+    const markerOnly = JSON.stringify([marker]);
+    return markerOnly.length <= maxLen ? markerOnly : "[]";
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value);
+    const out = {
+      _truncated: true,
+      _originalKeyCount: entries.length,
+      _omittedKeyCount: entries.length,
+    };
+    for (const [key, val] of entries) {
+      const candidate = { ...out, [key]: val };
+      candidate._omittedKeyCount = Math.max(0, entries.length - Object.keys(candidate).length + 3);
+      const candidateText = JSON.stringify(candidate);
+      if (candidateText.length > maxLen) break;
+      Object.assign(out, candidate);
+    }
+    const result = JSON.stringify(out);
+    return result.length <= maxLen ? result : "{}";
+  }
+  return text;
+}
+
+function safeParseJson(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch (_) {}
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced && fenced[1]) {
+    try {
+      return JSON.parse(fenced[1].trim());
+    } catch (_) {}
+  }
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(raw.slice(start, end + 1));
+    } catch (_) {}
+  }
+  return null;
+}
+
+function compactAnomalySignalForAudit(signal) {
+  const row = signal || {};
+  return {
+    symbol: row.symbol || "",
+    marketDataSymbol: row.marketDataSymbol || row.symbol || "",
+    underlyingSymbol: row.underlyingSymbol || "",
+    marketDataBasis: row.marketDataBasis || "",
+    triggerKinds: row.triggerKinds || [],
+    reasons: row.reasons || [],
+    oneDayPct: round(row.oneDayPct, 2),
+    fiveDayPct: round(row.fiveDayPct, 2),
+    currentMovePct: round(row.currentMovePct, 2),
+    intradayPct: round(row.intradayPct, 2),
+    zScore: round(row.zScore, 2),
+    latestPrice: round(row.latestPrice || row.close, 4),
+    latestPriceAsOfHkt: row.latestPriceAsOfHkt || row.latestDateHkt || row.liveAsOfHkt || "",
+    latestPriceSource: row.latestPriceSource || "",
+    latestPriceInterval: row.latestPriceInterval || "",
+    oneDayBasis: row.oneDayBasis || "",
+    lastCompletedClose: round(row.lastCompletedClose, 4),
+    lastCompletedCloseHkt: row.lastCompletedCloseHkt || "",
+    cumulativeVolumeMultiple: round(row.cumulativeVolumeMultiple || row.sessionCumulativeRvol || row.volumeMultiple, 2),
+    currentCumulativeVolume: row.currentCumulativeVolume || row.sessionCumulativeVolume || null,
+    cumulativeVolumeMedian: row.cumulativeVolumeMedian || row.sessionCumulativeMedian || null,
+    volumeBasis: row.volumeBasis || "",
+    volumeInterval: row.volumeInterval || "",
+    volumeAvailable: row.volumeAvailable,
+    portfolioMoveContribution: round(row.portfolioMoveContribution, 5),
+  };
+}
+
+function sourceOriginForType(sourceType) {
+  const type = String(sourceType || "").toLowerCase();
+  if (type === "news" || type === "analyst" || type === "corporate_event" || type === "x_post") return "per_ticker_search";
+  if (type === "breaking_news") return "pi_market_breaking_search";
+  if (type === "theme_news") return "pi_theme_search";
+  if (type === "topic_news") return "arrays_topic_news";
+  if (type === "asset_anomaly") return "asset_anomaly_signal";
+  return "unknown";
+}
+
+function sourceOriginLabel(sourceOrigin) {
+  const origin = String(sourceOrigin || "").toLowerCase();
+  if (origin === "per_ticker_search") return "Per-ticker source loop";
+  if (origin === "pi_market_breaking_search") return "Pi market-breaking search";
+  if (origin === "pi_theme_search") return "Pi theme search";
+  if (origin === "arrays_topic_news") return "Arrays topic news";
+  if (origin === "asset_anomaly_signal") return "Asset anomaly signal";
+  return "Unknown source";
+}
+
+function sourceOriginFromEvent(item) {
+  const metadata = item && item.metadata ? item.metadata : {};
+  return metadata.sourceOrigin || sourceOriginForType(item && item.sourceType);
+}
+
+function uniqueCompactStrings(values, maxLen) {
+  const seen = {};
+  const out = [];
+  (values || []).forEach((value) => {
+    const text = clean(value, maxLen || 160);
+    if (!text) return;
+    const key = text.toLowerCase();
+    if (seen[key]) return;
+    seen[key] = true;
+    out.push(text);
+  });
+  return out;
+}
+
+function uniqueSymbols(values) {
+  const seen = {};
+  const out = [];
+  (values || []).forEach((value) => {
+    const symbol = String(value || "").toUpperCase().trim();
+    if (!symbol || seen[symbol]) return;
+    seen[symbol] = true;
+    out.push(symbol);
+  });
+  return out;
+}
+
+function rawAffectedSymbols(item) {
+  const metadata = item && item.metadata ? item.metadata : {};
+  const direct = []
+    .concat(item && Array.isArray(item.affectedSymbols) ? item.affectedSymbols : [])
+    .concat(Array.isArray(metadata.affectedSymbols) ? metadata.affectedSymbols : []);
+  if (direct.length) return uniqueSymbols(direct);
+  const symbol = String((item && item.symbol) || "").toUpperCase();
+  if (symbol && symbol !== "PORTFOLIO") return [symbol];
+  return [];
+}
+
+function rawAffectedThemes(item) {
+  const metadata = item && item.metadata ? item.metadata : {};
+  return uniqueCompactStrings(
+    []
+      .concat(item && Array.isArray(item.affectedThemes) ? item.affectedThemes : [])
+      .concat(Array.isArray(metadata.affectedThemes) ? metadata.affectedThemes : [])
+      .concat(Array.isArray(metadata.themes) ? metadata.themes : [])
+      .concat(Array.isArray(metadata.riskFactors) ? metadata.riskFactors : [])
+      .concat(metadata.matchedTheme ? [metadata.matchedTheme] : []),
+    80
+  ).map(normalizeThemeName).filter(Boolean);
+}
+
+function compactEventCandidateForAudit(candidate) {
+  const row = candidate || {};
+  const sourceOrigin = row.sourceOrigin || sourceOriginForType(row.candidateType);
+  return {
+    candidateId: row.candidateId || "",
+    lane: row.lane || "event_impact",
+    candidateType: row.candidateType || "",
+    symbol: row.symbol || row.primaryAsset || "",
+    title: clean(row.title || row.summary || "", 180),
+    summary: clean(row.summary || "", 360),
+    reason: clean(row.reason || "", 360),
+    eventRefs: row.eventRefs || [],
+    affectedSymbols: row.affectedSymbols || [],
+    affectedThemes: row.affectedThemes || [],
+    portfolioExposurePct: row.portfolioExposurePct == null ? null : round(row.portfolioExposurePct, 4),
+    portfolioExposureText: row.portfolioExposureText || "",
+    sourceLinks: row.sourceLinks || [],
+    mappingReason: clean(row.mappingReason || "", 360),
+    portfolioLevelEvent: !!row.portfolioLevelEvent,
+    riskFactors: row.riskFactors || [],
+    portfolioRelevanceBasis: clean(row.portfolioRelevanceBasis || "", 360),
+    sourceRelatedTickers: row.sourceRelatedTickers || [],
+    sourceOrigin,
+    sourceOriginLabel: row.sourceOriginLabel || sourceOriginLabel(sourceOrigin),
+    sourceLane: row.sourceLane || "",
+    sourceSearchMode: row.sourceSearchMode || "",
+    sourceTweetUrl: row.sourceTweetUrl || "",
+    sourceTweetRank: row.sourceTweetRank || null,
+    sourceTweetEngagementScore: row.sourceTweetEngagementScore || null,
+    source: row.source || "",
+    url: row.url || "",
+    dedupeStatus: row.dedupeStatus || "",
+    publishedAtMs: row.publishedAtMs || null,
+    sourceTimeLabel: row.sourceTimeLabel || "",
+    sourceEventTime: row.sourceEventTime === undefined ? "" : row.sourceEventTime,
+    sourceEventAtMs: row.sourceEventAtMs || null,
+    firstSeenAtMs: row.firstSeenAtMs || null,
+    lastSeenAtMs: row.lastSeenAtMs || null,
+  };
+}
+
+function compactEventCandidateForAnalyst(candidate) {
+  const row = candidate || {};
+  const sourceOrigin = row.sourceOrigin || sourceOriginForType(row.candidateType);
+  return {
+    candidateId: row.candidateId || "",
+    candidateType: row.candidateType || "",
+    symbol: row.symbol || row.primaryAsset || "",
+    title: clean(row.title || row.summary || "", 140),
+    summary: clean(row.summary || "", 220),
+    eventRefs: row.eventRefs || [],
+    affectedSymbols: row.affectedSymbols || [],
+    affectedThemes: row.affectedThemes || [],
+    portfolioExposurePct: row.portfolioExposurePct == null ? null : round(row.portfolioExposurePct, 4),
+    sourceOrigin,
+    dedupeStatus: row.dedupeStatus || "",
+    publishedAtMs: row.publishedAtMs || null,
+    sourceTimeLabel: row.sourceTimeLabel || "",
+    sourceEventTime: row.sourceEventTime === undefined ? "" : row.sourceEventTime,
+    firstSeenAtMs: row.firstSeenAtMs || null,
+    lastSeenAtMs: row.lastSeenAtMs || null,
+	    sourceLinks: (row.sourceLinks || (row.url ? [row.url] : [])).slice(0, 2),
+	    mappingReason: clean(row.mappingReason || row.reason || "", 180),
+	    portfolioLevelEvent: !!row.portfolioLevelEvent,
+	    riskFactors: row.riskFactors || [],
+	    portfolioRelevanceBasis: clean(row.portfolioRelevanceBasis || "", 220),
+	    relatedHoldings: row.relatedHoldings || [],
+	    sourceRelatedTickers: row.sourceRelatedTickers || [],
+	    sourceTweetUrl: row.sourceTweetUrl || "",
+	    sourceTweetRank: row.sourceTweetRank || null,
+	    sourceTweetEngagementScore: row.sourceTweetEngagementScore || null,
+	    sourceText: clean(row.sourceText || "", 500),
+	  };
+	}
+
+function compactRawEventForAudit(item) {
+  const row = item || {};
+  const metadata = row.metadata || {};
+  const sourceOrigin = sourceOriginFromEvent(row);
+  return {
+    eventKey: row.eventKey || "",
+    sourceType: row.sourceType || "",
+    symbol: row.symbol || "",
+    title: clean(row.title || "", 220),
+    summary: clean(row.summary || "", 520),
+    url: row.url || "",
+    source: row.source || "",
+    dedupeStatus: row.dedupeStatus || "",
+    affectedSymbols: rawAffectedSymbols(row),
+    affectedThemes: rawAffectedThemes(row),
+    sourceLinks: row.sourceLinks || metadata.sourceLinks || [],
+    mappingReason: clean(row.mappingReason || metadata.mappingReason || metadata.whyRelevant || "", 360),
+    portfolioLevelEvent: !!metadata.portfolioLevelEvent,
+    riskFactors: metadata.riskFactors || [],
+    portfolioRelevanceBasis: clean(metadata.portfolioRelevanceBasis || "", 360),
+    sourceRelatedTickers: metadata.sourceRelatedTickers || [],
+    sourceOrigin,
+    sourceOriginLabel: sourceOriginLabel(sourceOrigin),
+    sourceLane: metadata.sourceLane || "",
+    sourceSearchMode: metadata.sourceSearchMode || "",
+    sourceTweetId: metadata.sourceTweetId || "",
+    sourceTweetUrl: metadata.sourceTweetUrl || "",
+    sourceTweetRank: metadata.sourceTweetRank || null,
+    sourceTweetEngagementScore: metadata.sourceTweetEngagementScore || null,
+    sourceTimeLabel: metadata.sourceTimeLabel || row.sourceTimeLabel || "",
+    sourceEventTime: metadata.sourceEventTime === undefined ? "" : metadata.sourceEventTime,
+    sourceEventAtMs: metadata.sourceEventAtMs || null,
+    publishedAtMs: row.publishedAtMs || null,
+    firstSeenAtMs: row.firstSeenAtMs || null,
+    lastSeenAtMs: row.lastSeenAtMs || null,
+    metadata,
+  };
+}
+
+function compactRawEventForAnalyst(item) {
+  const row = item || {};
+  const metadata = row.metadata || {};
+  const sourceOrigin = sourceOriginFromEvent(row);
+  return {
+    eventKey: row.eventKey || "",
+    sourceType: row.sourceType || "",
+    symbol: row.symbol || "",
+    title: clean(row.title || row.summary || "", 140),
+    summary: clean(row.summary || "", 220),
+    dedupeStatus: row.dedupeStatus || "",
+    affectedSymbols: rawAffectedSymbols(row),
+    affectedThemes: rawAffectedThemes(row),
+    sourceOrigin,
+    url: row.url || "",
+    sourceLinks: (row.sourceLinks || metadata.sourceLinks || (row.url ? [row.url] : [])).slice(0, 2),
+    publishedAtMs: row.publishedAtMs || null,
+    sourceTimeLabel: metadata.sourceTimeLabel || "",
+    sourceEventTime: metadata.sourceEventTime === undefined ? "" : metadata.sourceEventTime,
+	    sourceEventAtMs: metadata.sourceEventAtMs || null,
+	    firstSeenAtMs: row.firstSeenAtMs || null,
+	    lastSeenAtMs: row.lastSeenAtMs || null,
+	    mappingReason: clean(row.mappingReason || metadata.mappingReason || metadata.whyRelevant || "", 180),
+	    portfolioLevelEvent: !!metadata.portfolioLevelEvent,
+	    riskFactors: metadata.riskFactors || [],
+	    portfolioRelevanceBasis: clean(metadata.portfolioRelevanceBasis || "", 220),
+	    relatedHoldings: metadata.relatedHoldings || [],
+	    sourceRelatedTickers: metadata.sourceRelatedTickers || [],
+	    sourceTweetId: metadata.sourceTweetId || "",
+	    sourceTweetUrl: metadata.sourceTweetUrl || "",
+	    sourceTweetRank: metadata.sourceTweetRank || null,
+	    sourceTweetEngagementScore: metadata.sourceTweetEngagementScore || null,
+	    sourceText: clean(metadata.sourceText || "", 500),
+	  };
+	}
+
+function compactPriceSignalForAnalyst(signal) {
+  const row = signal || {};
+  const volume = row.volume || {};
+  return {
+    symbol: row.symbol || "",
+    marketDataSymbol: row.marketDataSymbol || row.symbol || "",
+    underlyingSymbol: row.underlyingSymbol || "",
+    marketDataBasis: row.marketDataBasis || "",
+    abnormal: !!row.abnormal,
+    triggerKinds: row.triggerKinds || [],
+    oneDayPct: row.oneDayPct,
+    oneDayBasis: row.oneDayBasis || "",
+    currentPrice: row.currentPrice,
+    currentPriceAsOfHkt: row.currentPriceAsOfHkt || "",
+    previousClose: row.previousClose,
+    fiveDayPct: row.fiveDayPct,
+    cumulativeVolume: volume.cumulativeVolume,
+    historicalSameTimeAverage: volume.historicalSameTimeAverage,
+    cumulativeVolumeMultiple: volume.cumulativeVolumeMultiple,
+    volumeAsOfHkt: volume.asOfHkt || row.volumeAsOfHkt || "",
+  };
+}
+
+function compactAnomalyForAudit(anomaly) {
+  const row = anomaly || {};
+  return {
+    anomalyId: row.anomalyId || "",
+    lane: row.lane || "anomaly_attribution",
+    symbol: row.symbol || row.primaryAsset || "",
+    title: clean(row.title || row.summary || "", 180),
+    summary: clean(row.summary || "", 360),
+    reason: clean(row.reason || "", 360),
+    sourceOrigin: "asset_anomaly_signal",
+    sourceOriginLabel: sourceOriginLabel("asset_anomaly_signal"),
+    sourceLane: "price_volume_anomaly",
+    sourceSearchMode: row.sourceSearchMode || "computed_from_market_data",
+    anomalyMetrics: compactAnomalySignalForAudit(row.anomalyMetrics || row),
+  };
+}
+
+function buildAuditArtifacts(eventCandidates, abnormalSignals, anomalies) {
+  const compactCandidates = (eventCandidates || []).map(compactEventCandidateForAudit);
+  const signalByKey = {};
+  (abnormalSignals || []).forEach((signal) => {
+    const compact = compactAnomalySignalForAudit(signal);
+    const key = compact.symbol + ":" + (compact.triggerKinds || []).join(",");
+    signalByKey[key] = compact;
+  });
+  (anomalies || [])
+    .map(compactAnomalyForAudit)
+    .forEach((anomaly) => {
+      const signal = anomaly.anomalyMetrics || {};
+      const key = signal.symbol + ":" + (signal.triggerKinds || []).join(",");
+      if (!signalByKey[key]) signalByKey[key] = signal;
+    });
+  const compactSignals = Object.keys(signalByKey)
+    .map((key) => signalByKey[key])
+    .sort((a, b) => String(a.symbol || "").localeCompare(String(b.symbol || "")));
+  return {
+    candidateAudit: {
+      candidateCount: compactCandidates.length,
+      candidateLaneCounts: countBy(compactCandidates, "lane"),
+      candidateTypeCounts: countBy(compactCandidates, "candidateType"),
+      candidateSourceOriginCounts: countBy(compactCandidates, "sourceOrigin"),
+      candidates: compactCandidates,
+    },
+    anomalySignals: {
+      signalCount: compactSignals.length,
+      signals: compactSignals,
+    },
+    anomalies: {
+      anomalyCount: (anomalies || []).length,
+      anomalies: (anomalies || []).map(compactAnomalyForAudit),
+    },
+  };
+}
+
+function buildSearchExpansionTrace(summary) {
+  summary = summary || {};
+  const toolCalls = (summary.toolCalls || []).map((call, idx) => ({
+    order: idx + 1,
+    tool: call.tool || "",
+    purpose: call.purpose || "",
+    lane: call.purpose === "theme_news" ? "theme_news" : "market_breaking",
+    query: clean(call.query || "", 260),
+    theme: call.theme || "",
+    topic: call.topic || "",
+    resultFilter: call.resultFilter || "",
+    freshness: call.freshness || "",
+    resultCount: Number(call.resultCount) || 0,
+    limit: call.limit || null,
+    startHkt: call.startHkt || "",
+    endHkt: call.endHkt || "",
+    limitReached: !!call.limitReached,
+    error: call.error || "",
+  }));
+  return {
+    agentCalled: !!summary.agentCalled,
+    queryPlanning: summary.queryPlanning || "",
+    sourceExpansionPolicy: "Code fetches recent Arrays indexed X top-engagement tweets; Pi decides whether supplied tweets are investment-related breaking news. Brave source_expansion with result_filter=web is allowed only after a supplied indexed-X tweet qualifies, to find original/official source first, then earliest credible media/source link.",
+    toolCallCount: toolCalls.length,
+    indexedXDiscovery: summary.indexedXDiscovery || null,
+    indexedXDiscoveryCalls: toolCalls.filter((call) => call.tool === "searchArraysIndexedX"),
+    xDiscoveryCalls: toolCalls.filter((call) => call.tool === "searchArraysIndexedX" || call.tool === "searchGrokX"),
+    grokDiscoveryCalls: toolCalls.filter((call) => call.tool === "searchGrokX"),
+    sourceExpansionCalls: toolCalls.filter((call) => call.tool === "searchBrave" && call.purpose === "source_expansion"),
+    themeNewsCalls: toolCalls.filter((call) => call.tool === "searchBrave" && call.purpose === "theme_news"),
+    arraysTopicNewsCalls: toolCalls.filter((call) => call.tool === "searchArraysMarketNewsTopic"),
+    allToolCalls: toolCalls,
+    searchAudit: Array.isArray(summary.searchAudit) ? summary.searchAudit : [],
+    themeTopicMappings: Array.isArray(summary.themeTopicMappings) ? summary.themeTopicMappings : [],
+    parsedEventCount: summary.parsedEventCount || 0,
+    rawEventRecords: summary.rawEventRecords || 0,
+    error: summary.error || "",
+  };
+}
+
+function normalizeKey(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/https?:\/\/(www\.)?/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 120);
+}
+
+function eventTerminologyText(value) {
+  return String(value || "")
+    .replace(new RegExp("\\bevid" + "ences\\b", "gi"), "event records")
+    .replace(new RegExp("\\bevid" + "ence\\b", "gi"), "event records");
+}
+
+function normalizeEventTerminology(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string") return eventTerminologyText(value);
+  if (Array.isArray(value)) return value.map(normalizeEventTerminology);
+  if (typeof value !== "object") return value;
+  const out = {};
+  Object.keys(value).forEach((key) => {
+    let nextKey = key;
+    if (key === ["evid", "ence_refs"].join("")) nextKey = "event_refs";
+    else if (key === ["supporting_evid", "ence"].join("")) nextKey = "supporting_events";
+    else if (key === ["evid", "enceKey"].join("")) nextKey = "eventKey";
+    out[nextKey] = normalizeEventTerminology(value[key]);
+  });
+  return out;
+}
+
+async function alvaApiJson(path, params) {
+  const apiKey = secret.loadPlaintext("ALVA_API_KEY");
+  if (!apiKey) throw new Error("Missing ALVA_API_KEY for connected-account portfolio API");
+  const query = Object.keys(params || {})
+    .filter((key) => params[key] !== undefined && params[key] !== null && params[key] !== "")
+    .map((key) => encodeURIComponent(key) + "=" + encodeURIComponent(String(params[key])))
+    .join("&");
+  const url = ALVA_API_BASE + path + (query ? "?" + query : "");
+  const resp = await http.fetch(url, { headers: { "X-Alva-Api-Key": apiKey } });
+  const body = await resp.json();
+  if (!resp.ok) {
+    throw new Error("Alva portfolio API request failed: " + path + " " + resp.status + " " + JSON.stringify(body).slice(0, 240));
+  }
+  return body;
+}
+
+async function fetchPortfolioSummary(accountId) {
+  return alvaApiJson("/api/v1/portfolio/summary", { accountId });
+}
+
+function normalizeAssetClass(rawHolding, symbol) {
+  if (String(symbol || "").indexOf("O:") === 0) return "option";
+  const raw = String(
+    (rawHolding && (rawHolding.assetClass || rawHolding.asset_class || rawHolding.instrumentType || rawHolding.securityType || rawHolding.type)) || ""
+  ).toLowerCase();
+  if (raw.indexOf("option") >= 0) return "option";
+  if (raw.indexOf("crypto") >= 0 || raw.indexOf("digital") >= 0 || raw.indexOf("token") >= 0) return "crypto";
+  return "equity";
+}
+
+function normalizeSummary(parsed, runAtMs) {
+  const holdings = Array.isArray(parsed.holdings) ? parsed.holdings : [];
+  const cash = amount(parsed.cash);
+  const parsedAsOfMs = amount(parsed.asOfMs);
+  const normalizedHoldings = holdings
+    .map((h) => {
+      const symbol = String(h.symbol || "").trim().toUpperCase();
+      const assetClass = normalizeAssetClass(h, symbol);
+      return {
+        instrumentId: assetClass + ":" + symbol,
+        symbol,
+        assetClass,
+        side: String(h.side || ""),
+        quantity: amount(h.quantity),
+        currentPrice: null,
+        marketValue: null,
+        allocation: null,
+        currency: String(h.currency || "USD"),
+        instrumentDetails: assetClass === "option" ? parseOptionSymbol(symbol) : {},
+      };
+    })
+    .filter((h) => h.symbol);
+  normalizedHoldings.sort((a, b) => String(a.symbol).localeCompare(String(b.symbol)));
+  return {
+    accountId: ACCOUNT_ID,
+    markVersion: "unpriced_connected_account_positions",
+    priceBasis: "unpriced_connected_account_positions",
+    totalValue: null,
+    cash,
+    cashAllocation: null,
+    holdings: normalizedHoldings,
+    holdingCount: normalizedHoldings.length,
+    asOfMs: parsedAsOfMs || runAtMs,
+    asOfMsEstimated: !parsedAsOfMs,
+    runAtMs,
+  };
+}
+
+function markSnapshotToLatest(snapshot, priceSignals, warnings) {
+  const signalBySymbol = priceSignalMap(priceSignals);
+  let latestAsOfMs = 0;
+  let pricedHoldingCount = 0;
+  let unpricedHoldingCount = 0;
+  let holdingsMarketValue = 0;
+  const markedHoldings = (snapshot.holdings || []).map((holding) => {
+    const signal = signalBySymbol[holding.symbol];
+    const latestPrice = signal && Number.isFinite(signal.latestPrice) ? signal.latestPrice : null;
+    const latestPriceAsOfMs = signal && Number.isFinite(signal.latestPriceAsOfMs) ? signal.latestPriceAsOfMs : null;
+    const quantity = Number.isFinite(holding.quantity) ? holding.quantity : null;
+    const isShort = String(holding.side || "").toUpperCase() === "SHORT";
+    const signedQuantity = quantity === null ? null : (isShort ? -Math.abs(quantity) : quantity);
+    let marketValue = null;
+    let currentPrice = null;
+    let valuationStatus = "unpriced";
+    if (
+      holding.assetClass === "equity" &&
+      Number.isFinite(latestPrice) &&
+      Number.isFinite(latestPriceAsOfMs) &&
+      Number.isFinite(signedQuantity)
+    ) {
+      marketValue = signedQuantity * latestPrice;
+      currentPrice = latestPrice;
+      valuationStatus = "priced";
+      holdingsMarketValue += marketValue;
+      pricedHoldingCount += 1;
+      latestAsOfMs = Math.max(latestAsOfMs, latestPriceAsOfMs);
+    } else if (holding.assetClass !== "equity") {
+      unpricedHoldingCount += 1;
+      warnings.push({ source: "portfolio-mark:" + holding.symbol, error: "non-equity valuation excluded until Arrays/current-price coverage exists" });
+    } else {
+      unpricedHoldingCount += 1;
+      warnings.push({ source: "portfolio-mark:" + holding.symbol, error: "latest Arrays price unavailable; position value excluded from marked total value" });
+    }
+    return {
+      ...holding,
+      currentPrice,
+      marketValue,
+      instrumentDetails: {
+        ...(holding.instrumentDetails || {}),
+        currentPriceSource: signal ? signal.latestPriceSource || "" : "",
+        latestPriceSource: signal ? signal.latestPriceSource || "" : "",
+        latestPriceInterval: signal ? signal.latestPriceInterval || "" : "",
+        latestPriceAsOfHkt: signal ? signal.latestPriceAsOfHkt || "" : "",
+        valuationBasis: valuationStatus === "priced" ? "arrays_latest_price_x_signed_quantity" : "not_valued_without_arrays_price",
+        valuationStatus,
+      },
+    };
+  });
+  const hasValueComponent = pricedHoldingCount > 0 || Number.isFinite(snapshot.cash);
+  const markedTotalValue = hasValueComponent ? holdingsMarketValue + (Number.isFinite(snapshot.cash) ? snapshot.cash : 0) : null;
+  const holdingsWithWeights = markedHoldings.map((holding) => ({
+    ...holding,
+    allocation: Number.isFinite(markedTotalValue) && markedTotalValue !== 0 && Number.isFinite(holding.marketValue)
+      ? holding.marketValue / markedTotalValue
+      : null,
+  })).sort((a, b) => (b.allocation || 0) - (a.allocation || 0));
+  return {
+    ...snapshot,
+    markVersion: CONFIG.snapshotMarkVersion,
+    priceBasis: "arrays_latest_price_x_connected_account_quantity_plus_cash",
+    valuationPolicy: "cost_and_pnl_fields_omitted",
+    pricedHoldingCount,
+    unpricedHoldingCount,
+    totalValue: Number.isFinite(markedTotalValue) ? round(markedTotalValue, 2) : markedTotalValue,
+    cashAllocation: Number.isFinite(markedTotalValue) && markedTotalValue !== 0 && Number.isFinite(snapshot.cash)
+      ? snapshot.cash / markedTotalValue
+      : null,
+    holdings: holdingsWithWeights,
+    holdingCount: holdingsWithWeights.length,
+    priceAsOfMs: latestAsOfMs || snapshot.asOfMs,
+  };
+}
+
+function refreshSignalContributions(priceSignals, snapshot) {
+  const holdings = bySymbol(snapshot);
+  return (priceSignals || []).map((signal) => {
+    if (!signal || !signal.available) return signal;
+    const holding = holdings[signal.symbol];
+    const allocation = holding && Number.isFinite(holding.allocation) ? holding.allocation : 0;
+    const portfolioMoveContribution = allocation * Math.abs((signal.oneDayPct || 0) / 100);
+    return {
+      ...signal,
+      portfolioMoveContribution: round(portfolioMoveContribution, 5),
+      impactFlags: portfolioMoveContribution >= CONFIG.materiality.portfolioMoveContributionPts
+        ? ["portfolio_move_contribution"]
+        : [],
+    };
+  });
+}
+
+function parseOptionSymbol(symbol) {
+  const match = String(symbol || "").match(/^O:([A-Z]+)(\d{6})([CP])(\d{8})$/);
+  if (!match) return {};
+  const yy = Number(match[2].slice(0, 2));
+  const yyyy = yy >= 70 ? 1900 + yy : 2000 + yy;
+  return {
+    underlying: match[1],
+    expiry: yyyy + "-" + match[2].slice(2, 4) + "-" + match[2].slice(4, 6),
+    optionType: match[3] === "C" ? "call" : "put",
+    strike: Number(match[4]) / 1000,
+  };
+}
+
+function marketDataSymbolForHolding(holding) {
+  const symbol = String(holding && holding.symbol || "").toUpperCase();
+  if (!symbol) return "";
+  if (String(holding && holding.assetClass || "").toLowerCase() !== "option") return symbol;
+  const details = (holding && holding.instrumentDetails) || {};
+  const underlying = String(details.underlying || parseOptionSymbol(symbol).underlying || "").toUpperCase();
+  return underlying || symbol;
+}
+
+function holdingReferenceSymbols(holding) {
+  return uniqueSymbols([holding && holding.symbol, marketDataSymbolForHolding(holding)]);
+}
+
+function bySymbol(snapshot) {
+  const out = {};
+  (snapshot.holdings || []).forEach((h) => {
+    out[h.symbol] = h;
+  });
+  return out;
+}
+
+function normalizeThemeName(theme) {
+  return String(theme || "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+function normalizeThemeList(themes) {
+  const seen = {};
+  const out = [];
+  (Array.isArray(themes) ? themes : []).forEach((theme) => {
+    const key = normalizeThemeName(theme);
+    if (!key || seen[key]) return;
+    seen[key] = true;
+    out.push(key);
+  });
+  return out.length ? out : ["uncategorized"];
+}
+
+function fallbackThemesForSymbol(symbol) {
+  return normalizeThemeList((CONFIG.fallbackThemeMap || {})[symbol] || ["uncategorized"]);
+}
+
+function themeMapFromSnapshot(snapshot) {
+  const map = {};
+  if (snapshot && snapshot.themeMap && typeof snapshot.themeMap === "object") {
+    Object.keys(snapshot.themeMap).forEach((symbol) => {
+      const key = String(symbol || "").toUpperCase();
+      if (!key) return;
+      map[key] = normalizeThemeList(snapshot.themeMap[symbol]);
+    });
+  }
+  return map;
+}
+
+function themesForHolding(snapshot, holding) {
+  if (holding && Array.isArray(holding.themes) && holding.themes.length) {
+    return normalizeThemeList(holding.themes);
+  }
+  const symbol = String(holding && holding.symbol || "").toUpperCase();
+  const snapshotMap = themeMapFromSnapshot(snapshot);
+  return snapshotMap[symbol] || fallbackThemesForSymbol(symbol);
+}
+
+function themesForSymbol(snapshot, symbol) {
+  const holding = bySymbol(snapshot || {})[String(symbol || "").toUpperCase()];
+  return themesForHolding(snapshot, holding || { symbol });
+}
+
+function themeExposure(snapshot) {
+  const exposure = {};
+  (snapshot.holdings || []).forEach((h) => {
+    const themes = themesForHolding(snapshot, h);
+    themes.forEach((theme) => {
+      exposure[theme] = (exposure[theme] || 0) + (h.allocation || 0);
+    });
+  });
+  return Object.keys(exposure)
+    .map((theme) => ({
+      theme,
+      allocation: round(exposure[theme], 4),
+      searchPhrase: (snapshot.themeSearchPhrases && snapshot.themeSearchPhrases[theme]) || themeSearchPhrase(theme),
+      linkedSymbols: (snapshot.holdings || [])
+        .filter((holding) => themesForHolding(snapshot, holding).indexOf(theme) >= 0)
+        .map((holding) => holding.symbol)
+        .join(","),
+    }))
+    .sort((a, b) => b.allocation - a.allocation);
+}
+
+function buildThemeExtractionPrompt(snapshot, previous) {
+  const previousThemeMap = previous && previous.themeMap ? themeMapFromSnapshot(previous) : {};
+  const holdings = (snapshot.holdings || []).map((h) => ({
+    symbol: h.symbol,
+    assetClass: h.assetClass,
+    side: h.side,
+    quantity: h.quantity,
+    weight: round(h.allocation || 0, 4),
+    marketValue: round(h.marketValue || 0, 2),
+    instrumentDetails: h.instrumentDetails || {},
+    priorThemes: previousThemeMap[h.symbol] || fallbackThemesForSymbol(h.symbol),
+  }));
+  return [
+    "You are the theme extraction step inside a portfolio watch automation for a discretionary investor.",
+    "Your job is to classify the current portfolio holdings into investable exposure themes used for event monitoring and exposure sizing.",
+    "Use ONLY the supplied JSON. Do not browse. Do not infer current news, catalysts, prices, or recommendations.",
+    "Return JSON only. It MUST begin with { and end with }.",
+    "",
+    "Rules:",
+    "- Produce themes for every current holding exactly once.",
+    "- Themes should describe business exposure, risk bucket, asset class, supply chain, end-market, or macro sensitivity.",
+    "- Use stable lowercase kebab-case labels, e.g. ai-infrastructure, memory, semiconductors, enterprise-software, optical-interconnect, crypto, defi, energy, rates.",
+    "- Prefer 2-5 useful themes per holding. Include more only when the position genuinely spans more exposure buckets.",
+	    "- Use priorThemes only as weak continuity hints. Do not copy them for stability; keep a prior theme only when the current holding context still supports it.",
+    "- Do not create theme labels from today's price action or unsourced news.",
+    "- If a holding is unclear, use uncategorized plus the broadest defensible asset-class theme.",
+    "",
+    "Input:",
+    compactJson({
+      run_at_hkt: hkt(snapshot.runAtMs),
+      theme_extraction_version: CONFIG.themeExtractionVersion,
+      holdings,
+    }, 20000),
+    "",
+    "Output schema:",
+    "{",
+    '  "holdings": [',
+    '    {"symbol":"TICKER", "themes":["theme-a","industry-b","risk-factor-c"], "primary_theme":"theme-a", "reason":"short phrase"}',
+    "  ],",
+    '  "theme_universe": [',
+    '    {"theme":"theme-a", "label":"Readable Theme Label", "search_phrase":"theme-specific market news query"}',
+    "  ]",
+    "}",
+  ].join("\n");
+}
+
+function normalizeThemeExtraction(parsed, snapshot, previous, runAtMs, rawText, errorText) {
+  const byHolding = {};
+  const themeSearchPhrases = {};
+  if (parsed && Array.isArray(parsed.theme_universe)) {
+    parsed.theme_universe.forEach((row) => {
+      const theme = normalizeThemeName(row && (row.theme || row.id || row.label));
+      if (!theme) return;
+      const phrase = clean(row.search_phrase || row.searchPhrase || row.query || "", 220);
+      if (phrase) themeSearchPhrases[theme] = phrase;
+    });
+  }
+  if (parsed && Array.isArray(parsed.holdings)) {
+    parsed.holdings.forEach((row) => {
+      const symbol = String(row && row.symbol || "").toUpperCase();
+      if (!symbol) return;
+      const themes = normalizeThemeList(row.themes || (row.primary_theme ? [row.primary_theme] : []));
+      byHolding[symbol] = {
+        themes,
+        primaryTheme: normalizeThemeName(row.primary_theme || row.primaryTheme || themes[0]),
+        reason: clean(row.reason || row.why || "", 240),
+      };
+    });
+  }
+  const previousThemeMap = previous && previous.themeMap ? themeMapFromSnapshot(previous) : {};
+  const themeMap = {};
+  const holdings = (snapshot.holdings || []).map((holding) => {
+    const extracted = byHolding[holding.symbol];
+    const themes = extracted && extracted.themes && extracted.themes.length
+      ? extracted.themes
+      : (previousThemeMap[holding.symbol] || fallbackThemesForSymbol(holding.symbol));
+    themeMap[holding.symbol] = themes;
+    return {
+      ...holding,
+      themes,
+      primaryTheme: extracted && extracted.primaryTheme ? extracted.primaryTheme : themes[0],
+      themeReason: extracted && extracted.reason ? extracted.reason : (errorText ? "fallback after theme extraction error" : "fallback theme mapping"),
+    };
+  });
+  const themeCount = {};
+  Object.keys(themeMap).forEach((symbol) => {
+    (themeMap[symbol] || []).forEach((theme) => {
+      themeCount[theme] = true;
+      if (!themeSearchPhrases[theme]) themeSearchPhrases[theme] = themeSearchPhrase(theme);
+    });
+  });
+  return {
+    ...snapshot,
+    holdings,
+    themeMap,
+    themeSearchPhrases,
+    themeExtractionSummary: {
+      environment: "Alva Ask (LLM)",
+      call: "ask(buildThemeExtractionPrompt(snapshot))",
+      version: CONFIG.themeExtractionVersion,
+      toolLoop: false,
+      browsing: false,
+      suppliedJsonOnly: true,
+      agentCalled: !errorText,
+      fallbackUsed: !!errorText || Object.keys(byHolding).length < (snapshot.holdings || []).length,
+      holdingCount: (snapshot.holdings || []).length,
+      themeCount: Object.keys(themeCount).length,
+      rawTextPreview: clean(rawText || "", 900),
+      error: errorText || "",
+    },
+  };
+}
+
+function extractPortfolioThemes(snapshot, previous, warnings, runAtMs) {
+  try {
+    const text = String(ask(buildThemeExtractionPrompt(snapshot, previous)).text || "");
+    const parsed = safeParseJson(text);
+    if (!parsed) throw new Error("Theme extraction prompt did not return parseable JSON");
+    return normalizeThemeExtraction(parsed, snapshot, previous, runAtMs, text, "");
+  } catch (err) {
+    const error = String(err && err.message ? err.message : err).slice(0, 260);
+    warnings.push({ source: "theme-extraction", error });
+    return normalizeThemeExtraction(null, snapshot, previous, runAtMs, "", error);
+  }
+}
+
+function computePortfolioDelta(snapshot, previous) {
+  const result = {
+    firstRun: !previous,
+    material: false,
+    actionMaterial: false,
+    navChangePct: null,
+    navChangeUsd: null,
+    cashChangeUsd: null,
+    cashChangePts: null,
+    positionChanges: [],
+    exposureChanges: [],
+    summary: "baseline_created",
+  };
+  if (!previous) return result;
+
+  const prevBy = bySymbol(previous);
+  const currBy = bySymbol(snapshot);
+  const changes = [];
+
+  (snapshot.holdings || []).forEach((h) => {
+    const prev = prevBy[h.symbol];
+    if (!prev) {
+      changes.push({
+        symbol: h.symbol,
+        changeType: "new_position",
+        oldQuantity: null,
+        newQuantity: h.quantity,
+        oldWeight: 0,
+        newWeight: round(h.allocation || 0, 4),
+        marketValueChangeUsd: round(h.marketValue || 0, 2),
+        markToMarketOnly: false,
+        material: (h.allocation || 0) >= 0.01,
+      });
+      return;
+    }
+    const quantityChange = (h.quantity || 0) - (prev.quantity || 0);
+    const weightChange = (h.allocation || 0) - (prev.allocation || 0);
+    const marketValueChangeUsd = (h.marketValue || 0) - (prev.marketValue || 0);
+    const mvChangePct = prev.marketValue ? marketValueChangeUsd / Math.abs(prev.marketValue) : null;
+    const quantityChanged = Math.abs(quantityChange) > CONFIG.materiality.quantityEpsilon;
+    const valueOrWeightChanged =
+      (Math.abs(weightChange) >= CONFIG.materiality.allocationMovePts &&
+        Math.abs(marketValueChangeUsd) >= CONFIG.materiality.positionMvMoveUsd) ||
+      (Number.isFinite(mvChangePct) &&
+        Math.abs(mvChangePct) >= CONFIG.materiality.positionMvMovePct &&
+        Math.abs(marketValueChangeUsd) >= CONFIG.materiality.positionMvMoveUsd);
+    const material =
+      quantityChanged ||
+      valueOrWeightChanged;
+    if (material) {
+      changes.push({
+        symbol: h.symbol,
+        changeType: quantityChanged ? "quantity_change" : "mark_to_market_change",
+        oldQuantity: prev.quantity,
+        newQuantity: h.quantity,
+        oldWeight: round(prev.allocation || 0, 4),
+        newWeight: round(h.allocation || 0, 4),
+        quantityChange: round(quantityChange, 6),
+        weightChangePts: round(weightChange * 100, 2),
+        marketValueChangeUsd: round(marketValueChangeUsd, 2),
+        marketValueChangePct: round(mvChangePct, 4),
+        markToMarketOnly: !quantityChanged,
+        material,
+      });
+    }
+  });
+
+  Object.keys(prevBy).forEach((symbol) => {
+    if (!currBy[symbol]) {
+      changes.push({
+        symbol,
+        changeType: "removed_position",
+        oldQuantity: prevBy[symbol].quantity,
+        newQuantity: null,
+        oldWeight: round(prevBy[symbol].allocation || 0, 4),
+        newWeight: 0,
+        marketValueChangeUsd: round(-(prevBy[symbol].marketValue || 0), 2),
+        markToMarketOnly: false,
+        material: (prevBy[symbol].allocation || 0) >= 0.01,
+      });
+    }
+  });
+
+  const navChangeUsd = (snapshot.totalValue || 0) - (previous.totalValue || 0);
+  const navChangePct = previous.totalValue ? navChangeUsd / Math.abs(previous.totalValue) : null;
+  const cashChangeUsd = (snapshot.cash || 0) - (previous.cash || 0);
+  const cashChangePts = ((snapshot.cashAllocation || 0) - (previous.cashAllocation || 0)) * 100;
+  const currentThemes = themeExposure(snapshot);
+  const previousThemes = themeExposure(previous);
+  const prevThemeBy = {};
+  previousThemes.forEach((t) => {
+    prevThemeBy[t.theme] = t.allocation || 0;
+  });
+  const exposureChanges = currentThemes
+    .map((t) => {
+      const oldAllocation = prevThemeBy[t.theme] || 0;
+      return {
+        bucket: t.theme,
+        oldAllocation: round(oldAllocation, 4),
+        newAllocation: round(t.allocation || 0, 4),
+        changePts: round(((t.allocation || 0) - oldAllocation) * 100, 2),
+      };
+    })
+    .filter((t) => Math.abs(t.changePts || 0) >= CONFIG.materiality.themeExposureChangePts * 100);
+
+  result.navChangeUsd = round(navChangeUsd, 2);
+  result.navChangePct = round(navChangePct, 4);
+  result.cashChangeUsd = round(cashChangeUsd, 2);
+  result.cashChangePts = round(cashChangePts, 2);
+  result.positionChanges = changes;
+  result.exposureChanges = exposureChanges;
+  result.actionMaterial =
+    changes.some((c) => c.material && !c.markToMarketOnly) ||
+    Math.abs(cashChangeUsd || 0) >= CONFIG.materiality.cashMoveUsd;
+  result.material =
+    changes.some((c) => c.material) ||
+    exposureChanges.length > 0 ||
+    (Number.isFinite(navChangePct) &&
+      Math.abs(navChangePct) >= CONFIG.materiality.portfolioValueMovePct &&
+      Math.abs(navChangeUsd) >= CONFIG.materiality.portfolioValueMoveUsd) ||
+    Math.abs(cashChangeUsd || 0) >= CONFIG.materiality.cashMoveUsd ||
+    Math.abs(cashChangePts || 0) >= CONFIG.materiality.cashMovePts * 100;
+  result.summary = [
+    "positions=" + changes.length,
+    "theme_changes=" + exposureChanges.length,
+    "nav=" + fmtMove((navChangePct || 0) * 100),
+    "cash=" + fmtMove(cashChangePts || 0) + " pts / " + fmtMoney(cashChangeUsd || 0),
+  ].join(", ");
+  return result;
+}
+
+function mean(values) {
+  return values.reduce((acc, x) => acc + x, 0) / values.length;
+}
+
+function median(values) {
+  const cleanValues = (values || []).filter(Number.isFinite).slice().sort((a, b) => a - b);
+  if (!cleanValues.length) return null;
+  const mid = Math.floor(cleanValues.length / 2);
+  return cleanValues.length % 2 ? cleanValues[mid] : (cleanValues[mid - 1] + cleanValues[mid]) / 2;
+}
+
+function stdev(values) {
+  if (!values.length) return 0;
+  const m = mean(values);
+  const variance = values.reduce((acc, x) => acc + Math.pow(x - m, 2), 0) / values.length;
+  return Math.sqrt(variance);
+}
+
+function pct(a, b) {
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) return null;
+  return ((a / b) - 1) * 100;
+}
+
+function timestampSec(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    return numeric > 100000000000 ? Math.floor(numeric / 1000) : Math.floor(numeric);
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : 0;
+}
+
+function barTimeSec(bar) {
+  if (!bar) return 0;
+  return timestampSec(
+    bar.time_close ||
+    bar.time_period_end ||
+    bar.time_open ||
+    bar.time_period_start ||
+    bar.date
+  );
+}
+
+function barClose(bar) {
+  const n = Number(bar && (bar.price_close !== undefined ? bar.price_close : bar.close));
+  return Number.isFinite(n) ? n : null;
+}
+
+function barVolume(bar) {
+  const n = Number(bar && (bar.volume_traded !== undefined ? bar.volume_traded : bar.volume));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function assetVolumeClass(symbol, holding) {
+  const assetClass = String(holding && holding.assetClass || "").toLowerCase();
+  if (assetClass === "option") return "us_option_underlying";
+  if (assetClass === "crypto" || assetClass === "cryptocurrency" || assetClass === "digital_asset" || assetClass === "token") return "crypto_24_7";
+  return "us_equity";
+}
+
+function utcDateKey(d) {
+  return [
+    d.getUTCFullYear(),
+    String(d.getUTCMonth() + 1).padStart(2, "0"),
+    String(d.getUTCDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function nyParts(ms) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      hour12: false,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      weekday: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).formatToParts(new Date(ms));
+    const out = {};
+    parts.forEach((part) => {
+      if (part.type !== "literal") out[part.type] = part.value;
+    });
+    const hour = Number(out.hour) % 24;
+    const minute = Number(out.minute);
+    return {
+      dateKey: out.year + "-" + out.month + "-" + out.day,
+      weekday: out.weekday || "",
+      minuteOfDay: hour * 60 + minute,
+    };
+  } catch (_) {
+    const d = new Date(ms);
+    return {
+      dateKey: utcDateKey(d),
+      weekday: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getUTCDay()],
+      minuteOfDay: d.getUTCHours() * 60 + d.getUTCMinutes(),
+    };
+  }
+}
+
+function volumeMeta(sec, volumeClass) {
+  const ms = sec * 1000;
+  if (volumeClass === "crypto_24_7") {
+    const d = new Date(ms);
+    const minute = d.getUTCHours() * 60 + d.getUTCMinutes();
+    return {
+      sessionName: "crypto_utc_day",
+      volumeRegime: "crypto_24_7",
+      sessionKey: utcDateKey(d) + ":crypto",
+      sessionMinute: minute,
+      cumulativeBaselineKey: "crypto_utc_day",
+      volumeBasis: "crypto_utc_day_hourly_cumulative_to_same_time",
+      includeInCumulative: true,
+      tradable: true,
+    };
+  }
+
+  const p = nyParts(ms);
+  const regularStart = 9 * 60 + 30;
+  const regularEnd = 16 * 60;
+  let sessionName = "closed";
+  let sessionMinute = p.minuteOfDay;
+  let includeInCumulative = false;
+  let tradable = false;
+  if (p.minuteOfDay < regularStart) {
+    sessionName = "premarket";
+    sessionMinute = -1;
+  } else if (p.minuteOfDay <= regularEnd) {
+    sessionName = "regular";
+    includeInCumulative = true;
+    tradable = true;
+  } else {
+    sessionName = "afterhours_close_frozen";
+    sessionMinute = regularEnd;
+    tradable = true;
+  }
+  return {
+    sessionName,
+    volumeRegime: sessionName,
+    sessionKey: p.dateKey + ":rth_day",
+    sessionMinute,
+    cumulativeBaselineKey: "us_equity:rth_day",
+    volumeBasis: "us_equity_regular_session_hourly_cumulative_to_current_or_market_close",
+    includeInCumulative,
+    tradable,
+  };
+}
+
+function volumeProfile(symbol, holding, volumeBars) {
+  const volumeClass = assetVolumeClass(symbol, holding);
+  const bars = Array.isArray(volumeBars)
+    ? volumeBars.slice().sort((a, b) => barTimeSec(a) - barTimeSec(b))
+    : [];
+  if (!bars.length) {
+    return {
+      volumeSignalVersion: CONFIG.volumeSignalVersion,
+      assetVolumeClass: volumeClass,
+      volumeAvailable: false,
+      reason: "not_enough_intraday_volume_bars",
+    };
+  }
+
+  const latest = bars[bars.length - 1];
+  const latestSec = barTimeSec(latest);
+  const currentMeta = volumeMeta(latestSec, volumeClass);
+  const rows = bars
+    .map((bar) => ({
+      bar,
+      sec: barTimeSec(bar),
+      volume: barVolume(bar),
+      meta: volumeMeta(barTimeSec(bar), volumeClass),
+    }))
+    .filter((row) => row.sec > 0);
+  const history = rows.filter((row) => row.sec < latestSec);
+
+  const currentCumulativeVolume = rows
+    .filter((row) =>
+      row.meta.sessionKey === currentMeta.sessionKey &&
+      row.meta.includeInCumulative !== false &&
+      row.meta.sessionMinute <= currentMeta.sessionMinute)
+    .reduce((acc, row) => acc + row.volume, 0);
+  const sessionTotals = {};
+  history.forEach((row) => {
+    if (row.meta.includeInCumulative === false) return;
+    if (row.meta.sessionKey === currentMeta.sessionKey) return;
+    if (row.meta.cumulativeBaselineKey !== currentMeta.cumulativeBaselineKey) return;
+    if (row.meta.sessionMinute > currentMeta.sessionMinute) return;
+    sessionTotals[row.meta.sessionKey] = (sessionTotals[row.meta.sessionKey] || 0) + row.volume;
+  });
+  const cumulativeSamples = Object.keys(sessionTotals)
+    .map((key) => sessionTotals[key])
+    .filter(Number.isFinite)
+    .slice(-CONFIG.materiality.volumeLookbackSamples);
+  const cumulativeMedian = cumulativeSamples.length >= CONFIG.materiality.volumeMinBaselineSamples
+    ? median(cumulativeSamples)
+    : null;
+
+  const cumulativeVolumeMultiple = cumulativeMedian && cumulativeMedian > 0 ? currentCumulativeVolume / cumulativeMedian : null;
+  return {
+    volumeSignalVersion: CONFIG.volumeSignalVersion,
+    assetVolumeClass: volumeClass,
+    volumeAvailable: true,
+    volumeRegime: currentMeta.volumeRegime,
+    volumeBasis: currentMeta.volumeBasis,
+    volumeInterval: "1h",
+    latestVolumeBarVolume: round(barVolume(latest), 0),
+    currentCumulativeVolume: round(currentCumulativeVolume, 0),
+    cumulativeVolumeMedian: round(cumulativeMedian, 0),
+    cumulativeVolumeMultiple: round(cumulativeVolumeMultiple, 2),
+    cumulativeVolumeBaselineSamples: cumulativeSamples.length,
+    sessionCumulativeVolume: round(currentCumulativeVolume, 0),
+    sessionCumulativeMedian: round(cumulativeMedian, 0),
+    sessionCumulativeRvol: round(cumulativeVolumeMultiple, 2),
+    sessionCumulativeBaselineSamples: cumulativeSamples.length,
+    volumeTradable: currentMeta.tradable,
+  };
+}
+
+function analyzePrice(symbol, holding, dailyBars, hourlyBars, minuteBars, volumeBars, marketDataSymbolInput) {
+  const holdingSymbol = String(symbol || "").toUpperCase();
+  const marketDataSymbol = String(marketDataSymbolInput || marketDataSymbolForHolding(holding) || holdingSymbol).toUpperCase();
+  const underlyingSymbol = String(holding && holding.assetClass || "").toLowerCase() === "option" && marketDataSymbol !== holdingSymbol
+    ? marketDataSymbol
+    : "";
+  const marketDataBasis = underlyingSymbol ? "underlying_equity" : "holding_symbol";
+  if (!Array.isArray(dailyBars) || dailyBars.length < 10) {
+    return { symbol: holdingSymbol, marketDataSymbol, underlyingSymbol, marketDataBasis, available: false, reason: "not_enough_daily_bars" };
+  }
+  const bars = dailyBars.slice().sort((a, b) => barTimeSec(a) - barTimeSec(b));
+  const hourly = Array.isArray(hourlyBars)
+    ? hourlyBars.slice().sort((a, b) => barTimeSec(a) - barTimeSec(b))
+    : [];
+  const minute = Array.isArray(minuteBars)
+    ? minuteBars.slice().sort((a, b) => barTimeSec(a) - barTimeSec(b))
+    : [];
+  let intradayPct = null;
+  let liveClose = null;
+  let liveAsOfMs = null;
+  let liveAsOfHkt = "";
+  let liveVsLastClosePct = null;
+  let latestPriceInterval = "";
+  const liveSeries = minute.length ? minute : hourly;
+  if (liveSeries.length >= 1) {
+    const lastLiveBar = liveSeries[liveSeries.length - 1];
+    liveClose = barClose(lastLiveBar);
+    liveAsOfMs = barTimeSec(lastLiveBar) * 1000;
+    liveAsOfHkt = hkt(liveAsOfMs);
+    latestPriceInterval = minute.length ? "1min" : "1h_fallback";
+    const target = barTimeSec(lastLiveBar) - 24 * 3600;
+    let back = liveSeries[0];
+    liveSeries.forEach((bar) => {
+      if (barTimeSec(bar) <= target) back = bar;
+    });
+    intradayPct = pct(liveClose, barClose(back));
+  }
+  const referenceSec = Number.isFinite(liveAsOfMs) ? Math.floor(liveAsOfMs / 1000) : Math.floor(Date.now() / 1000);
+  const completedBars = bars.filter((bar) => barTimeSec(bar) <= referenceSec);
+  if (completedBars.length < 2) {
+    return { symbol: holdingSymbol, marketDataSymbol, underlyingSymbol, marketDataBasis, available: false, reason: "not_enough_completed_daily_bars" };
+  }
+  const latest = completedBars[completedBars.length - 1];
+  const prev = completedBars[completedBars.length - 2];
+  const fiveBack = completedBars.length >= 6 ? completedBars[completedBars.length - 6] : null;
+  const returns = [];
+  for (let i = Math.max(1, completedBars.length - 31); i < completedBars.length - 1; i += 1) {
+    const r = pct(barClose(completedBars[i]), barClose(completedBars[i - 1]));
+    if (Number.isFinite(r)) returns.push(r);
+  }
+  const avgVolBars = completedBars.slice(Math.max(0, completedBars.length - 22), completedBars.length - 1);
+  const avgVol = avgVolBars.length ? mean(avgVolBars.map(barVolume)) : null;
+  const lastCompletedClose = barClose(latest);
+  const priorCompletedClose = barClose(prev);
+  const lastCompletedCloseSec = barTimeSec(latest);
+  const lastClosedOneDayPct = pct(lastCompletedClose, priorCompletedClose);
+  const lastClosedFiveDayPct = fiveBack ? pct(lastCompletedClose, barClose(fiveBack)) : null;
+  const returnStd = stdev(returns);
+  const dailyVolumeMultiple = avgVol && avgVol > 0 ? barVolume(latest) / avgVol : null;
+  if (Number.isFinite(liveClose)) {
+    liveVsLastClosePct = pct(liveClose, lastCompletedClose);
+  }
+  const liveIsNewer = Number.isFinite(liveClose) && Number.isFinite(liveAsOfMs) && liveAsOfMs / 1000 > lastCompletedCloseSec;
+  const latestPrice = liveIsNewer ? liveClose : lastCompletedClose;
+  const latestPriceAsOfMs = liveIsNewer ? liveAsOfMs : lastCompletedCloseSec * 1000;
+  const latestPriceSource = liveIsNewer
+    ? (latestPriceInterval === "1min" ? "latest_1min_extended_hours" : "latest_1h_extended_hours_fallback")
+    : "last_completed_daily_close_fallback_no_newer_intraday";
+  const oneDayPct = liveIsNewer ? pct(latestPrice, lastCompletedClose) : lastClosedOneDayPct;
+  const fiveDayPct = fiveBack ? pct(latestPrice, barClose(fiveBack)) : null;
+  const zScore = returnStd > 0 && Number.isFinite(oneDayPct) ? oneDayPct / returnStd : null;
+  const volumeInput = Array.isArray(volumeBars) && volumeBars.length ? volumeBars : hourly;
+  const volume = volumeProfile(marketDataSymbol, holding, volumeInput);
+  const allocation = holding && Number.isFinite(holding.allocation) ? holding.allocation : 0;
+  const portfolioMoveContribution = allocation * Math.abs((oneDayPct || 0) / 100);
+  const reasons = [];
+  if (Math.abs(oneDayPct || 0) >= CONFIG.materiality.priceOneDayPct) reasons.push("1d_price_move");
+  if (Math.abs(zScore || 0) >= CONFIG.materiality.priceZScore) reasons.push("return_zscore");
+  if (volume.volumeTradable !== false && (volume.cumulativeVolumeMultiple || 0) >= CONFIG.materiality.cumulativeVolumeMultiple) reasons.push("cumulative_volume_rvol");
+  return {
+    symbol: holdingSymbol,
+    marketDataSymbol,
+    underlyingSymbol,
+    marketDataBasis,
+    priceSignalVersion: CONFIG.priceSignalVersion,
+    volumeSignalVersion: CONFIG.volumeSignalVersion,
+    available: true,
+    close: round(latestPrice, 4),
+    latestDateHkt: hkt(latestPriceAsOfMs),
+    latestPrice: round(latestPrice, 4),
+    latestPriceAsOfMs,
+    latestPriceAsOfHkt: hkt(latestPriceAsOfMs),
+    latestPriceSource,
+    latestPriceInterval: liveIsNewer ? latestPriceInterval : "1d_fallback",
+    lastCompletedClose: round(lastCompletedClose, 4),
+    lastCompletedCloseHkt: hkt(lastCompletedCloseSec * 1000),
+    lastClosedOneDayPct: round(lastClosedOneDayPct, 2),
+    lastClosedFiveDayPct: round(lastClosedFiveDayPct, 2),
+    oneDayPct: round(oneDayPct, 2),
+    fiveDayPct: round(fiveDayPct, 2),
+    currentMovePct: round(oneDayPct, 2),
+    intradayPct: round(intradayPct, 2),
+    liveClose: round(liveClose, 4),
+    liveAsOfHkt,
+    liveVsLastClosePct: round(liveVsLastClosePct, 2),
+    oneDayBasis: liveIsNewer
+      ? (latestPriceInterval === "1min"
+        ? "latest_1min_price_vs_previous_regular_session_close"
+        : "latest_intraday_fallback_price_vs_previous_regular_session_close")
+      : "last_completed_daily_close_vs_prior_completed_daily_close",
+    zScore: round(zScore, 2),
+    dailyVolumeMultiple: round(dailyVolumeMultiple, 2),
+    volumeMultiple: volume.cumulativeVolumeMultiple,
+    assetVolumeClass: volume.assetVolumeClass,
+    volumeRegime: volume.volumeRegime,
+    volumeBasis: volume.volumeBasis,
+    volumeInterval: volume.volumeInterval,
+    latestVolumeBarVolume: volume.latestVolumeBarVolume,
+    currentCumulativeVolume: volume.currentCumulativeVolume,
+    cumulativeVolumeMedian: volume.cumulativeVolumeMedian,
+    cumulativeVolumeMultiple: volume.cumulativeVolumeMultiple,
+    cumulativeVolumeBaselineSamples: volume.cumulativeVolumeBaselineSamples,
+    sessionCumulativeVolume: volume.sessionCumulativeVolume,
+    sessionCumulativeMedian: volume.sessionCumulativeMedian,
+    sessionCumulativeRvol: volume.sessionCumulativeRvol,
+    sessionCumulativeBaselineSamples: volume.sessionCumulativeBaselineSamples,
+    volumeAvailable: volume.volumeAvailable,
+    volumeTradable: volume.volumeTradable,
+    portfolioMoveContribution: round(portfolioMoveContribution, 5),
+    triggerKinds: [
+      Math.abs(oneDayPct || 0) >= CONFIG.materiality.priceOneDayPct ||
+      Math.abs(zScore || 0) >= CONFIG.materiality.priceZScore
+        ? "price"
+        : "",
+      (volume.volumeTradable !== false && (
+        (volume.cumulativeVolumeMultiple || 0) >= CONFIG.materiality.cumulativeVolumeMultiple
+      ))
+        ? "volume"
+        : "",
+    ].filter(Boolean),
+    abnormal: reasons.length > 0,
+    reasons,
+  };
+}
+
+async function arraysJson(path, params) {
+  const jwt = secret.loadPlaintext("ARRAYS_JWT");
+  if (!jwt) throw new Error("Missing ARRAYS_JWT");
+  const query = Object.keys(params || {})
+    .filter((key) => params[key] !== undefined && params[key] !== null && params[key] !== "")
+    .reduce((pairs, key) => {
+      const value = params[key];
+      const values = Array.isArray(value) ? value : [value];
+      values
+        .filter((item) => item !== undefined && item !== null && item !== "")
+        .forEach((item) => pairs.push(encodeURIComponent(key) + "=" + encodeURIComponent(String(item))));
+      return pairs;
+    }, [])
+    .join("&");
+  const url = ARRAYS_BASE + path + (query ? "?" + query : "");
+  const resp = await http.fetch(url, { headers: { Authorization: "Bearer " + jwt } });
+  const body = await resp.json();
+  if (!resp.ok || body.success === false) {
+    throw new Error("Arrays request failed: " + path + " " + resp.status + " " + JSON.stringify(body).slice(0, 240));
+  }
+  return body;
+}
+
+async function optionalArrays(path, params, warnings, label) {
+  try {
+    return await arraysJson(path, params);
+  } catch (err) {
+    warnings.push({ source: label || path, error: String(err && err.message ? err.message : err).slice(0, 260) });
+    return { data: [] };
+  }
+}
+
+function parseJsonObjectField(value) {
+  if (!value) return {};
+  if (typeof value === "object") return value;
+  try {
+    const parsed = JSON.parse(String(value));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function tweetMetric(row, key) {
+  const direct = amount(row && row[key]);
+  if (Number.isFinite(direct)) return direct;
+  const meta = parseJsonObjectField(row && row.meta_json);
+  const publicMetrics = meta.public_metrics || {};
+  const mapped = {
+    like_count: publicMetrics.like_count,
+    retweet_count: publicMetrics.retweet_count,
+    reply_count: publicMetrics.reply_count,
+    quote_count: publicMetrics.quote_count,
+    view_count: publicMetrics.impression_count || publicMetrics.view_count,
+    bookmark_count: publicMetrics.bookmark_count,
+  };
+  const n = amount(mapped[key]);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function indexedXTweetScore(row) {
+  const likes = tweetMetric(row, "like_count");
+  const reposts = tweetMetric(row, "retweet_count");
+  const replies = tweetMetric(row, "reply_count");
+  const quotes = tweetMetric(row, "quote_count");
+  const bookmarks = tweetMetric(row, "bookmark_count");
+  const views = tweetMetric(row, "view_count");
+  return likes + 2 * reposts + replies + 2 * quotes + 0.5 * bookmarks + 0.001 * views;
+}
+
+function compactIndexedXTweet(row, rank) {
+  const publishedAtMs = Date.parse(row && row.published_at || "") || null;
+  const score = indexedXTweetScore(row || {});
+  const source = row && row.source && typeof row.source === "object" ? row.source : null;
+  return {
+    rank,
+    platform_id: String(row && (row.platform_id || row.id) || ""),
+    url: row && row.url || "",
+    published_at_iso: row && row.published_at || "",
+    published_at_hkt: Number.isFinite(publishedAtMs) ? hkt(publishedAtMs) : "",
+    first_observed_at: row && row.first_observed_at || "",
+    last_observed_at: row && row.last_observed_at || "",
+    handle: row && row.twitter_handle || "",
+    display_name: row && row.display_name || "",
+    content_type: row && row.content_type || "",
+    text: clean(row && row.full_text || "", 900),
+    source_text: clean(row && row.full_text || "", 1400),
+    metrics: {
+      likes: tweetMetric(row, "like_count"),
+      reposts: tweetMetric(row, "retweet_count"),
+      replies: tweetMetric(row, "reply_count"),
+      quotes: tweetMetric(row, "quote_count"),
+      bookmarks: tweetMetric(row, "bookmark_count"),
+      views: tweetMetric(row, "view_count"),
+      engagement_score: round(score, 3),
+    },
+    mentions: row && row.mentions || [],
+    entity_mentions: row && row.entity_mentions || {},
+    referenced_tweets: row && row.referenced_tweets || [],
+    quoted_or_source_tweet: source ? {
+      handle: source.twitter_handle || "",
+      display_name: source.display_name || "",
+      text: clean(source.full_text || "", 700),
+      url: source.url || "",
+      published_at_iso: source.published_at || "",
+    } : null,
+  };
+}
+
+async function fetchIndexedXTopTweets(fetchStartMs, runAtMs, warnings) {
+  const startMs = Math.max(fetchStartMs, runAtMs - CONFIG.indexedXLookbackMinutes * 60 * 1000);
+  const sinceSec = Math.floor(startMs / 1000);
+  let untilSec = Math.floor(runAtMs / 1000);
+  const rawRows = [];
+  const pages = [];
+  const seen = {};
+  for (let page = 0; page < CONFIG.maxIndexedXTweetFetchPages && untilSec >= sinceSec; page += 1) {
+    const body = await optionalArrays("/api/v1/social-feeds/x/search", {
+      since: sinceSec,
+      until: untilSec,
+      limit: CONFIG.maxIndexedXTweetsFetch,
+      content_type: ["original", "quote"],
+    }, warnings, "social-feeds/x/search:indexed-top-engagement:page-" + (page + 1));
+    const pageRows = body.data || [];
+    let oldestMs = null;
+    pageRows.forEach((row) => {
+      const key = String((row && (row.platform_id || row.id || row.url)) || "");
+      if (!key || seen[key]) return;
+      seen[key] = true;
+      rawRows.push(row);
+      const publishedAtMs = Date.parse(row && row.published_at || "") || null;
+      if (Number.isFinite(publishedAtMs)) oldestMs = oldestMs === null ? publishedAtMs : Math.min(oldestMs, publishedAtMs);
+    });
+    pages.push({
+      page: page + 1,
+      untilSec,
+      fetchedRows: pageRows.length,
+      uniqueRowsAfterPage: rawRows.length,
+      oldestPublishedAtMs: oldestMs,
+      oldestPublishedAtHkt: Number.isFinite(oldestMs) ? hkt(oldestMs) : "",
+    });
+    if (pageRows.length < CONFIG.maxIndexedXTweetsFetch || !Number.isFinite(oldestMs) || oldestMs <= startMs + 1000) break;
+    untilSec = Math.floor((oldestMs - 1000) / 1000);
+  }
+  const rows = rawRows
+    .filter((row) => {
+      const publishedAtMs = Date.parse(row && row.published_at || "") || 0;
+      if (!publishedAtMs || publishedAtMs < startMs || publishedAtMs > runAtMs + 60000) return false;
+      const text = clean(row && row.full_text || "", 200);
+      if (!text || /^https?:\/\/\S+$/i.test(text)) return false;
+      return true;
+    })
+    .sort((a, b) => indexedXTweetScore(b) - indexedXTweetScore(a));
+  const topTweets = rows
+    .slice(0, CONFIG.maxIndexedXTweetsForPi)
+    .map((row, idx) => compactIndexedXTweet(row, idx + 1));
+  return {
+    source: "Arrays /api/v1/social-feeds/x/search",
+    discovery_mode: "q_omitted_reverse_chronological_paginated_then_code_ranked_by_engagement",
+    ranking_formula: "likes + 2*reposts + replies + 2*quotes + 0.5*bookmarks + 0.001*views",
+    startMs,
+    endMs: runAtMs,
+    startHkt: hkt(startMs),
+    endHkt: hkt(runAtMs),
+    pages,
+    fetchedPages: pages.length,
+    fetchedRows: rawRows.length,
+    eligibleRows: rows.length,
+    keptRows: topTweets.length,
+    topTweets,
+  };
+}
+
+async function fetchDailyBars(symbol, warnings) {
+  const end = Math.floor(Date.now() / 1000) + 2 * 86400;
+  const start = end - 100 * 86400;
+  const body = await optionalArrays("/api/v1/stocks/kline", {
+    symbol,
+    interval: "1d",
+    start_time: start,
+    end_time: end,
+    limit: 90,
+  }, warnings, "stocks/kline:" + symbol);
+  return (body.data || []).slice().sort((a, b) => barTimeSec(a) - barTimeSec(b));
+}
+
+async function fetchMinuteBars(symbol, warnings) {
+  const end = Math.floor(Date.now() / 1000) + 60;
+  const start = end - CONFIG.latestPriceLookbackHours * 3600;
+  const body = await optionalArrays("/api/v1/stocks/kline", {
+    symbol,
+    interval: CONFIG.latestPriceInterval,
+    session: "ETH",
+    start_time: start,
+    end_time: end,
+    limit: CONFIG.latestPriceLimit,
+  }, warnings, "stocks/kline-1min:" + symbol);
+  return (body.data || []).slice().sort((a, b) => barTimeSec(a) - barTimeSec(b));
+}
+
+async function fetchHourlyBars(symbol, warnings) {
+  const end = Math.floor(Date.now() / 1000) + 3600;
+  const start = end - 35 * 86400;
+  const body = await optionalArrays("/api/v1/stocks/kline", {
+    symbol,
+    interval: "1h",
+    session: "ETH",
+    start_time: start,
+    end_time: end,
+    limit: 120,
+  }, warnings, "stocks/kline-1h:" + symbol);
+  return (body.data || []).slice().sort((a, b) => barTimeSec(a) - barTimeSec(b));
+}
+
+async function fetchNews(symbol, startSec, endSec, warnings) {
+  const body = await optionalArrays("/api/v1/stocks/market-news", {
+    symbol,
+    start_time: startSec,
+    end_time: endSec,
+    sort_by_type: "PUBLISHED_TIME",
+    sort_by: "DESC",
+    limit: CONFIG.eventSourceLimits.marketNewsFetch,
+  }, warnings, "market-news:" + symbol);
+  return (body.data || []).map((item) => ({
+    sourceType: "news",
+    symbol,
+    sourceRecordId: item.id ? String(item.id) : "",
+    title: item.title || "",
+    summary: item.summary || "",
+    source: item.source || item.source_domain || "",
+    url: item.url || "",
+    publishedAtMs: item.publish_time ? item.publish_time * 1000 : Date.parse(item.time_published || "") || null,
+    metadata: {
+      sourceOrigin: "per_ticker_search",
+      sourceLane: "per_ticker_market_news",
+      sourceSearchMode: "arrays_market_news_by_symbol",
+      querySymbol: symbol,
+      sentiment: item.overall_sentiment_label || "",
+      topics: item.topics || [],
+      tickers: item.tickers || [],
+    },
+  }));
+}
+
+function normalizeMarketNewsTopic(value) {
+  const text = String(value || "").trim().toUpperCase().replace(/[\s-]+/g, "_");
+  return SUPPORTED_MARKET_NEWS_TOPICS.indexOf(text) >= 0 ? text : "";
+}
+
+function normalizeTickerRows(tickers) {
+  return uniqueSymbols((Array.isArray(tickers) ? tickers : []).map((row) => {
+    if (typeof row === "string") return row;
+    return row && (row.ticker || row.symbol || row.name || "");
+  }));
+}
+
+function normalizeThemeTopicMappings(parsed, themeContexts) {
+  const rows = Array.isArray(parsed && parsed.themeTopicMappings)
+    ? parsed.themeTopicMappings
+    : (Array.isArray(parsed && parsed.theme_topic_mappings) ? parsed.theme_topic_mappings : []);
+  const mappedByTheme = {};
+  rows.forEach((row) => {
+    const theme = normalizeThemeName(row && (row.theme || row.theme_id || row.themeId));
+    if (!theme) return;
+    const topics = uniqueCompactStrings(
+      (Array.isArray(row.topics) ? row.topics : [row.topic]).map(normalizeMarketNewsTopic).filter(Boolean),
+      80
+    );
+    mappedByTheme[theme] = {
+      theme,
+      topics,
+      reason: clean(row.reason || row.mapping_reason || "", 360),
+    };
+  });
+  return (themeContexts || []).map((context) => {
+    const theme = normalizeThemeName(context.theme);
+    const mapped = mappedByTheme[theme] || { theme, topics: [], reason: "" };
+    const topics = uniqueCompactStrings(mapped.topics || [], 80);
+    return {
+      theme,
+      topics,
+      status: topics.length ? "mapped" : "no_supported_topic",
+      reason: mapped.reason || (topics.length ? "Pi mapped this portfolio theme to supported Arrays market-news topics." : "Pi did not find a supported Arrays market-news topic for this theme."),
+      linked_holdings: context.linked_holdings || [],
+      allocation: context.allocation || 0,
+    };
+  }).filter((row) => row.theme);
+}
+
+async function fetchPriceTargetNews(symbol, startSec, endSec, warnings) {
+  const body = await optionalArrays("/api/v1/stocks/company/price-target-news", {
+    symbol,
+    start_time: startSec,
+    end_time: endSec,
+    limit: CONFIG.eventSourceLimits.priceTargetFetch,
+  }, warnings, "price-target-news:" + symbol);
+  return (body.data || []).map((item) => ({
+    sourceType: "analyst",
+    symbol: item.symbol || symbol,
+    sourceRecordId: item.news_url || item.news_title || "",
+    title: item.news_title || "Price target news",
+    summary: [
+      item.analyst_company || "",
+      Number.isFinite(item.price_target) ? "target " + item.price_target : "",
+      Number.isFinite(item.price_when_posted) ? "price_when_posted " + item.price_when_posted : "",
+    ].filter(Boolean).join(" · "),
+    source: item.news_publisher || item.analyst_company || "",
+    url: item.news_url || "",
+    publishedAtMs: item.observed_at ? item.observed_at * 1000 : Date.parse(item.publish_time || "") || null,
+    metadata: {
+      ...item,
+      sourceOrigin: "per_ticker_search",
+      sourceLane: "per_ticker_price_target",
+      sourceSearchMode: "arrays_price_target_news_by_symbol",
+      querySymbol: symbol,
+    },
+  }));
+}
+
+async function fetchEarnings(symbol, nowSec, warnings) {
+  const body = await optionalArrays("/api/v1/stocks/earnings-calendar", {
+    symbol,
+    start_time: nowSec - 7 * 86400,
+    end_time: nowSec + 45 * 86400,
+  }, warnings, "earnings-calendar:" + symbol);
+  return (body.data || []).map((item) => {
+    const eventAtMs = Date.parse((item.date || "") + "T12:00:00Z") || null;
+    return {
+      sourceType: "corporate_event",
+      symbol: item.symbol || symbol,
+      sourceRecordId: item.id ? String(item.id) : [symbol, item.date, item.time].join(":"),
+      title: symbol + " earnings " + (item.date || ""),
+      summary: "Earnings calendar: " + (item.date || "unknown date") + " " + (item.time || ""),
+      source: "Arrays earnings-calendar",
+      url: "",
+      publishedAtMs: null,
+      metadata: {
+        ...item,
+        eventAtMs,
+        sourceOrigin: "per_ticker_search",
+        sourceLane: "per_ticker_earnings_calendar",
+        sourceSearchMode: "arrays_earnings_calendar_by_symbol",
+        querySymbol: symbol,
+      },
+    };
+  });
+}
+
+function parseSourceMs(value) {
+  if (!value) return null;
+  const text = String(value);
+  let ms = Date.parse(text);
+  if (!Number.isFinite(ms) && /^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    ms = Date.parse(text + "T00:00:00Z");
+  }
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function macroPoint(kind, symbol, row, fetchedAtMs) {
+  if (!row) return null;
+  const sourceDate = row.date || row.timestamp || row.time || "";
+  const sourceAsOfMs = parseSourceMs(sourceDate);
+  return {
+    ...row,
+    kind,
+    symbol: row.symbol || symbol,
+    fetchedAtMs,
+    fetchedAtHkt: hkt(fetchedAtMs),
+    sourceDate,
+    sourceAsOfMs,
+    sourceAsOfHkt: Number.isFinite(sourceAsOfMs) ? hkt(sourceAsOfMs) : "",
+    sourceAgeHours: Number.isFinite(sourceAsOfMs) ? round((fetchedAtMs - sourceAsOfMs) / 3600000, 2) : null,
+    timestampPrecision: sourceDate ? "date" : "missing",
+    freshnessNote: sourceDate
+      ? "Macro endpoint provides date-level source timestamp; fetchedAtMs is retrieval time."
+      : "Macro endpoint did not provide a source timestamp; use as contextual only.",
+  };
+}
+
+function macroFreshnessSummary(macro) {
+  return Object.keys(macro || {})
+    .filter((key) => key !== "_meta")
+    .map((key) => {
+      const row = macro[key] || {};
+      return {
+        key,
+        sourceDate: row.sourceDate || row.date || "",
+        sourceAsOfHkt: row.sourceAsOfHkt || "",
+        fetchedAtHkt: row.fetchedAtHkt || "",
+        sourceAgeHours: row.sourceAgeHours,
+        timestampPrecision: row.timestampPrecision || "",
+      };
+    });
+}
+
+async function fetchMacro(warnings) {
+  const fetchedAtMs = Date.now();
+  const out = {
+    _meta: {
+      fetchedAtMs,
+      fetchedAtHkt: hkt(fetchedAtMs),
+      timestampPolicy: "Macro data is fetched once per run. Arrays macro real-time/rates endpoints currently expose date-level source timestamps, so analyst should treat sourceDate/sourceAge as freshness context and fetchedAt as retrieval time.",
+    },
+  };
+  const indexSymbols = ["^SPX", "^IXIC", "^VIX"];
+  for (const symbol of indexSymbols) {
+    const body = await optionalArrays("/api/v1/macro/index/real-time", { symbol }, warnings, "macro-index:" + symbol);
+    out[symbol] = macroPoint("index", symbol, (body.data || [])[0] || null, fetchedAtMs);
+  }
+  const oil = await optionalArrays("/api/v1/macro/commodity/real-time", { symbol: "CLUSD" }, warnings, "macro-oil:CLUSD");
+  out.CLUSD = macroPoint("commodity", "CLUSD", (oil.data || [])[0] || null, fetchedAtMs);
+  const rates = await optionalArrays("/api/v1/macro/treasury-rates", {}, warnings, "macro-rates");
+  out.rates = macroPoint("treasury_rates", "UST", (rates.data || [])[0] || null, fetchedAtMs);
+  out._meta.items = macroFreshnessSummary(out);
+  return out;
+}
+
+function isoDateOnly(ms) {
+  if (!Number.isFinite(ms)) return "";
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function piMessageText(message) {
+  const content = message && Array.isArray(message.content) ? message.content : [];
+  return content
+    .filter((block) => block && block.type === "text")
+    .map((block) => block.text || "")
+    .join("");
+}
+
+function buildPiThemeContexts(snapshot, currentThemes) {
+  const seen = {};
+  return (currentThemes || [])
+    .filter((row) => row && row.theme && row.theme !== "uncategorized")
+    .map((row) => {
+      const theme = normalizeThemeName(row.theme);
+      return {
+        theme,
+        allocation: round(row.allocation || 0, 4),
+        linked_holdings: holdingsForTheme(snapshot, theme).map((holding) => ({
+          symbol: holding.symbol,
+          weight: round(holding.allocation || 0, 4),
+        })),
+      };
+    })
+    .filter((row) => {
+      if (!row.theme || seen[row.theme]) return false;
+      seen[row.theme] = true;
+      return true;
+	    });
+}
+
+function buildPiHoldingContexts(snapshot) {
+  return (snapshot.holdings || []).map((holding) => {
+    const marketDataSymbol = marketDataSymbolForHolding(holding);
+    const aliases = uniqueCompactStrings(
+      []
+        .concat(CONFIG.aliases[holding.symbol] || [])
+        .concat(CONFIG.aliases[marketDataSymbol] || [])
+        .concat([holding.symbol, marketDataSymbol]),
+      80
+    ).slice(0, 8);
+    return {
+      holding_symbol: holding.symbol,
+      market_data_symbol: marketDataSymbol,
+      asset_class: holding.assetClass,
+      side: holding.side,
+      quantity: holding.quantity,
+      weight: round(holding.allocation || 0, 4),
+      market_value: Number.isFinite(holding.marketValue) ? round(holding.marketValue, 2) : null,
+      themes: themesForHolding(snapshot, holding),
+      aliases,
+      instrument_details: {
+        underlying: holding.instrumentDetails && holding.instrumentDetails.underlying || "",
+        optionType: holding.instrumentDetails && holding.instrumentDetails.optionType || "",
+        expiry: holding.instrumentDetails && holding.instrumentDetails.expiry || "",
+        strike: holding.instrumentDetails && holding.instrumentDetails.strike || null,
+      },
+    };
+  });
+}
+
+function normalizeConfidence(value) {
+  const text = String(value || "").toLowerCase();
+  return ["low", "medium", "high"].indexOf(text) >= 0 ? text : "";
+}
+
+function arrayFromPossibleObject(value) {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") {
+    return Object.keys(value).map((key) => {
+      const row = value[key];
+      return row && typeof row === "object" ? { symbol: key, ...row } : { symbol: key, rationale: String(row || "") };
+    });
+  }
+  return [];
+}
+
+function sourceRelatedTickersFromPiItem(item) {
+  return uniqueSymbols(
+    []
+      .concat(item && item.source_related_tickers || [])
+      .concat(item && item.sourceRelatedTickers || [])
+      .concat(item && item.source_tickers || [])
+      .concat(item && item.symbols || [])
+      .concat(item && item.tickers || [])
+  );
+}
+
+function relatedHoldingsFromPiItem(item, snapshot) {
+  const holdingBy = bySymbol(snapshot);
+  const rows = []
+    .concat(arrayFromPossibleObject(item && item.related_holdings))
+    .concat(arrayFromPossibleObject(item && item.relatedHoldings))
+    .concat(arrayFromPossibleObject(item && item.holding_mappings))
+    .concat(arrayFromPossibleObject(item && item.affected_holdings));
+  const byHolding = {};
+  rows.forEach((row) => {
+    const value = typeof row === "string" ? { symbol: row } : (row || {});
+    const symbol = String(
+      value.holding_symbol ||
+      value.holdingSymbol ||
+      value.holding ||
+      value.symbol ||
+      ""
+    ).toUpperCase();
+    if (!symbol || !holdingBy[symbol]) return;
+    byHolding[symbol] = {
+      symbol,
+      relation: clean(value.relation || value.relationship || value.relation_type || value.relationType || "portfolio_relevance", 80),
+      confidence: normalizeConfidence(value.confidence),
+      rationale: clean(value.rationale || value.reason || value.why_relevant || value.whyRelevant || "", 320),
+      mappingSource: "pi_agentic_event_mapping",
+    };
+  });
+  return Object.keys(byHolding)
+    .sort((a, b) => ((holdingBy[b] && holdingBy[b].allocation) || 0) - ((holdingBy[a] && holdingBy[a].allocation) || 0))
+    .map((symbol) => byHolding[symbol]);
+}
+
+function piEventSourceType(item, themeNews) {
+  const kind = String(item && (item.source_kind || item.sourceKind || item.source_type || item.sourceType) || "").toLowerCase();
+  if (themeNews && (kind.indexOf("topic") >= 0 || kind.indexOf("arrays") >= 0)) return "topic_news";
+  return themeNews ? "theme_news" : "breaking_news";
+}
+
+function inferBreakingNewsSymbols(item, snapshot) {
+  const explicit = Array.isArray(item.symbols) ? item.symbols.map((s) => String(s || "").toUpperCase()) : [];
+  const holdingBy = bySymbol(snapshot);
+  const explicitHeld = explicit.filter((symbol) => !!holdingBy[symbol]);
+  if (explicitHeld.length) return explicitHeld;
+  const explicitUnderlyingHeld = [];
+  explicit.forEach((symbol) => {
+    (snapshot.holdings || []).forEach((holding) => {
+      if (marketDataSymbolForHolding(holding) === symbol) explicitUnderlyingHeld.push(holding.symbol);
+    });
+  });
+  if (explicitUnderlyingHeld.length) return uniqueSymbols(explicitUnderlyingHeld);
+
+  const text = ((item.title || "") + " " + (item.summary || "") + " " + (item.why_relevant || "")).toLowerCase();
+  const itemThemes = normalizedItemThemes(item);
+  const inferred = (snapshot.holdings || [])
+    .filter((holding) => {
+      if (holdingReferenceSymbols(holding).some((symbol) => eventMentionsSymbol({ title: item.title || "", summary: text, metadata: { tickers: explicit } }, symbol))) return true;
+      const themes = themesForHolding(snapshot, holding);
+      return itemThemes.some((theme) => themes.indexOf(normalizeThemeName(theme)) >= 0);
+    })
+    .sort((a, b) => (b.allocation || 0) - (a.allocation || 0))
+    .slice(0, 6)
+    .map((holding) => holding.symbol);
+  return inferred;
+}
+
+function normalizedItemThemes(item) {
+  const out = {};
+  if (Array.isArray(item && item.themes)) {
+    item.themes.forEach((theme) => {
+      const key = String(theme || "").toLowerCase();
+      if (key) out[key] = true;
+    });
+  }
+  const matched = String((item && (item.matched_theme || item.theme)) || "").toLowerCase();
+  if (matched) out[matched] = true;
+  return Object.keys(out);
+}
+
+function normalizedItemRiskFactors(item) {
+  const out = {};
+  []
+    .concat(item && item.risk_factors || [])
+    .concat(item && item.riskFactors || [])
+    .concat(item && item.portfolio_risk_factors || [])
+    .concat(item && item.portfolioRiskFactors || [])
+    .forEach((factor) => {
+      const key = normalizeThemeName(factor);
+      if (key) out[key] = true;
+    });
+  return Object.keys(out);
+}
+
+function eventScope(item) {
+  return String(item.event_scope || item.source_type || item.source_kind || "").toLowerCase();
+}
+
+function isThemeNewsEvent(item) {
+  const scope = eventScope(item);
+  return scope.indexOf("theme") >= 0 || scope.indexOf("industry") >= 0;
+}
+
+function themeAllocationLookup(currentThemes) {
+  const out = {};
+  (currentThemes || []).forEach((row) => {
+    if (row && row.theme) out[String(row.theme).toLowerCase()] = row.allocation || 0;
+  });
+  return out;
+}
+
+function sourceEventTimeValue(item, themeNews) {
+  const fieldNames = ["source_event_time", "sourceEventTime", "origin_source_time", "original_source_time"];
+  for (const name of fieldNames) {
+    if (!Object.prototype.hasOwnProperty.call(item || {}, name)) continue;
+    const value = item[name];
+    if (value === null) return null;
+    const text = String(value || "").trim();
+    if (text) return text;
+  }
+  return themeNews ? "" : null;
+}
+
+function normalizeBreakingNewsRecords(parsed, snapshot, runAtMs, currentThemes) {
+  const events = Array.isArray(parsed && parsed.events) ? parsed.events : [];
+  const records = [];
+  const themeAllocationBy = themeAllocationLookup(currentThemes);
+	events.slice(0, CONFIG.maxBreakingNewsRecords).forEach((item, idx) => {
+	  const title = clean(item.title || item.event_title || "", 240);
+	  const summary = clean(item.summary || item.why_relevant || item.market_impact || "", 700);
+	  const sourceText = clean(item.source_text || item.sourceText || item.source_text_excerpt || item.sourceTextExcerpt || item.content || item.description || item.raw_text || "", 1600);
+	  if (!title && !summary) return;
+	  const themeNews = isThemeNewsEvent(item);
+	  const sourceType = piEventSourceType(item, themeNews);
+	  const relatedHoldings = relatedHoldingsFromPiItem(item, snapshot);
+	  const matchedSymbols = relatedHoldings.map((row) => row.symbol);
+	  const riskFactors = normalizedItemRiskFactors(item);
+	  const eventThemes = uniqueCompactStrings(normalizedItemThemes(item).concat(riskFactors), 80).map(normalizeThemeName).filter(Boolean);
+	  const sourceRelatedTickers = sourceRelatedTickersFromPiItem(item);
+	  const themeAllocation = eventThemes.reduce((acc, theme) => Math.max(acc, themeAllocationBy[theme] || 0), 0);
+		  const sourceTweetUrl = clean(
+		    item.source_tweet_url ||
+		    item.sourceTweetUrl ||
+		    item.expanded_from_tweet_url ||
+		    item.expandedFromTweetUrl ||
+		    item.x_post_url ||
+		    item.xPostUrl ||
+		    "",
+		    500
+		  );
+		  const sourceTweetId = clean(
+		    item.source_tweet_id ||
+		    item.sourceTweetId ||
+		    item.expanded_from_tweet_id ||
+		    item.expandedFromTweetId ||
+		    item.x_post_id ||
+		    item.xPostId ||
+		    "",
+		    80
+		  );
+		  const sourceTweetRank = amount(item.source_tweet_rank || item.sourceTweetRank || item.x_rank || item.xRank);
+		  const sourceTweetEngagementScore = amount(item.source_tweet_engagement_score || item.sourceTweetEngagementScore || item.engagement_score || item.engagementScore);
+		  const expandedFromTweetUrl = clean(item.expanded_from_tweet_url || item.expandedFromTweetUrl || sourceTweetUrl || "", 500);
+		  const expandedFromTweetId = clean(item.expanded_from_tweet_id || item.expandedFromTweetId || sourceTweetId || "", 80);
+		  const rawLinks = Array.isArray(item.source_links) ? item.source_links.filter(Boolean) : [];
+		  const links = uniqueCompactStrings((sourceTweetUrl ? [sourceTweetUrl] : []).concat(rawLinks), 500).slice(0, 6);
+    const publishedAtMs =
+      Date.parse(item.published_at_iso || item.event_time_iso || item.publishedAt || "") ||
+      Date.parse(item.created_at || "") ||
+      null;
+    const sourceEventTimeRaw = sourceEventTimeValue(item, themeNews);
+    const sourceEventAtMs = parseSourceMs(sourceEventTimeRaw);
+    const holdingBy = bySymbol(snapshot);
+    const affectedThemes = uniqueCompactStrings(
+      eventThemes.concat(matchedSymbols.reduce((acc, symbol) => acc.concat(themesForHolding(snapshot, holdingBy[symbol] || { symbol })), [])),
+      80
+    ).map(normalizeThemeName).filter(Boolean);
+	  const linkedHoldings = matchedSymbols.map((symbol) => ({
+	    symbol,
+	    weight: round((holdingBy[symbol] && holdingBy[symbol].allocation) || 0, 4),
+	  }));
+	  const linkedHoldingWeight = linkedHoldings.reduce((acc, row) => acc + (Number(row.weight) || 0), 0);
+	  const portfolioRelevanceBasis = clean(
+	    item.portfolio_relevance_basis ||
+	    item.portfolioRelevanceBasis ||
+	    item.why_relevant ||
+	    item.market_impact ||
+	    "",
+	    700
+	  );
+	  const mappingReason = clean(
+	    item.mapping_reason ||
+	    item.mappingReason ||
+	    relatedHoldings.map((row) => row.symbol + ": " + (row.rationale || row.relation || "")).join("; ") ||
+	    portfolioRelevanceBasis ||
+	    "",
+	    700
+	  );
+	  const sourceOrigin = sourceType === "topic_news"
+	    ? "arrays_topic_news"
+	    : (themeNews ? "pi_theme_search" : "pi_market_breaking_search");
+	  const sourceLane = sourceType === "topic_news"
+	    ? "pi_arrays_topic_news"
+	    : (themeNews ? "pi_theme_news" : "pi_market_breaking");
+		  const sourceSearchMode = sourceType === "topic_news"
+		    ? "pi_agent_arrays_market_news_by_topic"
+		    : (themeNews ? "pi_planned_brave_theme_search" : "arrays_indexed_x_top_tweets");
+	  records.push({
+	    sourceType,
+	    symbol: matchedSymbols.length ? (matchedSymbols.length > 1 ? "PORTFOLIO" : matchedSymbols[0]) : "PORTFOLIO",
+	    affectedSymbols: matchedSymbols,
+	    affectedThemes,
+      sourceRecordId: item.event_id || item.id || links[0] || title || ("pi-event-search-" + idx),
+      title,
+      summary,
+	    source: sourceType === "topic_news"
+	      ? "Pi event-search topic-news lane: " + (item.matched_theme || item.source_kind || "Arrays")
+	      : (themeNews
+	        ? "Pi event-search theme-news lane: " + (item.matched_theme || item.source_kind || "Brave")
+	        : (item.source_kind ? "Pi event-search loop: " + item.source_kind : "Pi event-search loop")),
+      url: links[0] || "",
+      publishedAtMs,
+      mappingReason,
+      metadata: {
+        sourceLinks: links,
+        confidence: item.confidence || "",
+	        whyRelevant: item.why_relevant || "",
+	        mappingReason,
+	        sourceText,
+	        themes: item.themes || (item.matched_theme ? [item.matched_theme] : []),
+	        riskFactors,
+	        portfolioRelevanceBasis,
+	        affectedThemes,
+	        affectedSymbols: matchedSymbols,
+	        linkedHoldings,
+	        relatedHoldings,
+		        sourceRelatedTickers,
+		        tickers: sourceRelatedTickers,
+		        sourceTweetId,
+		        sourceTweetUrl,
+		        sourceTweetRank: Number.isFinite(sourceTweetRank) ? sourceTweetRank : null,
+		        sourceTweetEngagementScore: Number.isFinite(sourceTweetEngagementScore) ? round(sourceTweetEngagementScore, 3) : null,
+		        expandedFromTweetId,
+		        expandedFromTweetUrl,
+		        holdingMappingPolicy: matchedSymbols.length ? "pi_agent_related_holdings_only" : "pi_agent_related_holdings_or_portfolio_level",
+	        portfolioLevelEvent: !matchedSymbols.length,
+	        piBreakingNews: !themeNews,
+	        piThemeNews: themeNews,
+	        sourceOrigin,
+	        sourceLane,
+	        sourceSearchMode,
+	        themeMatched: themeNews,
+        matchedTheme: item.matched_theme || eventThemes[0] || "",
+        themeAllocation: themeNews ? round(themeAllocation || 0, 4) : null,
+        linkedHoldingWeight: round(linkedHoldingWeight || 0, 4),
+	        query: item.search_query || item.query || (sourceType === "breaking_news" ? "arrays_indexed_x_top_engagement_recent_90m" : ""),
+        sourceTimeLabel: item.source_time_label || item.sourceTimeLabel || item.published_at_label || "",
+        sourceEventTime: sourceEventTimeRaw === null ? null : String(sourceEventTimeRaw || ""),
+        sourceEventAtMs,
+        sourceEventHkt: Number.isFinite(sourceEventAtMs) ? hkt(sourceEventAtMs) : "",
+        fetchedAtMs: themeNews ? runAtMs : null,
+        fetchedAtHkt: themeNews ? hkt(runAtMs) : "",
+	        searchProvider: themeNews ? "Brave via Pi Agent" : (sourceType === "breaking_news" ? "Arrays indexed X via code; Brave source expansion via Pi when used" : ""),
+        eventScope: eventScope(item) || (themeNews ? "theme_news" : "market_breaking"),
+      },
+    });
+  });
+  return records;
+}
+
+async function fetchBreakingNews(snapshot, currentThemes, fetchStartMs, runAtMs, warnings) {
+  const summary = {
+    enabled: CONFIG.breakingNewsEnabled,
+    environment: "Pi Agent",
+    agentCalled: false,
+    model: "gpt-5.5",
+		  tools: ["searchArraysIndexedX(code)", "searchBrave", "searchArraysMarketNewsTopic"],
+	    queries: [],
+	    indexedXDiscovery: null,
+    themeQueries: [],
+    themeTopicMappings: [],
+    topicNewsCalls: [],
+    topicNewsRecords: 0,
+	  queryPlanning: "pi_agent_objective_centric",
+	  holdingContextCount: 0,
+	  themeContextCount: 0,
+    toolCalls: [],
+    parsedEventCount: 0,
+    rawEventRecords: 0,
+    themeNewsSummary: {
+      enabled: true,
+	    environment: "Pi Agent",
+	    agentCalled: false,
+	    tools: ["themeTopicMappings", "searchArraysMarketNewsTopic", "searchBrave"],
+      queries: [],
+      themeTopicMappings: [],
+      topicNewsCalls: [],
+      topicNewsRecords: 0,
+	      queryPlanning: "pi_agent_objective_centric",
+	      holdingContextCount: 0,
+	      themeContextCount: 0,
+      toolCalls: [],
+      parsedEventCount: 0,
+      rawEventRecords: 0,
+      error: "",
+    },
+    stopReason: "",
+    rawTextPreview: "",
+    error: "",
+  };
+  if (!CONFIG.breakingNewsEnabled) return { records: [], summary };
+	  const themeContexts = buildPiThemeContexts(snapshot, currentThemes);
+	  const holdingContexts = buildPiHoldingContexts(snapshot);
+	  summary.holdingContextCount = holdingContexts.length;
+	  summary.themeContextCount = themeContexts.length;
+	  summary.themeNewsSummary.holdingContextCount = holdingContexts.length;
+	  summary.themeNewsSummary.themeContextCount = themeContexts.length;
+
+	  try {
+	    const { Agent, Type, getModel } = require("@alva/pi");
+	    const { searchBrave } = require("@arrays/data/search/search-brave:v1.0.0");
+	    const indexedXDiscovery = await fetchIndexedXTopTweets(fetchStartMs, runAtMs, warnings);
+	    summary.indexedXDiscovery = {
+	      source: indexedXDiscovery.source,
+	      discovery_mode: indexedXDiscovery.discovery_mode,
+	      ranking_formula: indexedXDiscovery.ranking_formula,
+		      startHkt: indexedXDiscovery.startHkt,
+		      endHkt: indexedXDiscovery.endHkt,
+		      fetchedPages: indexedXDiscovery.fetchedPages,
+		      pageLimit: CONFIG.maxIndexedXTweetsFetch,
+		      maxPages: CONFIG.maxIndexedXTweetFetchPages,
+		      fetchedRows: indexedXDiscovery.fetchedRows,
+		      eligibleRows: indexedXDiscovery.eligibleRows,
+		      keptRows: indexedXDiscovery.keptRows,
+		      pages: indexedXDiscovery.pages,
+		      topTweets: indexedXDiscovery.topTweets.slice(0, 10).map((tweet) => ({
+	        rank: tweet.rank,
+	        handle: tweet.handle,
+	        content_type: tweet.content_type,
+	        published_at_hkt: tweet.published_at_hkt,
+	        engagement_score: tweet.metrics && tweet.metrics.engagement_score,
+	        url: tweet.url,
+	        text: clean(tweet.text, 220),
+	      })),
+	    };
+		    const toolCalls = [{
+			      tool: "searchArraysIndexedX",
+			      purpose: "market_breaking indexed_x_top_engagement",
+			      query: "/api/v1/social-feeds/x/search q omitted; code paginates and ranks by engagement",
+			      resultCount: indexedXDiscovery.fetchedRows,
+			      startHkt: indexedXDiscovery.startHkt,
+			      endHkt: indexedXDiscovery.endHkt,
+			      limit: CONFIG.maxIndexedXTweetsFetch * CONFIG.maxIndexedXTweetFetchPages,
+		    }];
+		    let themeBraveCallCount = 0;
+		    let sourceBraveCallCount = 0;
+		    let topicNewsCallCount = 0;
+		    const maxThemeBraveCalls = themeContexts.length * CONFIG.maxThemeNewsSearchAttemptsPerTheme;
+		    const maxSourceBraveCalls = CONFIG.maxBreakingNewsBraveCalls;
+		    const maxTopicNewsCalls = CONFIG.maxTopicNewsToolCalls;
+	    const tools = [
+		      {
+	        name: "searchArraysMarketNewsTopic",
+	        description: "Fetch recent Arrays market-news rows for one supported topic after you map a supplied portfolio theme to that topic. Use the returned source_tickers only as source context; you must still decide related_holdings yourself from the current portfolio context.",
+	        parameters: Type.Object({
+	          topic: Type.String(),
+	          theme: Type.Optional(Type.String()),
+	          purpose: Type.Optional(Type.String()),
+	        }),
+	        execute: async (_id, { topic, theme, purpose }) => {
+	          const normalizedTopic = normalizeMarketNewsTopic(topic);
+	          if (!normalizedTopic) {
+	            const compactInvalid = { success: false, topic, rows: [], error: "unsupported_topic" };
+	            toolCalls.push({ tool: "searchArraysMarketNewsTopic", purpose: purpose || "theme_news", theme: clean(theme || "", 80), topic: clean(topic || "", 80), resultCount: 0, error: "unsupported_topic" });
+	            return { content: [{ type: "text", text: compactJson(compactInvalid, 2000) }], details: compactInvalid };
+	          }
+	          if (topicNewsCallCount >= maxTopicNewsCalls) {
+	            const compactLimit = { success: false, topic: normalizedTopic, rows: [], limitReached: true };
+	            toolCalls.push({ tool: "searchArraysMarketNewsTopic", purpose: purpose || "theme_news", theme: clean(theme || "", 80), topic: normalizedTopic, resultCount: 0, limitReached: true });
+	            return { content: [{ type: "text", text: compactJson(compactLimit, 2000) }], details: compactLimit };
+	          }
+	          topicNewsCallCount += 1;
+	          const body = await optionalArrays("/api/v1/stocks/market-news", {
+	            topic: normalizedTopic,
+	            start_time: Math.floor(fetchStartMs / 1000),
+	            end_time: Math.floor(runAtMs / 1000),
+	            sort_by_type: "PUBLISHED_TIME",
+	            sort_by: "DESC",
+	            limit: CONFIG.maxTopicNewsRowsPerTopic,
+	          }, warnings, "pi-market-news-topic:" + normalizedTopic);
+	          const rows = (body.data || []).slice(0, CONFIG.maxTopicNewsRowsPerTopic).map((item) => {
+	            const publishedAtMs = item.publish_time ? item.publish_time * 1000 : Date.parse(item.time_published || "") || null;
+	            return {
+	              id: item.id ? String(item.id) : (item.url || item.title || ""),
+	              title: clean(item.title || "", 240),
+	              summary: clean(item.summary || "", 700),
+	              source_text: clean(item.summary || item.title || "", 1400),
+	              url: item.url || "",
+	              source: item.source || item.source_domain || "Arrays market-news topic",
+	              published_at_iso: Number.isFinite(publishedAtMs) ? new Date(publishedAtMs).toISOString() : "",
+	              published_at_hkt: Number.isFinite(publishedAtMs) ? hkt(publishedAtMs) : "",
+	              source_related_tickers: normalizeTickerRows(item.tickers),
+	              topics: item.topics || [],
+	            };
+	          });
+	          const compact = {
+	            success: true,
+	            topic: normalizedTopic,
+	            theme: theme || "",
+	            start_hkt: hkt(fetchStartMs),
+	            end_hkt: hkt(runAtMs),
+	            rows,
+	          };
+	          toolCalls.push({
+	            tool: "searchArraysMarketNewsTopic",
+	            purpose: purpose || "theme_news",
+	            theme: clean(theme || "", 80),
+	            topic: normalizedTopic,
+	            resultCount: rows.length,
+	            startHkt: hkt(fetchStartMs),
+	            endHkt: hkt(runAtMs),
+	            limit: CONFIG.maxTopicNewsRowsPerTopic,
+	          });
+	          return { content: [{ type: "text", text: compactJson(compact, 16000) }], details: compact };
+	        },
+	      },
+	      {
+		        name: "searchBrave",
+	        description: "Search web/news results. Use purpose='theme_news' with result_filter='news' for recent theme/industry searches you plan from portfolio theme context. Use purpose='source_expansion' with result_filter='web' only after a supplied indexed-X top tweet plausibly qualifies as market-breaking, to identify its original/official or earliest credible source. source_expansion must not discover brand-new market_breaking events without an indexed-X anchor and is not restricted to the recent event window. Never use result_filter='news' for source_expansion. If results are off-objective, refine the query within budget.",
+        parameters: Type.Object({
+          query: Type.String(),
+          result_filter: Type.Optional(Type.String()),
+          purpose: Type.Optional(Type.String()),
+          theme: Type.Optional(Type.String()),
+        }),
+        execute: async (_id, { query, result_filter, purpose, theme }) => {
+          const normalizedPurpose = String(purpose || "").toLowerCase();
+          const callPurpose = normalizedPurpose.indexOf("theme") >= 0 ? "theme_news" : "source_expansion";
+          const limitReached = callPurpose === "theme_news"
+            ? themeBraveCallCount >= maxThemeBraveCalls
+            : sourceBraveCallCount >= maxSourceBraveCalls;
+          if (limitReached) {
+            const compactLimit = { success: false, query, rows: [], limitReached: true };
+            toolCalls.push({ tool: "searchBrave", purpose: callPurpose, theme: clean(theme || "", 80), query: clean(query, 180), resultCount: 0, limitReached: true });
+            return { content: [{ type: "text", text: compactJson(compactLimit, 2000) }], details: compactLimit };
+          }
+          if (callPurpose === "theme_news") themeBraveCallCount += 1;
+          else sourceBraveCallCount += 1;
+          const resultFilter = callPurpose === "source_expansion"
+            ? "web"
+            : (result_filter || "news");
+          const braveParams = {
+            query,
+            result_filter: resultFilter,
+            count: callPurpose === "theme_news" ? CONFIG.maxThemeNewsRowsPerQuery : 5,
+          };
+          if (callPurpose === "theme_news") braveParams.freshness = "pd";
+          const result = await searchBrave(braveParams);
+	          const rows = (((result || {}).response || {}).data || []).slice(0, callPurpose === "theme_news" ? CONFIG.maxThemeNewsRowsPerQuery : 5).map((row) => ({
+	            title: clean(row.title || "", 240),
+	            url: row.url || "",
+	            description: clean(row.description || "", 500),
+	            source_text: clean(row.description || row.title || "", 1400),
+	            age: row.age || "",
+            date: row.date || "",
+            result_type: row.result_type || resultFilter || "",
+          }));
+          const compact = { success: !!(result && result.success !== false), query, rows };
+          toolCalls.push({
+            tool: "searchBrave",
+            purpose: callPurpose,
+            theme: clean(theme || "", 80),
+            query: clean(query, 180),
+            resultFilter,
+            freshness: callPurpose === "theme_news" ? "pd" : "unrestricted",
+            resultCount: rows.length,
+          });
+          return { content: [{ type: "text", text: compactJson(compact, 8000) }], details: compact };
+        },
+      },
+    ];
+	    const systemPrompt = [
+	      "You are the Pi event-search agent inside a portfolio watch automation.",
+	      "Your job is fresh event discovery only. You do not decide whether to push.",
+	      "You cover two lanes: market-wide indexed-X breaking-news review, and theme/industry news discovery for supplied current portfolio themes.",
+	      "For market-wide breaking-news, runtime code has already fetched recent Arrays indexed X posts and ranked them by engagement. Review only the supplied indexed_x_top_tweets; do not use portfolio holdings as discovery seeds and do not invent X results.",
+		      "A supplied indexed-X tweet is only a market_breaking anchor if it is fresh, investment-related, and plausibly market-moving for macro, rates, oil, geopolitics, semiconductors, AI infrastructure, crypto, major listed assets, or broad risk appetite. If the top tweets are social, political color with no market transmission, product fluff, jokes, or generic commentary, return no market_breaking event for them.",
+		      "When a supplied indexed-X tweet qualifies, proactively use searchBrave source_expansion to look for the original/official source first; if no official source is findable, use the earliest credible media/source link.",
+		      "For every indexed-X market_breaking event you return, include source_tweet_id, source_tweet_url, source_tweet_rank, source_tweet_engagement_score, expanded_from_tweet_url, the best original/official or earliest credible source you found, plus source_event_time when available. Use null only after a real source-expansion attempt fails or budget is exhausted.",
+		      "When using searchBrave for source_expansion, always pass purpose='source_expansion' and result_filter='web'. Do not pass result_filter='news' for source_expansion; the news vertical can miss official/source pages such as Fed statements, Reuters, CNBC, or primary-source pages.",
+		      "Do not use source_expansion to discover market_breaking events that were not anchored to a supplied indexed-X tweet. Brave expansion can confirm and enrich an indexed-X candidate, not create a new market_breaking candidate.",
+		      "For theme/industry news, first map every supplied current portfolio theme to supported Arrays market-news topics. Use no_supported_topic when none fit. When a topic fits, call searchArraysMarketNewsTopic to inspect actual source rows before returning any topic-derived event.",
+	      "You may also build Brave news queries from supplied current portfolio theme context when useful, especially when topic mapping is too broad or needs source context.",
+	      "For returned single-name or theme events, agentically map them to current holdings using current_portfolio_holdings and return related_holdings[]. Use exact holding_symbol values from the supplied portfolio. Source-returned tickers are context only, not an automatic mapping.",
+	      "When deciding related_holdings, use the event source text from tool rows (source_text/content/summary/description) plus source metadata. Do not map a holding from title and URL alone; if the source text is missing or too thin, use source expansion when appropriate or omit the event.",
+	      "A holding can be related even when not directly mentioned: peer/competitor read-through, supplier/customer exposure, shared theme/industry, macro/rates/oil/FX/liquidity sensitivity, crypto beta, or option-underlying exposure can all be valid if you explain the relation.",
+	      "Do not drop a truly market-moving macro, policy, liquidity, geopolitical, rates, oil, or broad risk-appetite event only because it has no exact holding symbol. For those portfolio-level events, return related_holdings: [], symbols: [], risk_factors, and portfolio_relevance_basis. If an event has neither exact holding relevance nor a credible portfolio-level risk-factor basis, do not return it.",
+	      "After each tool result, reflect on whether the query was on-objective. If results are stale, generic, or off-topic, try a sharper query within budget rather than returning bad events.",
+	      "Only return events that are new enough for the supplied window and plausibly material to markets, sectors, macro, major listed assets, or the supplied theme/industry exposures.",
+      "Do not invent sources, prices, portfolio positions, or conclusions. If nothing clears the bar, return an empty events array.",
+      "Return JSON only.",
+    ].join("\n");
+    const agent = new Agent({
+      initialState: {
+        systemPrompt,
+        model: getModel("openai", "gpt-5.5"),
+        tools,
+        thinkingLevel: "off",
+      },
+      getApiKey: () => secret.loadPlaintext("openai"),
+    });
+    const prompt = [
+      "Objective-centric market and theme discovery context:",
+      compactJson({
+		        run_at_hkt: hkt(runAtMs),
+		        window_start_hkt: hkt(fetchStartMs),
+		        market_breaking_objective: "Review the supplied recent Arrays indexed X top-engagement tweets and decide whether any one is a fresh investment-related market-breaking event. Only qualifying supplied tweets may enter Brave source expansion.",
+		        indexed_x_discovery: {
+		          source: indexedXDiscovery.source,
+		          discovery_mode: indexedXDiscovery.discovery_mode,
+		          ranking_formula: indexedXDiscovery.ranking_formula,
+		          start_hkt: indexedXDiscovery.startHkt,
+		          end_hkt: indexedXDiscovery.endHkt,
+		          fetched_rows: indexedXDiscovery.fetchedRows,
+		          eligible_rows_after_code_filters: indexedXDiscovery.eligibleRows,
+		          supplied_top_tweet_count: indexedXDiscovery.keptRows,
+		          indexed_x_top_tweets: indexedXDiscovery.topTweets,
+		        },
+		        theme_news_objective: "For each supplied current portfolio theme, map it to supported Arrays market-news topics, fetch useful topic rows with searchArraysMarketNewsTopic, and/or run a concise Brave industry/news query when it adds source context. Return events you can map to current holdings agentically, plus truly material portfolio-level risk-factor events when no exact holding symbol applies.",
+		        supported_arrays_market_news_topics: SUPPORTED_MARKET_NEWS_TOPICS,
+			        search_budgets: {
+			          indexed_x_page_limit: CONFIG.maxIndexedXTweetsFetch,
+			          indexed_x_max_pages: CONFIG.maxIndexedXTweetFetchPages,
+			          indexed_x_max_rows_fetched_by_code: CONFIG.maxIndexedXTweetsFetch * CONFIG.maxIndexedXTweetFetchPages,
+			          indexed_x_top_tweets_supplied_to_pi: CONFIG.maxIndexedXTweetsForPi,
+		          theme_brave_calls: maxThemeBraveCalls,
+	          source_expansion_brave_calls: maxSourceBraveCalls,
+	          topic_news_calls: maxTopicNewsCalls,
+	          topic_news_rows_per_call: CONFIG.maxTopicNewsRowsPerTopic,
+	          brave_rows_per_theme_call: CONFIG.maxThemeNewsRowsPerQuery,
+	        },
+	        current_portfolio_holdings: holdingContexts,
+	        current_portfolio_theme_context: themeContexts,
+	      }, CONFIG.maxPiPromptContextChars),
+	      "",
+		      "Run the search loop:",
+		      "1. Review indexed_x_top_tweets in rank order. Decide whether any supplied tweet is a fresh investment-related market_breaking anchor. Do not call a discovery search tool and do not invent tweets.",
+		      "2. For each qualifying indexed-X anchor, use searchBrave with purpose='source_expansion' and result_filter='web' to look first for the original/official source, then the earliest credible media/source link if official is unavailable. Do not use result_filter='news' for source_expansion. This source lookup is not restricted to the recent event window; older official/primary sources are allowed.",
+		      "3. If no supplied indexed-X tweet qualifies as investment-related breaking news, return no market_breaking events. Do not use Brave source_expansion to create a brand-new unanchored market_breaking event.",
+		      "4. Map every supplied current portfolio theme to zero or more supported Arrays market-news topics. This mapping is required even if you also use Brave. If no topic fits, return status no_supported_topic for that theme.",
+		      "5. For mapped topics that could produce useful portfolio-relevant events, call searchArraysMarketNewsTopic with the topic and theme. Inspect rows yourself and return only rows that clear event quality and holding mapping.",
+		      "6. Optionally call searchBrave for theme_news discovery using purpose='theme_news', result_filter='news', and the theme name in the theme parameter. Use the supplied theme context, not prebuilt query strings.",
+		      "7. Deduplicate same-event variants across indexed X, Brave, and Arrays topic rows. Do not return an event only because a tool result existed.",
+		      "8. For each returned event, set event_scope to market_breaking or theme_news. For Arrays topic rows, use event_scope='theme_news' and source_kind='arrays_topic_news'. For Brave theme rows, include matched_theme and the actual search_query you used.",
+		      "9. For each returned event, fill related_holdings with exact holding_symbol values from current_portfolio_holdings when a holding-level relation exists. Include relation, confidence, and rationale grounded in the source_text/content/summary/description you saw. Source tickers may go in source_related_tickers but must not substitute for related_holdings. For portfolio-level macro/policy/risk events with no exact holding relation, leave related_holdings empty and provide risk_factors plus portfolio_relevance_basis.",
+		      "10. For each returned event, published_at_iso must be copied from the discovery/source row timestamp when available. For indexed-X market_breaking events, this must be the supplied tweet's published_at_iso; if no timestamp is available, leave it blank and include source_time_label if present.",
+		      "11. For indexed-X market_breaking events, source_event_time should be the original/official source timestamp/date when found, otherwise the earliest credible non-X source time, otherwise null. It may be older than published_at_iso and must not replace the X freshness field.",
+		      "12. In search_audit, include the code-provided indexed-X discovery attempt, every meaningful tool attempt, lane, theme when applicable, tools_used, candidate_count, and a short result_assessment such as useful/refined/noisy/no_event.",
+		      "13. Return up to " + CONFIG.maxBreakingNewsRecords + " mapped events total across market-breaking, theme Brave, and Arrays topic-news sources.",
+      "",
+      "Output schema:",
+      "{",
+      '  "themeTopicMappings": [',
+      '    {"theme":"memory", "topics":["TECHNOLOGY","MANUFACTURING"], "status":"mapped|no_supported_topic", "reason":"why these Arrays market-news topics fit this portfolio theme"}',
+      "  ],",
+      '  "events": [',
+		      '    {"event_id":"stable short id", "event_scope":"market_breaking|theme_news", "title":"", "summary":"", "source_text_excerpt":"short excerpt from source_text/content/summary used for mapping", "published_at_iso":"", "source_time_label":"", "source_event_time":null, "source_tweet_id":"", "source_tweet_url":"", "source_tweet_rank":1, "source_tweet_engagement_score":0, "expanded_from_tweet_url":"", "source_related_tickers":["TICKER"], "themes":["theme-a"], "risk_factors":["rates","liquidity"], "portfolio_relevance_basis":"why this can matter to the current portfolio even if no exact holding symbol applies", "matched_theme":"theme-a", "search_query":"", "source_links":["https://..."], "source_kind":"indexed_x|mixed|news|arrays_topic_news", "confidence":"low|medium|high", "why_relevant":"", "related_holdings":[{"holding_symbol":"TICKER", "relation":"direct|peer_competitor|supplier_customer|theme_readthrough|macro_sensitivity|sector_readthrough|liquidity_beta|option_underlying|other", "confidence":"low|medium|high", "rationale":"why this event matters to this holding"}]}',
+	      "  ],",
+	      '  "search_audit": [{"query":"arrays_indexed_x_top_engagement_recent_90m", "lane":"market_breaking|theme_news", "theme":"", "tools_used":["searchArraysIndexedX(code)"], "candidate_count":0, "result_assessment":"useful|refined|noisy|no_event"}]',
+      "}",
+    ].join("\n");
+    summary.agentCalled = true;
+    summary.themeNewsSummary.agentCalled = true;
+    const { message } = await agent.ask(prompt);
+    summary.stopReason = message && message.stopReason ? String(message.stopReason) : "";
+    if (message && message.model) summary.model = message.model;
+    if (message && message.errorMessage) throw new Error("Pi agent error: " + message.errorMessage);
+    const text = piMessageText(message);
+    summary.rawTextPreview = clean(text, 900);
+	    const parsed = safeParseJson(text);
+	    if (!parsed) throw new Error("Pi event-search loop did not return parseable JSON");
+	    const topicMappings = normalizeThemeTopicMappings(parsed, themeContexts);
+	    const piRecords = normalizeBreakingNewsRecords(parsed, snapshot, runAtMs, currentThemes);
+	    const records = piRecords;
+	    const themeToolCalls = toolCalls.filter((call) => call && call.tool === "searchBrave" && call.purpose === "theme_news");
+		    const marketToolCalls = toolCalls.filter((call) => call && (call.tool === "searchArraysIndexedX" || call.tool === "searchGrokX"));
+	    const topicToolCalls = toolCalls.filter((call) => call && call.tool === "searchArraysMarketNewsTopic");
+	    const themeParsedCount = Array.isArray(parsed.events) ? parsed.events.filter((item) => isThemeNewsEvent(item)).length : 0;
+	    const themeRecordCount = records.filter((record) => record.sourceType === "theme_news" || record.sourceType === "topic_news").length;
+    summary.toolCalls = toolCalls;
+	    summary.queries = marketToolCalls.map((call) => call.query).filter(Boolean);
+	    summary.themeQueries = themeToolCalls.map((call) => ({ theme: call.theme || "", query: call.query || "" })).filter((row) => row.query);
+	    summary.themeTopicMappings = topicMappings;
+	    summary.topicNewsCalls = topicToolCalls;
+	    summary.topicNewsRecords = topicToolCalls.reduce((acc, call) => acc + (Number(call.resultCount) || 0), 0);
+	    summary.parsedEventCount = Array.isArray(parsed.events) ? parsed.events.length : 0;
+	    summary.rawEventRecords = records.length;
+    summary.searchAudit = Array.isArray(parsed.search_audit) ? parsed.search_audit.slice(0, 12) : [];
+    summary.themeNewsSummary.toolCalls = themeToolCalls;
+	    summary.themeNewsSummary.queries = summary.themeQueries;
+	    summary.themeNewsSummary.themeTopicMappings = topicMappings;
+	    summary.themeNewsSummary.topicNewsCalls = topicToolCalls;
+	    summary.themeNewsSummary.topicNewsRecords = summary.topicNewsRecords;
+    summary.themeNewsSummary.parsedEventCount = themeParsedCount;
+    summary.themeNewsSummary.rawEventRecords = themeRecordCount;
+    return { records, summary };
+  } catch (err) {
+    summary.error = String(err && err.message ? err.message : err).slice(0, 260);
+    summary.themeNewsSummary.error = summary.error;
+    warnings.push({ source: "pi-event-search-loop", error: summary.error });
+    return { records: [], summary };
+  }
+}
+
+function themeSearchPhrase(theme) {
+  const phrases = {
+    "ai-infra": "AI infrastructure data center capex GPU server networking market news",
+    compute: "AI compute GPU server cloud infrastructure market news",
+    "enterprise-it": "enterprise IT spending servers storage cloud market news",
+    storage: "enterprise storage server infrastructure market news",
+    memory: "memory semiconductor pricing supply market news",
+    semis: "semiconductor chips export controls foundry AI accelerator supply chain market news",
+    "optical-interconnect": "optical interconnect datacenter transceiver photonics market news",
+    "enterprise-software": "enterprise software cloud SaaS AI workflow market news",
+    "ai-workflow": "agentic AI workflow automation enterprise software market news",
+    crypto: "crypto market structure bitcoin ethereum treasury regulation market news",
+  };
+  return phrases[theme] || String(theme || "").replace(/-/g, " ") + " market news";
+}
+
+function holdingsForTheme(snapshot, theme) {
+  const themeLc = String(theme || "").toLowerCase();
+  return (snapshot.holdings || [])
+    .filter((holding) => {
+      const themes = themesForHolding(snapshot, holding).map((x) => String(x || "").toLowerCase());
+      return themes.indexOf(themeLc) >= 0;
+    })
+    .slice()
+    .sort((a, b) => (b.allocation || 0) - (a.allocation || 0));
+}
+
+function eventKey(item, runAtMs) {
+  const symbols = rawAffectedSymbols(item);
+  const subject = symbols.length > 1 || String(item.symbol || "").toUpperCase() === "PORTFOLIO"
+    ? "multi"
+    : (symbols[0] || item.symbol || "unknown");
+  if (item.sourceRecordId) return [item.sourceType, subject, normalizeKey(item.sourceRecordId)].join(":");
+  if (item.url) return [item.sourceType, subject, normalizeKey(item.url)].join(":");
+  return [item.sourceType, subject, normalizeKey(item.title), String(Math.floor((item.publishedAtMs || runAtMs || Date.now()) / 86400000))].join(":");
+}
+
+function normalizeEvent(rawItems, previousIndex, runAtMs) {
+  const seenThisRun = {};
+  const index = previousIndex && typeof previousIndex === "object" ? previousIndex : {};
+  const records = [];
+  rawItems.forEach((raw) => {
+    const key = eventKey(raw, runAtMs);
+    const prior = index[key];
+    const rawPublishedAtMs = Number.isFinite(raw.publishedAtMs) ? raw.publishedAtMs : null;
+    let status = "new";
+    if (seenThisRun[key]) status = "duplicate";
+    else if (prior) {
+      const oldHash = prior.textHash || "";
+      const nextHash = normalizeKey((raw.title || "") + " " + (raw.summary || ""));
+      status = oldHash && oldHash !== nextHash ? "updated" : "seen_before";
+    }
+    seenThisRun[key] = true;
+    const firstSeenAtMs = prior && prior.firstSeenAtMs ? prior.firstSeenAtMs : runAtMs;
+    const textHash = normalizeKey((raw.title || "") + " " + (raw.summary || ""));
+    index[key] = {
+      eventKey: key,
+      sourceType: raw.sourceType || "",
+      symbol: raw.symbol || "",
+      title: raw.title || "",
+      url: raw.url || "",
+      affectedSymbols: rawAffectedSymbols(raw),
+      affectedThemes: rawAffectedThemes(raw),
+      textHash,
+      firstSeenAtMs,
+      lastSeenAtMs: runAtMs,
+      seenCount: (prior && prior.seenCount ? prior.seenCount : 0) + 1,
+    };
+    records.push({
+      eventKey: key,
+      sourceType: raw.sourceType || "",
+      symbol: raw.symbol || "",
+      title: clean(raw.title, 240),
+      summary: clean(raw.summary, 700),
+      url: raw.url || "",
+      source: raw.source || "",
+      dedupeStatus: status,
+      metadata: raw.metadata || {},
+      affectedSymbols: rawAffectedSymbols(raw),
+      affectedThemes: rawAffectedThemes(raw),
+      sourceLinks: raw.sourceLinks || (raw.metadata && raw.metadata.sourceLinks) || [],
+      mappingReason: raw.mappingReason || (raw.metadata && raw.metadata.mappingReason) || "",
+      publishedAtMs: rawPublishedAtMs,
+      firstSeenAtMs,
+      lastSeenAtMs: runAtMs,
+      runAtMs,
+    });
+  });
+  const keys = Object.keys(index).sort((a, b) => (index[b].lastSeenAtMs || 0) - (index[a].lastSeenAtMs || 0));
+  const capped = {};
+  keys.slice(0, 1000).forEach((key) => {
+    capped[key] = index[key];
+  });
+  return { records, index: capped };
+}
+
+function eventAffectedSymbols(item, snapshot) {
+  const holdingBy = bySymbol(snapshot);
+  const metadata = item && item.metadata || {};
+  if (metadata.holdingMappingPolicy === "pi_agent_related_holdings_only") {
+    return uniqueSymbols(rawAffectedSymbols(item).filter((symbol) => !!holdingBy[symbol]));
+  }
+  if (metadata.holdingMappingPolicy === "pi_agent_related_holdings_or_portfolio_level") {
+    return uniqueSymbols(rawAffectedSymbols(item).filter((symbol) => !!holdingBy[symbol]));
+  }
+  const out = [];
+  rawAffectedSymbols(item).forEach((symbol) => {
+    if (holdingBy[symbol]) out.push(symbol);
+    (snapshot.holdings || []).forEach((holding) => {
+      if (marketDataSymbolForHolding(holding) === symbol) out.push(holding.symbol);
+    });
+  });
+  return uniqueSymbols(out);
+}
+
+function eventAffectedThemes(item, snapshot, affectedSymbols) {
+  return uniqueCompactStrings(
+    rawAffectedThemes(item).concat((affectedSymbols || []).reduce((acc, symbol) => acc.concat(themesForHolding(snapshot, bySymbol(snapshot)[symbol] || { symbol })), [])),
+    80
+  ).map(normalizeThemeName).filter(Boolean);
+}
+
+function eventPortfolioExposure(snapshot, affectedSymbols) {
+  const holdingBy = bySymbol(snapshot);
+  return (affectedSymbols || []).reduce((acc, symbol) => acc + ((holdingBy[symbol] && holdingBy[symbol].allocation) || 0), 0);
+}
+
+function eventCandidateEligible(item, affectedSymbols, runAtMs) {
+  if (!item || item.dedupeStatus === "duplicate") return false;
+  return true;
+}
+
+function eventMentionsSymbol(item, symbol) {
+  const text = ((item.title || "") + " " + (item.summary || "")).toLowerCase();
+  const metadata = item.metadata || {};
+  const tickers = metadata.tickers || [];
+  const tickerHit = Array.isArray(tickers) && tickers.some((row) => {
+    if (typeof row === "string") return row.toUpperCase() === symbol;
+    return String(row.ticker || row.symbol || "").toUpperCase() === symbol;
+  });
+  if (tickerHit) return true;
+  const itemThemes = Array.isArray(metadata.themes) ? metadata.themes.map((theme) => String(theme || "").toLowerCase()) : [];
+  if (metadata.themeMatched && itemThemes.length) {
+    const holdingThemes = fallbackThemesForSymbol(symbol).map((theme) => String(theme || "").toLowerCase());
+    if (itemThemes.some((theme) => holdingThemes.indexOf(theme) >= 0)) return true;
+  }
+  if (text.indexOf("$" + symbol.toLowerCase()) >= 0) return true;
+  const aliases = CONFIG.aliases[symbol] || [symbol];
+  return aliases.some((alias) => {
+    const raw = String(alias || "").toLowerCase();
+    if (!raw) return false;
+    if (raw[0] === "$") return text.indexOf(raw) >= 0;
+    if (raw.length <= 3) {
+      const rx = new RegExp("(^|[^a-z0-9])" + raw.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&") + "([^a-z0-9]|$)");
+      return rx.test(text);
+    }
+    return text.indexOf(raw) >= 0;
+  });
+}
+
+function priceSignalSchemaCompatible(previousPriceSignals) {
+  const rows = Object.keys(previousPriceSignals || {}).map((key) => previousPriceSignals[key]).filter(Boolean);
+  if (!rows.length) return false;
+  return rows.every((row) =>
+    row.priceSignalVersion === CONFIG.priceSignalVersion &&
+    row.volumeSignalVersion === CONFIG.volumeSignalVersion);
+}
+
+function priceSignalMap(signals) {
+  const out = {};
+  (signals || []).forEach((signal) => {
+    if (signal && signal.symbol) out[signal.symbol] = signal;
+  });
+  return out;
+}
+
+function buildAnomalies(snapshot, priceSignals) {
+  const anomalies = [];
+  const holdingBySymbol = bySymbol(snapshot);
+
+  (priceSignals || []).forEach((signal) => {
+    const h = holdingBySymbol[signal.symbol];
+    if (!h || !signal.available || !signal.abnormal) return;
+    const marketDataSymbol = signal.marketDataSymbol || signal.symbol;
+    const usesUnderlying = marketDataSymbol && marketDataSymbol !== signal.symbol;
+    const signalLabel = usesUnderlying ? signal.symbol + " underlying " + marketDataSymbol : signal.symbol;
+    anomalies.push({
+      anomalyId: "anomaly:" + signal.symbol + ":" + (signal.reasons || []).join("+"),
+      lane: "anomaly_attribution",
+      anomalyType: "asset_anomaly",
+      symbol: signal.symbol,
+      primaryAsset: signal.symbol,
+      marketDataSymbol,
+      underlyingSymbol: signal.underlyingSymbol || "",
+      marketDataBasis: signal.marketDataBasis || (usesUnderlying ? "underlying_equity" : "holding_symbol"),
+      title: signalLabel + " asset anomaly",
+      summary:
+        signalLabel + " triggered " + (signal.triggerKinds || []).join("+") + " anomaly; latest 1d " + fmtMove(signal.oneDayPct) +
+        " (" + (signal.oneDayBasis || "latest basis") + ")" +
+        ", last closed 1d " + fmtMove(signal.lastClosedOneDayPct) +
+        ", 5d " + fmtMove(signal.fiveDayPct) +
+        ", z " + signal.zScore +
+        ", cumulative volume " + signal.cumulativeVolumeMultiple + "x.",
+      reason: usesUnderlying
+        ? "Objective asset-level anomaly on the option holding's underlying equity; attribution should consider price and volume triggers together."
+        : "Objective asset-level anomaly on a current holding; attribution should consider price and volume triggers together.",
+      anomalyMetrics: signal,
+      eventRefs: [],
+      sourceOrigin: "asset_anomaly_signal",
+      sourceOriginLabel: sourceOriginLabel("asset_anomaly_signal"),
+      sourceLane: "price_volume_anomaly",
+      sourceSearchMode: usesUnderlying ? "computed_from_underlying_market_data" : "computed_from_market_data",
+    });
+  });
+
+  return anomalies;
+}
+
+function anomalyAsLegacyCandidate(anomaly) {
+  return {
+    candidateId: anomaly.anomalyId,
+    lane: anomaly.lane,
+    candidateType: anomaly.anomalyType || "asset_anomaly",
+    symbol: anomaly.symbol,
+    title: anomaly.title,
+    summary: anomaly.summary,
+    reason: anomaly.reason,
+    anomalyMetrics: anomaly.anomalyMetrics,
+    eventRefs: [],
+    sourceOrigin: anomaly.sourceOrigin,
+    sourceOriginLabel: anomaly.sourceOriginLabel,
+    sourceLane: anomaly.sourceLane,
+    sourceSearchMode: anomaly.sourceSearchMode,
+    marketDataSymbol: anomaly.marketDataSymbol,
+    underlyingSymbol: anomaly.underlyingSymbol,
+    marketDataBasis: anomaly.marketDataBasis,
+  };
+}
+
+function buildEventCandidates(snapshot, eventRecords) {
+  const candidates = [];
+
+  (eventRecords || []).forEach((item) => {
+    const affectedSymbols = eventAffectedSymbols(item, snapshot);
+    if (!eventCandidateEligible(item, affectedSymbols, snapshot.runAtMs)) return;
+    const affectedThemes = eventAffectedThemes(item, snapshot, affectedSymbols);
+    const portfolioExposurePct = affectedSymbols.length ? eventPortfolioExposure(snapshot, affectedSymbols) : null;
+    const primaryAsset = affectedSymbols.length ? (affectedSymbols.length > 1 ? "PORTFOLIO" : affectedSymbols[0]) : "PORTFOLIO";
+    const sourceOrigin = sourceOriginFromEvent(item);
+    const metadata = item.metadata || {};
+    const linkedText = !affectedSymbols.length
+      ? "portfolio-level risk/theme context" + (affectedThemes.length ? " (" + affectedThemes.join(", ") + ")" : "")
+      : affectedSymbols.length > 1
+      ? affectedSymbols.length + " holdings (" + affectedSymbols.join(", ") + ")"
+      : affectedSymbols[0];
+    const exposureText = affectedSymbols.length ? fmtPct(portfolioExposurePct) : "analyst-estimated";
+    const portfolioLevelEvent = !affectedSymbols.length;
+    candidates.push({
+      candidateId: "event:" + item.eventKey,
+      lane: "event_impact",
+      candidateType: item.sourceType,
+      symbol: primaryAsset,
+      primaryAsset,
+      title: item.title,
+      summary: item.summary,
+      reason: item.sourceType + " source record has dedupeStatus=" + item.dedupeStatus + " and maps to " + linkedText + " (" + exposureText + " exposure). Analyst must judge semantic relevance, novelty, exposure impact, and materiality.",
+      eventRefs: [item.eventKey],
+      affectedSymbols,
+      affectedThemes,
+      portfolioExposurePct,
+      portfolioExposureText: affectedSymbols.length ? fmtPct(portfolioExposurePct) : "analyst-estimated",
+      sourceLinks: item.sourceLinks || metadata.sourceLinks || (item.url ? [item.url] : []),
+      mappingReason: item.mappingReason || metadata.mappingReason || metadata.whyRelevant || "",
+      portfolioLevelEvent,
+      riskFactors: metadata.riskFactors || [],
+      portfolioRelevanceBasis: metadata.portfolioRelevanceBasis || "",
+      sourceOrigin,
+      sourceOriginLabel: sourceOriginLabel(sourceOrigin),
+      sourceLane: metadata.sourceLane || "",
+      sourceSearchMode: metadata.sourceSearchMode || "",
+      source: item.source,
+      url: item.url,
+      dedupeStatus: item.dedupeStatus,
+      publishedAtMs: item.publishedAtMs,
+      sourceTimeLabel: metadata.sourceTimeLabel || "",
+	      sourceEventTime: metadata.sourceEventTime === undefined ? "" : metadata.sourceEventTime,
+	      sourceEventAtMs: metadata.sourceEventAtMs || null,
+	      relatedHoldings: metadata.relatedHoldings || [],
+	      sourceRelatedTickers: metadata.sourceRelatedTickers || [],
+	      sourceTweetId: metadata.sourceTweetId || "",
+	      sourceTweetUrl: metadata.sourceTweetUrl || "",
+	      sourceTweetRank: metadata.sourceTweetRank || null,
+	      sourceTweetEngagementScore: metadata.sourceTweetEngagementScore || null,
+	      sourceText: clean(metadata.sourceText || "", 900),
+	      firstSeenAtMs: item.firstSeenAtMs,
+      lastSeenAtMs: item.lastSeenAtMs,
+    });
+  });
+
+  return candidates;
+}
+
+function buildCandidates(snapshot, previous, delta, priceSignals, previousPriceSignals, eventRecords, currentThemes, previousThemes) {
+  return buildEventCandidates(snapshot, eventRecords).concat(buildAnomalies(snapshot, priceSignals).map(anomalyAsLegacyCandidate));
+}
+
+function findingDedupeKey(finding, fallback) {
+  return normalizeKey([
+    finding.finding_type || finding.findingType || fallback.findingType || "",
+    finding.primary_asset || finding.primaryAsset || fallback.primaryAsset || "",
+    finding.event_id || finding.eventId || "",
+    finding.event_title || finding.summary || fallback.summary || "",
+  ].join("|"));
+}
+
+function buildAnalystPrompt(input) {
+  return [
+    "You are the analyst for a low-noise portfolio watch automation.",
+    "Your job is to decide whether this run is worth interrupting a discretionary investor now, prepare accurate data analysis for any selected event or anomaly attribution, and write the user-ready message. Default to no_push unless the user would likely be glad they saw it.",
+    "",
+    "1. Role",
+    "- This is portfolio monitoring, not a daily news digest.",
+    "- Use the supplied JSON as the base packet. If something looks wrong, stale, or worth deeper confirmation, you may use tools available to verify it. Do not invent facts, prices, catalysts, or source links.",
+    "",
+    "2. Decision mission",
+    "- Judge whether current holdings may be affected, and why.",
+    "- Push only for a material selected event exposure impact or a meaningful selected held-asset anomaly attribution.",
+    "- If evidence is weak, stale, generic, already known, or not portfolio-relevant, choose no_push.",
+    "",
+    "3. Two separate lanes",
+    "A) Event lane",
+    "- event_candidates_to_review is a long list of source records that code attached to current holdings or preserved as portfolio-level risk-factor events. They are not yet qualified events.",
+    "- A candidate may be single-asset or portfolio-level. Use affectedSymbols, affectedThemes, riskFactors, portfolioRelevanceBasis, sourceLinks, mappingReason, and portfolioExposurePct as the starting context, then verify/recompute if something looks wrong.",
+    "- First decide whether each event candidate is a real portfolio-relevant event, weak/noisy, repeated, seen-before context, or not qualified.",
+    "- Return eventCandidateStatuses for every event candidate. candidate_id must copy the candidateId exactly, including the event: prefix, with status selected, suppressed, or not_qualified and a concise reason.",
+    "- Use not_qualified for any candidate you do not promote into an eventImpactFinding, including stale, routine, weak, repeated, or semantically wrong rows. Use suppressed only when you created a linked eventImpactFinding but decided it should not be selected for the notification.",
+    "- For candidates that become real events worth analysis, create eventImpactFindings with exposure_impact.",
+    "- Ask: what changed, which current holdings/themes/risk buckets may be affected, and how large is the likely direct or related exposure?",
+    "- Estimate exposure from current holdings, weights, themes, and theme_exposure. Show the calculation briefly in exposure_impact.",
+    "- Do not suppress a directly relevant event just because no anomaly was supplied. First judge whether the event is material on its own, then use current price/volume context or tools if needed. If suppressed, explain the real reason.",
+    "- Treat portfolio delta and theme exposure as context only, not standalone findings.",
+    "",
+    "B) Anomaly lane",
+    "- asset_anomalies are already computed anomalies, not candidates.",
+    "- Produce one anomalyAttributionFinding for every asset anomaly when possible, combining price and volume triggers for that asset.",
+    "- Ask: is there a plausible source-backed reason, a weak correlation, or is it unexplained?",
+    "- If no good attribution exists, still return an attribution with attribution_status=unexplained or weak_correlation and explain why.",
+    "- Asset anomalies are worth reporting even when attribution is not confirmed. If attribution is weak, say it is weak and offer the best grounded guess, clearly labeled as a guess.",
+    "",
+    "4. Novelty and materiality gate",
+    "- prior_alert_history is the past 7 days of user-visible run timeline. Empty runs show only that no push was sent; they are not prior suppressed reasoning.",
+    "- Read prior_alert_history to avoid annoying repeats of messages the user actually received.",
+    "- A repeated narrative is pushable only if there is genuinely new information, higher urgency, changed uncertainty, or stronger attribution.",
+    "- A major macro, geopolitical, regulatory, war/peace, FOMC, CPI, jobs, sanctions, export-control, credit/liquidity, market-structure, or very large company event can be selected even without a clear surprise versus expectations, if it materially changes portfolio risk context.",
+    "- Source records may be new, updated, or seen_before; seen_before is context, not an automatic decision.",
+    "- For indexed-X breaking_news records, publishedAtMs/sourceTimeLabel should reflect the X post freshness when Pi returned it, while metadata.sourceEventTime/sourceEventAtMs is the original/official or earliest credible source time. Compare them; if the X post is fresh but sourceEventTime is old, treat it as resurfaced/newly discussed unless there is clear new information or new market reaction.",
+    "- Do not push routine price-target noise, broad market color with no portfolio implication, weak correlations, or not-qualified event candidates.",
+    "",
+    "5. Data contract",
+    "- Current portfolio valuation uses connected-account quantity times Arrays latest 1min price when available, plus connected-account cash. Broker currentPrice, broker marketValue, cost basis, realized P&L, and unrealized P&L are intentionally omitted.",
+    "- oneDayPct/currentMovePct use latest 1min extended-hours price versus previous regular-session close when available. lastClosedOneDayPct is completed-close context only.",
+    "- Volume anomaly uses hourly cumulative volume versus historical same-time cumulative volume. US-listed equities/ETFs, including crypto-related equities, use the US regular-session volume day capped at 16:00 ET after hours; direct crypto assets use UTC-day volume.",
+    "- If submitted derived fields look inconsistent, recompute from base fields where possible; otherwise lower confidence and add data_quality_notes.",
+    "",
+    "6. Message style",
+    "- Write like a sharp human portfolio analyst, not a template.",
+    "- Be concise and specific. Mention tickers, exposure, uncertainty, and what changed.",
+    "- Do not say 'there is news about X' unless you explain why it matters for this portfolio.",
+    "- It is okay to say 'worth watching', 'not enough to overread yet', or 'attribution is still weak' when true.",
+    "- When appropriate, add a brief human note for meaningful portfolio moves, for example a sharp portfolio rally, but keep it grounded and secondary to the analysis.",
+    "- No buy/sell advice. Do not treat price targets as your recommendation. Keep notification_message under 1400 characters.",
+    "",
+    "Return JSON only. It MUST begin with { and end with }.",
+    "Schema:",
+    "{",
+    '  "eventCandidateStatuses": [',
+    '    {"candidate_id":"", "status":"selected|suppressed|not_qualified", "reason":"", "linked_event_finding_id":""}',
+    "  ],",
+    '  "eventImpactFindings": [',
+    '    {"finding_id":"", "finding_type":"event_impact", "primary_asset":"", "summary":"", "dedupe_key":"", "affected_holdings":[], "affected_buckets":[], "exposure_impact":{"direct_exposure_pct":null,"related_bucket_exposure_pct":null,"total_exposure_pct":null,"calculation":"","confidence":"low|medium|high"}, "position_impacts":[], "repetition_context":{"is_repeated_exposure":false,"new_information":"","matched_prior_alert":""}, "event_refs":[], "data_quality_notes":[], "confidence":"low|medium|high"}',
+    "  ],",
+    '  "anomalyAttributionFindings": [',
+    '    {"finding_id":"", "finding_type":"anomaly_attribution", "primary_asset":"", "summary":"", "dedupe_key":"", "anomaly_metrics":{}, "attribution_status":"confirmed|plausible|weak_correlation|unexplained", "supporting_events":[], "data_quality_notes":[], "confidence":"low|medium|high"}',
+    "  ],",
+    '  "decision": {',
+    '    "alert_decision":"push|no_push",',
+    '    "urgency":"none|low|medium|high",',
+    '    "reason":"",',
+    '    "selected_event_impact_finding_ids":[],',
+    '    "selected_anomaly_attribution_finding_ids":[],',
+    '    "suppressed_finding_ids":[],',
+    '    "suppression_reasons":{},',
+    '    "message_sections":{"event_exposure_impacts":[],"anomaly_attributions":[]},',
+    '    "notification_message":"",',
+    '    "skip_reason":"",',
+    '    "next_context_hints":[]',
+    "  }",
+    "}",
+    "",
+    "Run input JSON:",
+    compactJson(input, CONFIG.maxAnalystPromptChars),
+  ].join("\n");
+}
+
+function normalizeAnalyst(parsed, candidates, runAtMs) {
+  parsed = normalizeEventTerminology(parsed);
+  const candidateIdSet = {};
+  (candidates || []).forEach((candidate) => {
+    if (candidate && candidate.candidateId) candidateIdSet[candidate.candidateId] = true;
+  });
+  function normalizeEventCandidateStatusId(value) {
+    const text = String(value || "");
+    if (!text) return "";
+    if (candidateIdSet[text]) return text;
+    if (candidateIdSet["event:" + text]) return "event:" + text;
+    return text;
+  }
+  const eventCandidateStatuses = Array.isArray(parsed && parsed.eventCandidateStatuses)
+    ? parsed.eventCandidateStatuses.map((row) => ({
+      candidateId: normalizeEventCandidateStatusId(row.candidate_id || row.candidateId || ""),
+      status: String(row.status || "not_qualified").toLowerCase(),
+      reason: clean(row.reason || "", 700),
+      linkedEventFindingId: String(row.linked_event_finding_id || row.linkedEventFindingId || ""),
+    })).filter((row) => row.candidateId)
+    : [];
+  const eventFindings = Array.isArray(parsed && parsed.eventImpactFindings) ? parsed.eventImpactFindings : [];
+  const anomalyFindings = Array.isArray(parsed && parsed.anomalyAttributionFindings) ? parsed.anomalyAttributionFindings : [];
+  const all = [];
+  eventFindings.forEach((row, idx) => {
+    const id = row.finding_id || "event-" + (idx + 1);
+    all.push({
+      findingId: id,
+      findingType: "event_impact",
+      primaryAsset: row.primary_asset || row.primaryAsset || "PORTFOLIO",
+      summary: clean(row.summary || "", 800),
+      dedupeKey: row.dedupe_key || findingDedupeKey(row, { findingType: "event_impact", summary: row.summary || "" }),
+      payload: row,
+      runAtMs,
+    });
+  });
+  anomalyFindings.forEach((row, idx) => {
+    const id = row.finding_id || "anomaly-" + (idx + 1);
+    all.push({
+      findingId: id,
+      findingType: "anomaly_attribution",
+      primaryAsset: row.primary_asset || row.primaryAsset || "PORTFOLIO",
+      summary: clean(row.summary || "", 800),
+      dedupeKey: row.dedupe_key || findingDedupeKey(row, { findingType: "anomaly_attribution", summary: row.summary || "" }),
+      payload: row,
+      runAtMs,
+    });
+  });
+  const decision = parsed && parsed.decision ? parsed.decision : {};
+  const selectedIds = []
+    .concat(decision.selected_event_impact_finding_ids || [])
+    .concat(decision.selected_anomaly_attribution_finding_ids || [])
+    .map(String);
+  const selectedSet = {};
+  selectedIds.forEach((id) => { selectedSet[id] = true; });
+  const suppression = decision.suppression_reasons || {};
+  return {
+    findings: all.map((finding) => ({
+      ...finding,
+      selected: selectedSet[finding.findingId] ? "true" : "false",
+      suppressionReason: selectedSet[finding.findingId] ? "" : String(suppression[finding.findingId] || ""),
+    })),
+    eventCandidateStatuses,
+    decision: {
+      alertDecision: decision.alert_decision === "push" ? "push" : "no_push",
+      urgency: decision.urgency || (decision.alert_decision === "push" ? "low" : "none"),
+      reason: decision.reason || "",
+      selectedFindingIds: selectedIds,
+      suppressedFindingIds: (decision.suppressed_finding_ids || []).map(String),
+      messageSections: decision.message_sections || {},
+      notificationMessage: clean(decision.notification_message || "", 1800),
+      skipReason: decision.skip_reason || "",
+      nextContextHints: Array.isArray(decision.next_context_hints) ? decision.next_context_hints : [],
+    },
+  };
+}
+
+function buildFallbackDecision(reason) {
+  return {
+    alertDecision: "no_push",
+    urgency: "none",
+    reason,
+    selectedFindingIds: [],
+    suppressedFindingIds: [],
+    messageSections: {},
+    notificationMessage: "",
+    skipReason: reason,
+    nextContextHints: [],
+  };
+}
+
+function assessmentSelected(finding, decision) {
+  const ids = decision && decision.selectedFindingIds ? decision.selectedFindingIds : [];
+  return finding && (finding.selected === "true" || ids.indexOf(finding.findingId) >= 0);
+}
+
+function eventCandidateIdsForFinding(finding) {
+  const payload = finding && finding.payload ? finding.payload : {};
+  const ids = [];
+  const explicit = payload.event_candidate_ids || payload.eventCandidateIds || payload.candidate_ids || payload.candidateIds || [];
+  (Array.isArray(explicit) ? explicit : [explicit]).forEach((id) => {
+    if (id) ids.push(String(id));
+  });
+  (payload.event_refs || payload.eventRefs || []).forEach((ref) => {
+    if (!ref) return;
+    const text = String(ref);
+    ids.push(text.indexOf("event:") === 0 ? text : "event:" + text);
+  });
+  return ids;
+}
+
+function compactAssessmentForAudit(finding, decision) {
+  const payload = finding && finding.payload ? finding.payload : {};
+  const selected = assessmentSelected(finding, decision);
+  return {
+    findingId: finding.findingId,
+    findingType: finding.findingType,
+    primaryAsset: finding.primaryAsset,
+    status: selected ? "selected" : "suppressed",
+    selected,
+    summary: finding.summary,
+    dedupeKey: finding.dedupeKey,
+    suppressionReason: selected ? "" : (finding.suppressionReason || ""),
+    confidence: payload.confidence || "",
+    exposureImpact: payload.exposure_impact || payload.exposureImpact || null,
+    attributionStatus: payload.attribution_status || payload.attributionStatus || "",
+    eventRefs: payload.event_refs || payload.eventRefs || [],
+    supportingEvents: payload.supporting_events || payload.supportingEvents || [],
+    dataQualityNotes: payload.data_quality_notes || payload.dataQualityNotes || [],
+    payload,
+  };
+}
+
+function buildLaneArtifacts(eventCandidates, anomalies, analyst) {
+  analyst = analyst || { findings: [], decision: buildFallbackDecision("unknown") };
+  const decision = analyst.decision || {};
+  const eventFindings = (analyst.findings || []).filter((finding) => finding.findingType === "event_impact");
+  const anomalyFindings = (analyst.findings || []).filter((finding) => finding.findingType === "anomaly_attribution");
+  const analystStatusByCandidate = {};
+  (analyst.eventCandidateStatuses || []).forEach((row) => {
+    if (row && row.candidateId) analystStatusByCandidate[row.candidateId] = row;
+  });
+  const finalEventStatusByCandidate = {};
+  eventFindings.forEach((finding) => {
+    const selected = assessmentSelected(finding, decision);
+    eventCandidateIdsForFinding(finding).forEach((candidateId) => {
+      finalEventStatusByCandidate[candidateId] = {
+        candidateId,
+        status: selected ? "selected" : "suppressed",
+        reason: selected ? "Selected for notification." : (finding.suppressionReason || "Qualified by analyst but not selected for notification."),
+        linkedEventFindingId: finding.findingId,
+      };
+    });
+  });
+  (eventCandidates || []).forEach((candidate) => {
+    if (finalEventStatusByCandidate[candidate.candidateId]) return;
+    const analystStatus = analystStatusByCandidate[candidate.candidateId];
+    const analystStatusValue = analystStatus
+      ? (((analystStatus.status === "selected" || analystStatus.status === "suppressed") && !analystStatus.linkedEventFindingId)
+        ? "not_qualified"
+        : analystStatus.status)
+      : "not_qualified";
+    finalEventStatusByCandidate[candidate.candidateId] = {
+      candidateId: candidate.candidateId,
+      status: analystStatusValue,
+      reason: analystStatus && analystStatus.reason
+        ? analystStatus.reason
+        : "No analyst status was returned for this candidate. It may have been outside the analyst prompt cap or omitted by the analyst response; keep it in the long-list audit, but do not treat it as a qualified event.",
+      linkedEventFindingId: analystStatus ? analystStatus.linkedEventFindingId : "",
+    };
+  });
+  const eventCandidateStatuses = (eventCandidates || []).map((candidate) => ({
+    ...compactEventCandidateForAudit(candidate),
+    finalStatus: finalEventStatusByCandidate[candidate.candidateId] || {
+      candidateId: candidate.candidateId,
+      status: "not_qualified",
+      reason: "No analyst status returned.",
+      linkedEventFindingId: "",
+    },
+  }));
+  const compactEventFindings = eventFindings.map((finding) => compactAssessmentForAudit(finding, decision));
+  const compactAnomalyFindings = anomalyFindings.map((finding) => compactAssessmentForAudit(finding, decision));
+  const anomalyBySymbol = {};
+  compactAnomalyFindings.forEach((finding) => {
+    if (finding.primaryAsset) anomalyBySymbol[String(finding.primaryAsset).toUpperCase()] = finding;
+  });
+  const anomalyAttributions = (anomalies || []).map((anomaly) => {
+    const symbol = String(anomaly.symbol || "").toUpperCase();
+    const matched = anomalyBySymbol[symbol];
+    return {
+      ...compactAnomalyForAudit(anomaly),
+      finalStatus: matched
+        ? {
+          status: matched.status,
+          reason: matched.selected ? "Selected for notification." : (matched.suppressionReason || "Attributed by analyst but not selected for notification."),
+          linkedAttributionFindingId: matched.findingId,
+        }
+        : {
+          status: "missing_attribution",
+          reason: "Analyst did not return an anomaly attribution for this computed anomaly. The prompt contract expects one attribution per anomaly.",
+          linkedAttributionFindingId: "",
+        },
+      attribution: matched || null,
+    };
+  });
+  return {
+    eventCandidates: eventCandidateStatuses,
+    qualifiedEvents: compactEventFindings,
+    selectedEvents: compactEventFindings.filter((row) => row.selected),
+    anomalies: (anomalies || []).map(compactAnomalyForAudit),
+    anomalyAttributions,
+    selectedAnomalyAttributions: anomalyAttributions.filter((row) => row.finalStatus && row.finalStatus.status === "selected"),
+    finalStatuses: {
+      eventCandidates: eventCandidateStatuses.map((row) => ({
+        candidateId: row.candidateId,
+        symbol: row.symbol,
+        title: row.title,
+        status: row.finalStatus.status,
+        reason: row.finalStatus.reason,
+        linkedEventFindingId: row.finalStatus.linkedEventFindingId,
+      })),
+      anomalies: anomalyAttributions.map((row) => ({
+        anomalyId: row.anomalyId,
+        symbol: row.symbol,
+        status: row.finalStatus.status,
+        reason: row.finalStatus.reason,
+        linkedAttributionFindingId: row.finalStatus.linkedAttributionFindingId,
+      })),
+    },
+  };
+}
+
+function countBy(rows, field) {
+  const out = {};
+  (rows || []).forEach((row) => {
+    const value = row && row[field] !== undefined && row[field] !== null && row[field] !== ""
+      ? String(row[field])
+      : "unknown";
+    out[value] = (out[value] || 0) + 1;
+  });
+  return out;
+}
+
+function sumRecords(rows) {
+  return (rows || []).reduce((acc, row) => acc + (Number(row.recordsAdded) || 0), 0);
+}
+
+function feedDataPath(group, doc, suffix) {
+  const owner = OWNER_USERNAME || "<ALVA_USERNAME>";
+  return "/alva/home/" + owner + "/feeds/" + FEED_NAME + "/v1/data/" + group + "/" + doc + "/" + suffix;
+}
+
+function buildPersistDeltaRows(input) {
+  const runAtMs = input.runAtMs;
+  const snapshot = input.snapshot || {};
+  const eventRecords = (input.normalizedEvent && input.normalizedEvent.records) || [];
+  const findings = (input.analyst && input.analyst.findings) || [];
+  const decision = input.analyst && input.analyst.decision ? input.analyst.decision : {};
+  const alertEntry = input.alertEntry || {};
+  const laneArtifacts = input.laneArtifacts || buildLaneArtifacts(input.eventCandidates || [], input.anomalies || [], input.analyst || {});
+  const eventStored = Math.min(eventRecords.length, 160);
+  const kvKeys = [
+    "lastSnapshot",
+    "lastRunAtMs",
+    "lastPriceSignals",
+    "eventIndex",
+    "alertHistory",
+    "findingHistory",
+    "lastDecision",
+    "nextRunContext",
+  ];
+  const rows = [
+    {
+      fileKey: "portfolio.snapshot",
+      fileLabel: "Portfolio Snapshot",
+      storageType: "feed_timeseries",
+      operation: "append",
+      recordsAdded: 1,
+      deltaSummary: "Added one run-level portfolio snapshot with Arrays-current valuation, portfolio delta, theme exposure, and warnings.",
+      delta: {
+        runSource: RUN_SOURCE,
+        runAtHkt: hkt(runAtMs),
+        totalValue: snapshot.totalValue,
+        cashAllocation: round(snapshot.cashAllocation, 4),
+        priceBasis: snapshot.priceBasis,
+        pricedHoldingCount: snapshot.pricedHoldingCount,
+        unpricedHoldingCount: snapshot.unpricedHoldingCount,
+        topHoldings: (snapshot.holdings || []).slice(0, 8).map((h) => ({ symbol: h.symbol, weight: round(h.allocation, 4) })),
+        portfolioDeltaSummary: input.delta ? input.delta.summary : "",
+        warningCount: (input.warnings || []).length,
+      },
+      pointer: { path: feedDataPath("portfolio", "snapshot", "@last/50"), runAtMs },
+    },
+    {
+      fileKey: "portfolio.positions",
+      fileLabel: "Portfolio Positions",
+      storageType: "feed_timeseries",
+      operation: "append",
+      recordsAdded: (snapshot.holdings || []).length,
+      deltaSummary: "Added one normalized position row per current holding.",
+      delta: {
+        runSource: RUN_SOURCE,
+        symbols: (snapshot.holdings || []).map((h) => h.symbol),
+        valuationBasis: snapshot.priceBasis,
+        costAndPnlOmitted: true,
+        unpricedHoldings: (input.warnings || []).filter((w) => String(w.source || "").indexOf("portfolio-mark:") === 0).map((w) => w.source),
+      },
+      pointer: { path: feedDataPath("portfolio", "positions", "@last/500"), runAtMs },
+    },
+    {
+      fileKey: "event.items",
+      fileLabel: "Event Items",
+      storageType: "feed_timeseries",
+      operation: eventStored ? "append" : "skip_empty",
+      recordsAdded: eventStored,
+      deltaSummary: eventStored
+        ? "Added normalized source records fetched in this run, including dedupe status and metadata."
+        : "No event rows were appended because the run produced zero normalized source records.",
+      delta: {
+        runSource: RUN_SOURCE,
+        totalNormalizedEvents: eventRecords.length,
+        storedRows: eventStored,
+        dedupeStatusCounts: countBy(eventRecords, "dedupeStatus"),
+        sourceTypeCounts: countBy(eventRecords, "sourceType"),
+        sampleNewOrUpdated: eventRecords
+          .filter((row) => row.dedupeStatus === "new" || row.dedupeStatus === "updated")
+          .slice(0, 8)
+          .map((row) => ({ symbol: row.symbol, sourceType: row.sourceType, title: row.title, eventKey: row.eventKey })),
+      },
+      pointer: { path: feedDataPath("event", "items", "@last/500"), runAtMs },
+    },
+    {
+      fileKey: "finding.records",
+      fileLabel: "Analyst Assessments",
+      storageType: "feed_timeseries",
+      operation: findings.length ? "append" : "skip_empty",
+      recordsAdded: findings.length,
+      deltaSummary: findings.length
+        ? "Added analyst assessments, including selected/suppressed state and payload JSON."
+        : "No assessment rows were appended because no analyst assessment survived or the analyst call was skipped.",
+      delta: {
+        runSource: RUN_SOURCE,
+        findingCountsByType: countBy(findings, "findingType"),
+        selectedFindingIds: decision.selectedFindingIds || [],
+        suppressedFindingIds: decision.suppressedFindingIds || [],
+        findings: findings.map((f) => ({
+          findingId: f.findingId,
+          findingType: f.findingType,
+          primaryAsset: f.primaryAsset,
+          selected: f.selected,
+          suppressionReason: f.suppressionReason,
+        })),
+      },
+      pointer: { path: feedDataPath("finding", "records", "@last/300"), runAtMs },
+    },
+    {
+      fileKey: "analysis.decision",
+      fileLabel: "Alert Decision",
+      storageType: "feed_timeseries",
+      operation: "append",
+      recordsAdded: 1,
+      deltaSummary: "Added the final push/no-push decision plus event/anomaly lane artifacts, current portfolio context, and the prior user-visible alert timeline.",
+      delta: {
+        runSource: RUN_SOURCE,
+        alertDecision: input.shouldPush ? "push" : "no_push",
+        urgency: input.shouldPush ? decision.urgency : "none",
+        reason: decision.reason || decision.skipReason || "",
+        skipReason: input.shouldPush ? "" : (decision.skipReason || decision.reason || "quiet_run"),
+        eventCandidateCount: (input.eventCandidates || []).length,
+        qualifiedEventCount: laneArtifacts.qualifiedEvents.length,
+        selectedEventCount: laneArtifacts.selectedEvents.length,
+        anomalyCount: (input.anomalies || []).length,
+        anomalyAttributionCount: laneArtifacts.anomalyAttributions.length,
+        abnormalAssets: (input.priceSignals || []).filter((s) => s && s.abnormal).map((s) => s.symbol),
+      },
+      pointer: { path: feedDataPath("analysis", "decision", "@last/50"), runAtMs },
+    },
+    {
+      fileKey: "notify.message",
+      fileLabel: "Notification Message",
+      storageType: "feed_timeseries",
+      operation: "append",
+      recordsAdded: 1,
+      deltaSummary: input.shouldPush
+        ? "Added a Telegram-ready notification message."
+        : "Added the quiet-run skip sentinel so the cron can complete without a user push.",
+      delta: {
+        runSource: RUN_SOURCE,
+        title: input.notifyTitle,
+        bodyPreview: clean(input.notifyBody === SKIP ? "SKIP_NOTIFICATION sentinel" : input.notifyBody, 800),
+        shouldPush: input.shouldPush,
+      },
+      pointer: { path: feedDataPath("notify", "message", "@last/50"), runAtMs },
+    },
+    {
+      fileKey: "kv_state",
+      fileLabel: "Feed KV State",
+      storageType: "feed_kv",
+      operation: "put",
+      recordsAdded: kvKeys.length,
+      deltaSummary: "Updated rolling state used by the next run: last snapshot, last run time, price signals, event index, user-visible alert timeline, finding history, last decision, and next-run context.",
+      delta: {
+        runSource: RUN_SOURCE,
+        keysUpdated: kvKeys,
+        alertHistorySizeAfterPut: input.alertHistorySize,
+        findingHistorySizeAfterPut: input.findingHistorySize,
+        lastDecision: alertEntry,
+      },
+      pointer: {
+        path: "/alva/home/" + (OWNER_USERNAME || "<ALVA_USERNAME>") + "/feeds/" + FEED_NAME + "/v1/kv/",
+        keys: kvKeys,
+      },
+    },
+  ];
+  const auditRowsPlanned = rows.length + 2;
+  rows.push({
+    fileKey: "audit.run_log",
+    fileLabel: "Run Audit Log",
+    storageType: "feed_timeseries",
+    operation: "append",
+    recordsAdded: 1,
+    deltaSummary: "Added one replayable step log for this automation run.",
+    delta: { runSource: RUN_SOURCE, status: "completed", runAtHkt: hkt(runAtMs) },
+    pointer: { path: feedDataPath("audit", "run_log", "@last/50"), runAtMs },
+  });
+  rows.push({
+    fileKey: "audit.persist_delta",
+    fileLabel: "Persist Delta",
+    storageType: "feed_timeseries",
+    operation: "append",
+    recordsAdded: auditRowsPlanned,
+    deltaSummary: "Added per-file delta rows for this run, including this audit file's own append.",
+    delta: { runSource: RUN_SOURCE, trackedFileCount: auditRowsPlanned },
+    pointer: { path: feedDataPath("audit", "persist_delta", "@last/500"), runAtMs },
+  });
+  return rows.map((row) => ({
+    date: runAtMs,
+    accountId: ACCOUNT_ID,
+    runSource: RUN_SOURCE,
+    fileKey: row.fileKey,
+    fileLabel: row.fileLabel,
+    storageType: row.storageType,
+    operation: row.operation,
+    recordsAdded: row.recordsAdded,
+    deltaSummary: row.deltaSummary,
+    deltaJson: compactJson(row.delta, 16000),
+    latestPointerJson: compactJson(row.pointer, 4000),
+    runAtMs,
+  }));
+}
+
+function buildRunAudit(input) {
+  const snapshot = input.snapshot || {};
+  const delta = input.delta || {};
+  const rawEvents = input.rawEvents || input.rawEvent || [];
+  const normalizedEvent = input.normalizedEvent || { records: [] };
+  const eventRecords = normalizedEvent.records || [];
+  const priceSignals = input.priceSignals || [];
+  const eventCandidates = input.eventCandidates || [];
+  const anomalies = input.anomalies || [];
+  const candidates = input.candidates || eventCandidates.concat(anomalies.map(anomalyAsLegacyCandidate));
+  const analyst = input.analyst || { findings: [], decision: buildFallbackDecision("unknown") };
+  const decision = analyst.decision || {};
+  const laneArtifacts = input.laneArtifacts || buildLaneArtifacts(eventCandidates, anomalies, analyst);
+  const abnormalSignals = priceSignals
+    .filter((signal) => signal && signal.abnormal)
+    .map((signal) => ({
+      symbol: signal.symbol,
+      triggerKinds: signal.triggerKinds || [],
+      reasons: signal.reasons || [],
+      oneDayPct: signal.oneDayPct,
+      fiveDayPct: signal.fiveDayPct,
+      cumulativeVolumeMultiple: signal.cumulativeVolumeMultiple,
+      currentCumulativeVolume: signal.currentCumulativeVolume,
+      cumulativeVolumeMedian: signal.cumulativeVolumeMedian,
+      sessionCumulativeRvol: signal.sessionCumulativeRvol,
+      oneDayBasis: signal.oneDayBasis,
+      latestPriceSource: signal.latestPriceSource,
+      latestPriceInterval: signal.latestPriceInterval,
+    }));
+  const selectedFindings = (analyst.findings || []).filter((finding) => decision.selectedFindingIds && decision.selectedFindingIds.indexOf(finding.findingId) >= 0);
+  const sourceCounts = countBy(rawEvents, "sourceType");
+  const rawEventOriginCounts = countBy(rawEvents.map((row) => ({ sourceOrigin: sourceOriginFromEvent(row) })), "sourceOrigin");
+  const eventStatusCounts = countBy(eventRecords, "dedupeStatus");
+  const candidateLaneCounts = countBy(candidates, "lane");
+  const candidateTypeCounts = countBy(candidates, "candidateType");
+  const auditArtifacts = buildAuditArtifacts(eventCandidates, abnormalSignals, anomalies);
+  const searchExpansionTrace = input.searchExpansionTrace || buildSearchExpansionTrace(input.breakingNewsSummary || {});
+  const dataFetchSummary = {
+    runSource: RUN_SOURCE,
+    windowStartHkt: hkt(input.fetchStartMs),
+    windowEndHkt: hkt(input.runAtMs),
+    marketDataCoverage: input.marketDataCoverage || [],
+    themeExtractionSummary: input.themeExtractionSummary || {},
+    breakingNewsSummary: input.breakingNewsSummary || {},
+    themeNewsSummary: input.themeNewsSummary || {},
+    rawEventCount: rawEvents.length,
+    rawEventSourceCounts: sourceCounts,
+    rawEventSourceOriginCounts: rawEventOriginCounts,
+    normalizedEventCount: eventRecords.length,
+    normalizedEventDedupeCounts: eventStatusCounts,
+    macroKeys: Object.keys(input.macro || {}).filter((key) => key !== "_meta"),
+    macroFreshness: macroFreshnessSummary(input.macro || {}),
+    searchExpansionTrace,
+    warningCount: (input.warnings || []).length,
+  };
+  const llmDecision = {
+    portfolioReader: {
+      environment: "Code",
+      call: "fetchPortfolioSummary(ACCOUNT_ID)",
+      toolLoop: false,
+      browsing: false,
+      contract: "GET /api/v1/portfolio/summary through Alva connected-account portfolio API; no LLM portfolio interpretation",
+      output: {
+        holdingCount: snapshot.holdingCount,
+        asOfHkt: hkt(snapshot.asOfMs),
+        topHoldings: (snapshot.holdings || []).slice(0, 8).map((h) => ({ symbol: h.symbol, weight: round(h.allocation, 4) })),
+      },
+    },
+    themeExtractor: {
+      environment: input.themeExtractionSummary ? "Alva Ask (LLM)" : "not_called",
+      call: input.themeExtractionSummary && input.themeExtractionSummary.call ? input.themeExtractionSummary.call : "skipped",
+      toolLoop: false,
+      browsing: false,
+      suppliedJsonOnly: true,
+      version: input.themeExtractionSummary ? input.themeExtractionSummary.version : "",
+      holdingCount: input.themeExtractionSummary ? input.themeExtractionSummary.holdingCount : 0,
+      themeCount: input.themeExtractionSummary ? input.themeExtractionSummary.themeCount : 0,
+      fallbackUsed: input.themeExtractionSummary ? !!input.themeExtractionSummary.fallbackUsed : false,
+      error: input.themeExtractionSummary ? input.themeExtractionSummary.error : "",
+      rawTextPreview: input.themeExtractionSummary ? input.themeExtractionSummary.rawTextPreview : "",
+    },
+    analyst: {
+      environment: input.analystCallMode === "alva_ask" ? "Alva Ask (LLM)" : "not_called",
+      call: input.analystCallMode === "alva_ask" ? "ask(buildAnalystPrompt(analystInput))" : "skipped",
+      skipReason: input.analystCallMode === "alva_ask" ? "" : (decision.skipReason || decision.reason || ""),
+      toolLoop: false,
+      browsing: false,
+      promptContract: input.analystPromptSummary || {},
+      parsedDecision: decision,
+      selectedFindings: selectedFindings.map((f) => ({ findingId: f.findingId, type: f.findingType, primaryAsset: f.primaryAsset, summary: f.summary })),
+      eventCandidateStatuses: laneArtifacts.finalStatuses.eventCandidates,
+      anomalyStatuses: laneArtifacts.finalStatuses.anomalies,
+      rawAnalystJson: input.rawAnalystJson || "",
+    },
+    breakingNews: {
+      environment: input.breakingNewsSummary && input.breakingNewsSummary.agentCalled ? "Pi Agent" : "not_called_or_failed",
+      call: input.breakingNewsSummary && input.breakingNewsSummary.agentCalled
+        ? "agent.ask(buildBreakingNewsPrompt(...))"
+        : "skipped_or_failed",
+      toolLoop: true,
+      browsing: true,
+	      tools: (input.breakingNewsSummary && input.breakingNewsSummary.tools) || [],
+	      queries: (input.breakingNewsSummary && input.breakingNewsSummary.queries) || [],
+	      queryPlanning: (input.breakingNewsSummary && input.breakingNewsSummary.queryPlanning) || "",
+	      holdingContextCount: input.breakingNewsSummary ? input.breakingNewsSummary.holdingContextCount : 0,
+	      themeContextCount: input.breakingNewsSummary ? input.breakingNewsSummary.themeContextCount : 0,
+	      promptContextCharCap: CONFIG.maxPiPromptContextChars,
+	      toolCalls: (input.breakingNewsSummary && input.breakingNewsSummary.toolCalls) || [],
+      parsedEventCount: input.breakingNewsSummary ? input.breakingNewsSummary.parsedEventCount : 0,
+      rawEventRecords: input.breakingNewsSummary ? input.breakingNewsSummary.rawEventRecords : 0,
+      error: input.breakingNewsSummary ? input.breakingNewsSummary.error : "",
+    },
+    themeNews: {
+	      environment: input.themeNewsSummary && input.themeNewsSummary.agentCalled ? "Pi Agent" : "not_called_or_failed",
+	      call: input.themeNewsSummary && input.themeNewsSummary.agentCalled
+	        ? "agent.ask(buildBreakingNewsPrompt(...)) with theme-topic mapping and searchArraysMarketNewsTopic tool calls inside Pi"
+	        : "skipped_or_failed",
+      toolLoop: true,
+      browsing: true,
+      tools: (input.themeNewsSummary && input.themeNewsSummary.tools) || ["searchBrave"],
+      queries: (input.themeNewsSummary && input.themeNewsSummary.queries) || [],
+      themeTopicMappings: (input.themeNewsSummary && input.themeNewsSummary.themeTopicMappings) || [],
+      topicNewsCalls: (input.themeNewsSummary && input.themeNewsSummary.topicNewsCalls) || [],
+      topicNewsRecords: input.themeNewsSummary ? input.themeNewsSummary.topicNewsRecords : 0,
+	      queryPlanning: (input.themeNewsSummary && input.themeNewsSummary.queryPlanning) || "",
+	      holdingContextCount: input.themeNewsSummary ? input.themeNewsSummary.holdingContextCount : 0,
+	      themeContextCount: input.themeNewsSummary ? input.themeNewsSummary.themeContextCount : 0,
+	      promptContextCharCap: CONFIG.maxPiPromptContextChars,
+      toolCalls: (input.themeNewsSummary && input.themeNewsSummary.toolCalls) || [],
+      rawEventRecords: input.themeNewsSummary ? input.themeNewsSummary.rawEventRecords : 0,
+      error: input.themeNewsSummary ? input.themeNewsSummary.error : "",
+    },
+  };
+  const outputSummary = {
+    runSource: RUN_SOURCE,
+    alertDecision: input.shouldPush ? "push" : "no_push",
+    urgency: input.shouldPush ? decision.urgency : "none",
+    skipReason: input.shouldPush ? "" : (decision.skipReason || decision.reason || "quiet_run"),
+    notificationTitle: input.notifyTitle,
+    notificationPreview: clean(input.notifyBody === SKIP ? "SKIP_NOTIFICATION sentinel" : input.notifyBody, 1200),
+    portfolioRows: 1,
+    positionRows: (snapshot.holdings || []).length,
+    eventRows: Math.min(eventRecords.length, 160),
+    findingRows: (analyst.findings || []).length,
+    eventCandidateCount: eventCandidates.length,
+    qualifiedEventCount: laneArtifacts.qualifiedEvents.length,
+    selectedEventCount: laneArtifacts.selectedEvents.length,
+    anomalyCount: anomalies.length,
+    anomalyAttributionCount: laneArtifacts.anomalyAttributions.length,
+    abnormalSignals,
+    candidateLaneCounts,
+    candidateTypeCounts,
+    candidateAuditCount: auditArtifacts.candidateAudit.candidateCount,
+    anomalySignalCount: auditArtifacts.anomalySignals.signalCount,
+  };
+  const persistSummary = {
+    trackedFiles: (input.persistRows || []).map((row) => ({
+      fileKey: row.fileKey,
+      operation: row.operation,
+      recordsAdded: row.recordsAdded,
+      summary: row.deltaSummary,
+    })),
+    totalRecordsAdded: sumRecords(input.persistRows || []),
+  };
+  const stepLog = [
+    {
+      step: 1,
+      node: "Connected-account portfolio API read",
+      environment: "Code",
+      input: { accountId: ACCOUNT_ID, runSource: RUN_SOURCE },
+      action: "Call fetchPortfolioSummary(accountId), which uses GET /api/v1/portfolio/summary with X-Alva-Api-Key auth.",
+      output: { holdingCount: snapshot.holdingCount, brokerSnapshotAsOfHkt: hkt(snapshot.asOfMs), cash: snapshot.cash },
+      gate: "Portfolio state is read from the connected-account API only; no Alva Ask, memory, watchlists, or prior-run portfolio reconstruction. Broker price, market value, cost, and P&L fields are not used as portfolio context.",
+    },
+    {
+      step: 2,
+      node: "Validate portfolio payload",
+      environment: "Code",
+      input: { accountId: ACCOUNT_ID, requiredShape: ["holdings[]"] },
+      action: "Require the API response to contain a usable holdings array before any market-data or event work starts.",
+      output: { holdingCount: snapshot.holdingCount, brokerSnapshotAsOfHkt: hkt(snapshot.asOfMs), cash: snapshot.cash },
+      gate: "If the API response is missing or holdings[] is empty, the run fails instead of fabricating a portfolio.",
+    },
+    {
+      step: 3,
+      node: "Normalize portfolio",
+      environment: "Code",
+      input: { rawHoldings: snapshot.holdingCount },
+      action: "Normalize symbols, side, quantity, currency, and option metadata. Drop broker current price, broker market value, cost, realized P&L, and unrealized P&L before context or persistence.",
+      output: {
+        priceBasis: snapshot.priceBasis,
+        topHoldings: (snapshot.holdings || []).slice(0, 8).map((h) => ({ symbol: h.symbol, weight: round(h.allocation, 4), marketValue: round(h.marketValue, 2) })),
+      },
+      gate: "Only connected-account quantity and cash survive this node; current price and market value are filled later from Arrays.",
+    },
+    {
+      step: 4,
+      node: "Prior state load",
+      environment: "Code",
+      input: { kvKeys: ["lastSnapshot", "lastRunAtMs", "eventIndex", "alertHistory", "findingHistory", "lastPriceSignals"] },
+      action: "Load previous run state from feed KV and tolerate missing/corrupt values with empty baselines. Sanitize alertHistory into a past-7-day user-visible run timeline: empty runs keep only time/no-push state, pushed runs keep the user-visible message.",
+      output: {
+        hasPreviousSnapshot: !!input.previous,
+        previousRunAtHkt: hkt(input.previousRunAtMs),
+        priorAlertTimelineRows: input.priorAlertHistorySize || 0,
+        findingHistoryRows: input.priorFindingHistorySize || 0,
+      },
+      gate: "If previous snapshot schema is incompatible, suppress one-run portfolio delta baseline.",
+    },
+    {
+      step: 5,
+      node: "Market data and event fetch",
+      environment: "Code + Pi Agent",
+      input: { holdings: (snapshot.holdings || []).map((h) => h.symbol), windowStartHkt: hkt(input.fetchStartMs), windowEndHkt: hkt(input.runAtMs) },
+	      action: "For each holding, fetch daily bars, latest 1min extended-hours bars, hourly bars, market news, price-target news, and earnings calendar. After price marking and current-theme extraction, fetch timestamped macro context and recent Arrays indexed X top-engagement tweets in code, then run one objective-centric Pi event-search agent. Pi judges supplied hot tweets for investment-related breaking-news eligibility, uses Brave source expansion only for qualifying indexed-X anchors, maps current themes to supported Arrays market-news topics, calls searchArraysMarketNewsTopic inside the Pi loop, and returns holding-linked events or portfolio-level risk-factor events.",
+      output: dataFetchSummary,
+      gate: "If more than 20% of holdings lack usable daily-bar price coverage, fail the run.",
+    },
+    {
+      step: 6,
+      node: "Price mark and anomaly metrics",
+      environment: "Code",
+      input: { priceSignalVersion: CONFIG.priceSignalVersion, volumeSignalVersion: CONFIG.volumeSignalVersion },
+	      action: "Mark equity positions to Arrays latest 1min price when available; compute total value from cash plus priced positions; compute price metrics and hourly cumulative-volume anomaly metrics. Then call Alva Ask once to extract current holding themes for this run before the Pi event-search agent uses theme context.",
+      output: {
+        abnormalSignals,
+        priceCoverageFailures: input.priceFailures,
+        totalValue: snapshot.totalValue,
+        pricedHoldingCount: snapshot.pricedHoldingCount,
+        unpricedHoldingCount: snapshot.unpricedHoldingCount,
+        themeExtraction: input.themeExtractionSummary || {},
+      },
+      gate: "oneDayPct/currentMovePct use latest 1min extended-hours price versus previous regular-session close when 1min data is newer. Hourly/daily are fallback only and are marked as fallback. Broker currentPrice, broker marketValue, cost, and P&L are never used. Theme extraction uses supplied portfolio JSON only every run; if it fails, code records a warning and falls back to the prior snapshot or fallback config for continuity.",
+    },
+    {
+      step: 7,
+      node: "Context update and event-candidate build",
+      environment: "Code",
+      input: { previousSnapshot: !!input.previous, rawEventCount: rawEvents.length },
+      action: "Compute portfolio delta and dynamic theme exposure for analyst context, dedupe event records, and build event_candidates from all non-duplicate source records, including portfolio-level macro/policy/risk events that do not name a specific holding. Broad market/theme/topic events remain one event object with affectedSymbols[] and affectedThemes[] instead of being duplicated per holding.",
+      output: {
+        portfolioDelta: delta,
+        themeExposure: input.currentThemes || [],
+        eventDedupeCounts: eventStatusCounts,
+        eventCandidateCount: eventCandidates.length,
+      },
+      gate: "Portfolio delta and theme exposure are context only, not standalone candidates. Event candidate code only drops same-run duplicates; missing exact symbol mapping is not a code-level rejection. Semantic relevance, exposure impact, freshness, novelty, qualification, and materiality are analyst responsibilities.",
+    },
+    {
+      step: 8,
+      node: "Asset anomaly build",
+      environment: "Code",
+      input: { abnormalSignals },
+      action: "Build one computed asset_anomaly object for each current holding with price or volume anomaly triggers. Anomalies are facts from market data, not event candidates. Prior-run anomaly buckets do not block attribution review; Alva Ask decides repetition using the user-visible alert timeline and current signal context.",
+      output: {
+        anomalyCount: anomalies.length,
+        anomalySymbols: anomalies.map((anomaly) => anomaly.symbol),
+      },
+      gate: "Anomaly attribution is separate from event impact. The analyst should return one attribution per anomaly. Anomalies are worth reporting even when attribution is weak, with uncertainty labeled clearly; code does not suppress it after the anomaly trigger fires.",
+    },
+    {
+      step: 9,
+      node: "Analyst decision",
+      environment: input.analystCallMode === "alva_ask" ? "Alva Ask (LLM)" : "Code",
+      input: input.analystPromptSummary || { reason: "LLM skipped" },
+      action: input.analystCallMode === "alva_ask"
+        ? "Call ask(buildAnalystPrompt(analystInput)) and parse JSON decision."
+        : "Use deterministic fallback decision because this run did not need an analyst call.",
+      output: llmDecision.analyst,
+      gate: "The analyst handles two separate flows: event candidates -> qualified events with exposure impact, and computed anomalies -> anomaly attributions. Selection/suppression is the final decision state, recorded in the final status ledger, not a separate event-lane stage. prior_alert_history is a past-7-day user-visible run timeline; empty runs are not suppressed reasoning. Portfolio delta/theme exposure are context only. Alva Ask may use available tools if it needs to verify stale or suspicious submitted data, and must return JSON only.",
+    },
+    {
+      step: 10,
+      node: "Persist and notify",
+      environment: "Code",
+      input: { selectedFindingIds: decision.selectedFindingIds || [] },
+      action: "Append feed outputs, write KV state, and emit either Telegram message or skip sentinel. Code does not override the analyst push/no-push decision with a separate repeat filter after the analyst returns.",
+      output: { outputSummary, persistSummary },
+      gate: "Quiet runs still persist decision, notification sentinel, run audit log, and per-file persist deltas.",
+    },
+  ];
+  return { stepLog, dataFetchSummary, llmDecision, outputSummary, persistSummary, auditArtifacts, laneArtifacts, searchExpansionTrace };
+}
+
+(async () => {
+  const runAtMs = Date.now();
+  if (!ACCOUNT_ID) {
+    throw new Error("Missing required env.args.accountId or env.args.connectedAccountId for the Alva connected portfolio account.");
+  }
+  const parsedPortfolio = await fetchPortfolioSummary(ACCOUNT_ID);
+  if (!parsedPortfolio || !Array.isArray(parsedPortfolio.holdings)) {
+    throw new Error("Connected-account portfolio API did not return usable holdings[]");
+  }
+  let snapshot = normalizeSummary(parsedPortfolio, runAtMs);
+  if (!snapshot.holdings.length) throw new Error("Connected portfolio returned zero holdings");
+
+  await feed.run(async (ctx) => {
+    let previous = null;
+    let previousRunAtMs = 0;
+    let eventIndex = {};
+    let alertHistory = [];
+    let findingHistory = [];
+    let previousPriceSignals = {};
+    let analystCallMode = "skipped";
+    let analystPromptSummary = {};
+
+    try {
+      const raw = await ctx.kv.load("lastSnapshot");
+      previous = raw ? JSON.parse(raw) : null;
+    } catch (_) {
+      previous = null;
+    }
+    previousRunAtMs = Number(await ctx.kv.load("lastRunAtMs")) || 0;
+    try {
+      const eventIndexRaw = await ctx.kv.load("eventIndex");
+      const legacyEventIndexRaw = eventIndexRaw ? "" : await ctx.kv.load(["evid", "enceIndex"].join(""));
+      eventIndex = normalizeEventTerminology(JSON.parse(eventIndexRaw || legacyEventIndexRaw || "{}"));
+    } catch (_) {
+      eventIndex = {};
+    }
+    try {
+      alertHistory = normalizeEventTerminology(JSON.parse((await ctx.kv.load("alertHistory")) || "[]"));
+    } catch (_) {
+      alertHistory = [];
+    }
+    alertHistory = sanitizeAlertTimeline(alertHistory, runAtMs);
+    const priorAlertTimeline = priorAlertTimelineForAnalyst(alertHistory, runAtMs);
+    try {
+      findingHistory = normalizeEventTerminology(JSON.parse((await ctx.kv.load("findingHistory")) || "[]"));
+    } catch (_) {
+      findingHistory = [];
+    }
+    try {
+      previousPriceSignals = JSON.parse((await ctx.kv.load("lastPriceSignals")) || "{}");
+    } catch (_) {
+      previousPriceSignals = {};
+    }
+    const priorAlertHistorySize = priorAlertTimeline.length;
+    const priorFindingHistorySize = findingHistory.length;
+
+    const warnings = [];
+    if (snapshot.asOfMsEstimated) {
+      warnings.push({ source: "portfolio:asOfMs", error: "connected-account snapshot did not provide asOfMs; runAtMs used for audit only" });
+    } else if (Number.isFinite(snapshot.asOfMs)) {
+      const snapshotAgeHours = (runAtMs - snapshot.asOfMs) / 3600000;
+      if (snapshotAgeHours > CONFIG.portfolioSnapshotStaleWarningHours) {
+        warnings.push({
+          source: "portfolio:asOfMs",
+          error: "connected-account snapshot is " + round(snapshotAgeHours, 1) + "h old; quantities/cash may lag recent trades",
+        });
+      }
+    }
+    if (previous && previous.markVersion !== CONFIG.snapshotMarkVersion) {
+      warnings.push({ source: "lastSnapshot", error: "previous snapshot schema migrated; suppressing one-run portfolio delta baseline" });
+      previous = null;
+    }
+    const fetchStartMs = previousRunAtMs
+      ? Math.min(runAtMs - CONFIG.defaultWindowMinutes * 60 * 1000, previousRunAtMs - CONFIG.eventOverlapMinutes * 60 * 1000)
+      : runAtMs - CONFIG.firstRunWindowHours * 60 * 60 * 1000;
+    const fetchStartSec = Math.floor(fetchStartMs / 1000);
+    const fetchEndSec = Math.floor(runAtMs / 1000);
+
+    const rawEvents = [];
+    const marketDataCoverage = [];
+    let priceSignals = [];
+    let priceFailures = 0;
+    for (const holding of snapshot.holdings) {
+      const marketDataSymbol = marketDataSymbolForHolding(holding);
+      const usesUnderlying = marketDataSymbol && marketDataSymbol !== holding.symbol;
+      const marketDataBasis = usesUnderlying ? "underlying_equity" : "holding_symbol";
+      const dailyBars = await fetchDailyBars(marketDataSymbol, warnings);
+      const minuteBars = await fetchMinuteBars(marketDataSymbol, warnings);
+      const hourlyBars = await fetchHourlyBars(marketDataSymbol, warnings);
+      const lastDaily = dailyBars.length ? dailyBars[dailyBars.length - 1] : null;
+      const lastMinute = minuteBars.length ? minuteBars[minuteBars.length - 1] : null;
+      const lastHourly = hourlyBars.length ? hourlyBars[hourlyBars.length - 1] : null;
+      marketDataCoverage.push({
+        symbol: holding.symbol,
+        marketDataSymbol,
+        underlyingSymbol: usesUnderlying ? marketDataSymbol : "",
+        marketDataBasis,
+        dailyBars: dailyBars.length,
+        minuteBars: minuteBars.length,
+        hourlyBars: hourlyBars.length,
+        latestDailyBarHkt: lastDaily ? hkt(barTimeSec(lastDaily) * 1000) : "n/a",
+        latestMinuteBarHkt: lastMinute ? hkt(barTimeSec(lastMinute) * 1000) : "n/a",
+        latestHourlyBarHkt: lastHourly ? hkt(barTimeSec(lastHourly) * 1000) : "n/a",
+      });
+      const priceSignal = analyzePrice(holding.symbol, holding, dailyBars, hourlyBars, minuteBars, hourlyBars, marketDataSymbol);
+      if (!priceSignal.available) priceFailures += 1;
+      priceSignals.push(priceSignal);
+      rawEvents.push.apply(rawEvents, await fetchNews(marketDataSymbol, fetchStartSec, fetchEndSec, warnings));
+      rawEvents.push.apply(rawEvents, await fetchPriceTargetNews(marketDataSymbol, fetchStartSec - 5 * 86400, fetchEndSec, warnings));
+      rawEvents.push.apply(rawEvents, await fetchEarnings(marketDataSymbol, fetchEndSec, warnings));
+    }
+    if (priceFailures / snapshot.holdings.length > 0.2) {
+      throw new Error("Price coverage blocker: " + priceFailures + " of " + snapshot.holdings.length + " holdings lacked usable daily bars");
+    }
+    snapshot = markSnapshotToLatest(snapshot, priceSignals, warnings);
+    priceSignals = refreshSignalContributions(priceSignals, snapshot);
+    snapshot = extractPortfolioThemes(snapshot, previous, warnings, runAtMs);
+    const delta = computePortfolioDelta(snapshot, previous);
+    const currentThemes = themeExposure(snapshot);
+    const previousThemes = previous ? themeExposure(previous) : [];
+
+    const macro = await fetchMacro(warnings);
+    const breakingNews = await fetchBreakingNews(snapshot, currentThemes, fetchStartMs, runAtMs, warnings);
+    rawEvents.push.apply(rawEvents, breakingNews.records);
+    if (previous && !priceSignalSchemaCompatible(previousPriceSignals)) {
+      warnings.push({ source: "lastPriceSignals", error: "previous asset anomaly signal schema migrated; suppressing one-run anomaly delta baseline" });
+      previousPriceSignals = priceSignalMap(priceSignals);
+    }
+    const normalizedEvent = normalizeEvent(rawEvents, eventIndex, runAtMs);
+    const eventCandidates = buildEventCandidates(snapshot, normalizedEvent.records);
+    const anomalies = buildAnomalies(snapshot, priceSignals);
+    const candidates = eventCandidates.concat(anomalies.map(anomalyAsLegacyCandidate));
+    const reviewItemCount = eventCandidates.length + anomalies.length;
+    let analyst = { findings: [], decision: buildFallbackDecision("no_material_candidates") };
+    let rawAnalystJson = "";
+    if (!reviewItemCount) {
+      analyst.decision = buildFallbackDecision("no event candidate or asset anomaly was built");
+    } else {
+      const analystInput = {
+        account_id: ACCOUNT_ID,
+        run_at_hkt: hkt(runAtMs),
+        event_candidates_to_review: eventCandidates.slice(0, CONFIG.maxPromptCandidates).map(compactEventCandidateForAnalyst),
+        asset_anomalies: anomalies,
+        asset_anomaly_metrics: priceSignals
+          .filter((signal) => signal && (signal.abnormal || anomalies.some((anomaly) => anomaly.symbol === signal.symbol)))
+          .map(compactPriceSignalForAnalyst),
+        event_records: normalizedEvent.records
+          .filter((item) => {
+            if (item.dedupeStatus === "duplicate") return false;
+            return eventCandidates.some((candidate) => (candidate.eventRefs || []).indexOf(item.eventKey) >= 0);
+          })
+          .slice(0, CONFIG.maxPromptEvents)
+          .map(compactRawEventForAnalyst),
+        prior_alert_history: priorAlertTimeline,
+        portfolio_snapshot: {
+          totalValue: snapshot.totalValue,
+          cash: snapshot.cash,
+          cashAllocation: snapshot.cashAllocation,
+          valuationBasis: snapshot.priceBasis,
+          valuationPolicy: snapshot.valuationPolicy,
+          pricedHoldingCount: snapshot.pricedHoldingCount,
+          unpricedHoldingCount: snapshot.unpricedHoldingCount,
+          brokerSnapshotAsOfHkt: hkt(snapshot.asOfMs),
+          latestPriceAsOfHkt: hkt(snapshot.priceAsOfMs),
+          holdings: snapshot.holdings.map((h) => ({
+            symbol: h.symbol,
+            assetClass: h.assetClass,
+            side: h.side,
+            quantity: h.quantity,
+            currentPrice: round(h.currentPrice, 4),
+            marketValue: round(h.marketValue, 2),
+            weight: round(h.allocation, 4),
+            themes: themesForHolding(snapshot, h),
+          })),
+        },
+        portfolio_context: {
+          current_portfolio_delta: delta,
+          theme_exposure: currentThemes,
+          note: "Portfolio delta and theme exposure are context only, not standalone candidates or required alert sections.",
+        },
+        macro_context: macro,
+        coverage_warnings: warnings.slice(0, 20),
+      };
+      analystCallMode = "alva_ask";
+      analystPromptSummary = {
+        promptName: "buildAnalystPrompt",
+        environment: "Alva Ask (LLM)",
+        toolLoop: "alva_ask_managed_if_needed",
+        browsing: "alva_ask_managed_if_needed",
+        suppliedJsonOnly: false,
+        requiredInputs: ["prior_alert_history", "event_candidates_to_review", "asset_anomalies", "asset_anomaly_metrics", "portfolio_context"],
+        inputCounts: {
+          eventCandidates: eventCandidates.length,
+          assetAnomalies: anomalies.length,
+          totalReviewItems: reviewItemCount,
+          eventRecords: analystInput.event_records.length,
+          priorAlertHistoryRows: analystInput.prior_alert_history.length,
+        },
+        caps: {
+          eventRecords: CONFIG.maxPromptEvents,
+          eventCandidates: CONFIG.maxPromptCandidates,
+          analystPromptChars: CONFIG.maxAnalystPromptChars,
+          priorAlertTimelineDays: CONFIG.priorAlertTimelineDays,
+          priorAlertTimelineRows: CONFIG.maxPriorAlertTimelineRows,
+        },
+        outputSchema: ["eventCandidateStatuses[]", "eventImpactFindings[] with exposure_impact", "anomalyAttributionFindings[]", "decision.message_sections.event_exposure_impacts/anomaly_attributions"],
+      };
+      const analystText = String(ask(buildAnalystPrompt(analystInput)).text || "");
+      const parsedAnalyst = safeParseJson(analystText);
+      if (!parsedAnalyst) throw new Error("Analyst prompt did not return parseable JSON");
+      const parsedAnalystClean = normalizeEventTerminology(parsedAnalyst);
+      rawAnalystJson = compactJson(parsedAnalystClean, 24000);
+      analyst = normalizeAnalyst(parsedAnalystClean, candidates, runAtMs);
+    }
+
+    const selectedFindings = analyst.findings.filter((f) => analyst.decision.selectedFindingIds.indexOf(f.findingId) >= 0);
+    const laneArtifacts = buildLaneArtifacts(eventCandidates, anomalies, analyst);
+
+    const shouldPush = analyst.decision.alertDecision === "push" && analyst.decision.notificationMessage && selectedFindings.length > 0;
+    const notifyBody = shouldPush ? analyst.decision.notificationMessage : SKIP;
+    const notifyTitle = shouldPush ? "Portfolio Watch" : "Portfolio Watch Quiet";
+
+    await ctx.self.ts("portfolio", "snapshot").append([{
+      date: runAtMs,
+      accountId: ACCOUNT_ID,
+      totalValue: snapshot.totalValue,
+      cash: snapshot.cash,
+      cashAllocation: snapshot.cashAllocation,
+      holdingCount: snapshot.holdingCount,
+      topHoldings: snapshot.holdings.slice(0, 8).map((h) => h.symbol + ":" + fmtPct(h.allocation || 0)).join(","),
+      portfolioDeltaJson: compactJson(delta, 12000),
+      themeExposureJson: compactJson(currentThemes, 8000),
+      coverageWarningsJson: compactJson(warnings, 8000),
+      rawJson: compactJson(snapshot, 24000),
+      asOfMs: snapshot.asOfMs,
+      runAtMs,
+    }]);
+
+    await ctx.self.ts("portfolio", "positions").append(snapshot.holdings.map((h) => ({
+      date: runAtMs,
+      accountId: ACCOUNT_ID,
+      instrumentId: h.instrumentId,
+      symbol: h.symbol,
+      assetClass: h.assetClass,
+      side: h.side,
+      quantity: h.quantity,
+      currentPrice: h.currentPrice,
+      marketValue: h.marketValue,
+      weight: h.allocation,
+      currency: h.currency,
+      instrumentDetailsJson: compactJson(h.instrumentDetails || {}),
+      themesJson: compactJson(themesForHolding(snapshot, h)),
+      runAtMs,
+    })));
+
+	    if (normalizedEvent.records.length) {
+	      await ctx.self.ts("event", "items").append(normalizedEvent.records.slice(0, 160).map((item) => ({
+	        date: item.publishedAtMs || (item.metadata && item.metadata.eventAtMs) || item.firstSeenAtMs || runAtMs,
+        eventKey: item.eventKey,
+        sourceType: item.sourceType,
+        symbol: item.symbol,
+        title: item.title,
+        summary: item.summary,
+        url: item.url,
+        source: item.source,
+        dedupeStatus: item.dedupeStatus,
+        metadataJson: compactJson(item.metadata || {}, 6000),
+	        publishedAtMs: item.publishedAtMs,
+        firstSeenAtMs: item.firstSeenAtMs,
+        lastSeenAtMs: item.lastSeenAtMs,
+        runAtMs,
+      })));
+    }
+
+    if (analyst.findings.length) {
+      await ctx.self.ts("finding", "records").append(analyst.findings.map((finding) => ({
+        date: runAtMs,
+        findingId: finding.findingId,
+        findingType: finding.findingType,
+        primaryAsset: finding.primaryAsset,
+        summary: finding.summary,
+        dedupeKey: finding.dedupeKey,
+        selected: finding.selected,
+        suppressionReason: finding.suppressionReason,
+        payloadJson: compactJson(finding.payload || {}, 10000),
+        runAtMs,
+      })));
+    }
+
+    const normalizedEventAuditRows = normalizedEvent.records.map(compactRawEventForAudit);
+    const decisionAuditArtifacts = buildAuditArtifacts(eventCandidates, priceSignals.filter((signal) => signal && signal.abnormal), anomalies);
+    const searchExpansionTrace = buildSearchExpansionTrace(breakingNews.summary);
+
+    await ctx.self.ts("analysis", "decision").append([{
+      date: runAtMs,
+      accountId: ACCOUNT_ID,
+      runSource: RUN_SOURCE,
+      alertDecision: shouldPush ? "push" : "no_push",
+      urgency: shouldPush ? analyst.decision.urgency : "none",
+      reason: analyst.decision.reason || analyst.decision.skipReason || "",
+      skipReason: shouldPush ? "" : (analyst.decision.skipReason || analyst.decision.reason || "quiet_run"),
+      notificationMessage: shouldPush ? analyst.decision.notificationMessage : "",
+      selectedFindingIdsJson: compactJson(analyst.decision.selectedFindingIds || []),
+      suppressedFindingIdsJson: compactJson(analyst.decision.suppressedFindingIds || []),
+      messageSectionsJson: compactJson(analyst.decision.messageSections || {}, 6000),
+      currentPortfolioDeltaJson: compactJson(delta, 12000),
+      priorAlertHistoryJson: compactJson(priorAlertTimeline, 50000),
+      rawEventsJson: compactJson(normalizedEventAuditRows, 250000),
+      eventCandidatesJson: compactJson(laneArtifacts.eventCandidates, 160000),
+      qualifiedEventsJson: compactJson(laneArtifacts.qualifiedEvents, 80000),
+      selectedEventsJson: compactJson(laneArtifacts.selectedEvents, 60000),
+      anomaliesJson: compactJson(laneArtifacts.anomalies, 60000),
+      anomalyAttributionsJson: compactJson(laneArtifacts.anomalyAttributions, 90000),
+      finalStatusesJson: compactJson(laneArtifacts.finalStatuses, 160000),
+      searchExpansionTraceJson: compactJson(searchExpansionTrace, 120000),
+      candidateSummaryJson: compactJson({ eventCandidates, qualifiedEvents: laneArtifacts.qualifiedEvents, selectedEvents: laneArtifacts.selectedEvents, anomalies, anomalyAttributions: laneArtifacts.anomalyAttributions, finalStatuses: laneArtifacts.finalStatuses, candidates, priceSignals }, 160000),
+      candidateAuditJson: compactJson(decisionAuditArtifacts.candidateAudit),
+      anomalySignalsJson: compactJson(decisionAuditArtifacts.anomalySignals),
+      rawAnalystJson,
+      runAtMs,
+    }]);
+
+    await ctx.self.ts("notify", "message").append([{
+      date: runAtMs,
+      title: notifyTitle,
+      body: notifyBody,
+    }]);
+
+    const alertEntry = sanitizeAlertTimelineRow({
+      runAtMs,
+      runAtHkt: hkt(runAtMs),
+      runSource: RUN_SOURCE,
+      alertDecision: shouldPush ? "push" : "no_push",
+      userReceivedPush: !!shouldPush,
+      summary: shouldPush ? (analyst.decision.reason || "") : "",
+      notificationMessage: shouldPush ? analyst.decision.notificationMessage : "",
+      selectedFindingIds: analyst.decision.selectedFindingIds || [],
+      selectedDedupeKeys: selectedFindings.map((f) => f.dedupeKey),
+      tickers: selectedFindings.map((f) => f.primaryAsset).filter((symbol) => symbol && symbol !== "PORTFOLIO"),
+    });
+    if (alertEntry) alertHistory.push(alertEntry);
+    alertHistory = sanitizeAlertTimeline(alertHistory, runAtMs);
+
+    const findingEntries = (analyst.findings || []).map((f) => ({
+      runAtMs,
+      findingId: f.findingId,
+      findingType: f.findingType,
+      primaryAsset: f.primaryAsset,
+      summary: f.summary,
+      dedupeKey: f.dedupeKey,
+      selected: f.selected,
+      suppressionReason: f.suppressionReason,
+    }));
+    findingHistory = findingHistory.concat(findingEntries).slice(-160);
+
+    await ctx.kv.put("lastSnapshot", compactJson(snapshot));
+    await ctx.kv.put("lastRunAtMs", String(runAtMs));
+    await ctx.kv.put("lastPriceSignals", compactJson(priceSignalMap(priceSignals)));
+    await ctx.kv.put("eventIndex", compactJson(normalizedEvent.index));
+    await ctx.kv.put("alertHistory", compactJson(alertHistory));
+    await ctx.kv.put("findingHistory", compactJson(findingHistory));
+    await ctx.kv.put("lastDecision", compactJson(alertEntry));
+    await ctx.kv.put("nextRunContext", compactJson({
+      runAtMs,
+      portfolioDeltaSummary: delta.summary,
+      selectedDedupeKeys: alertEntry.selectedDedupeKeys,
+      nextContextHints: analyst.decision.nextContextHints || [],
+      coverageWarnings: warnings.slice(0, 12),
+    }));
+
+    const persistRows = buildPersistDeltaRows({
+      runAtMs,
+      snapshot,
+      delta,
+      normalizedEvent,
+      analyst,
+      priceSignals,
+      eventCandidates,
+      anomalies,
+      candidates,
+      laneArtifacts,
+      warnings,
+      shouldPush,
+      notifyTitle,
+      notifyBody,
+      alertEntry,
+      alertHistorySize: alertHistory.length,
+      findingHistorySize: findingHistory.length,
+    });
+    const runCompletedAtMs = Date.now();
+    const audit = buildRunAudit({
+      runAtMs,
+      previous,
+      previousRunAtMs,
+      priorAlertHistorySize,
+      priorFindingHistorySize,
+      fetchStartMs,
+      marketDataCoverage,
+      themeExtractionSummary: snapshot.themeExtractionSummary || {},
+      breakingNewsSummary: breakingNews.summary,
+      themeNewsSummary: breakingNews.summary.themeNewsSummary,
+      rawEvents,
+      normalizedEvent,
+      priceSignals,
+      eventCandidates,
+      anomalies,
+      priceFailures,
+      macro,
+      snapshot,
+      delta,
+      currentThemes,
+      searchExpansionTrace,
+      laneArtifacts,
+      candidates,
+      analyst,
+      analystCallMode,
+      analystPromptSummary,
+      rawAnalystJson,
+      shouldPush,
+      notifyTitle,
+      notifyBody,
+      warnings,
+      persistRows,
+    });
+    await ctx.self.ts("audit", "run_log").append([{
+      date: runAtMs,
+      accountId: ACCOUNT_ID,
+      runSource: RUN_SOURCE,
+      status: "completed",
+      alertDecision: shouldPush ? "push" : "no_push",
+      shouldPush: shouldPush ? "true" : "false",
+      skipReason: shouldPush ? "" : (analyst.decision.skipReason || analyst.decision.reason || "quiet_run"),
+      stepLogJson: compactJson(audit.stepLog, 60000),
+      dataFetchSummaryJson: compactJson(audit.dataFetchSummary, 90000),
+      llmDecisionJson: compactJson(audit.llmDecision, 60000),
+      outputSummaryJson: compactJson(audit.outputSummary, 60000),
+      persistSummaryJson: compactJson(audit.persistSummary, 60000),
+      rawEventsJson: compactJson(normalizedEventAuditRows, 250000),
+      eventCandidatesJson: compactJson(laneArtifacts.eventCandidates, 160000),
+      qualifiedEventsJson: compactJson(laneArtifacts.qualifiedEvents, 80000),
+      selectedEventsJson: compactJson(laneArtifacts.selectedEvents, 60000),
+      anomaliesJson: compactJson(laneArtifacts.anomalies, 60000),
+      anomalyAttributionsJson: compactJson(laneArtifacts.anomalyAttributions, 90000),
+      finalStatusesJson: compactJson(laneArtifacts.finalStatuses, 160000),
+      searchExpansionTraceJson: compactJson(audit.searchExpansionTrace, 120000),
+      candidateAuditJson: compactJson(audit.auditArtifacts.candidateAudit),
+      anomalySignalsJson: compactJson(audit.auditArtifacts.anomalySignals),
+      notificationPreview: clean(notifyBody === SKIP ? "SKIP_NOTIFICATION sentinel" : notifyBody, 1600),
+      warningsJson: compactJson(warnings, 12000),
+      runStartedAtMs: runAtMs,
+      runCompletedAtMs,
+      durationMs: runCompletedAtMs - runAtMs,
+      runAtMs,
+    }]);
+    await ctx.self.ts("audit", "persist_delta").append(persistRows);
+  });
+})();

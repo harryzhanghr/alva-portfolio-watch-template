@@ -1,0 +1,2074 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Portfolio Watch Run Audit</title>
+  <link rel="stylesheet" href="https://alva-ai-static.b-cdn.net/design-system/v1/design-system.css" />
+  <script src="https://unpkg.com/@alva-ai/toolkit/dist/browser.global.js"></script>
+  <style>
+    :root {
+      --ink: #18211f;
+      --muted: #63716d;
+      --faint: #eef3f0;
+      --line: #d7e0dc;
+      --paper: #ffffff;
+      --panel: #f8faf8;
+      --green: #21704b;
+      --blue: #245ea8;
+      --amber: #8d641d;
+      --red: #a13d3f;
+      --violet: #6d5397;
+      --shadow: 0 12px 28px rgba(24, 33, 31, 0.08);
+      color-scheme: light;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #edf2ef;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+
+    button, select {
+      font: inherit;
+    }
+
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(248, 250, 248, 0.94);
+      backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--line);
+      padding: 18px clamp(16px, 4vw, 42px) 12px;
+    }
+
+    .title-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 14px;
+    }
+
+    h1 {
+      margin: 0 0 5px;
+      font-size: 24px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+
+    .subtle {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .status-pill {
+      border: 1px solid var(--line);
+      background: var(--paper);
+      border-radius: 999px;
+      padding: 7px 11px;
+      color: var(--muted);
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .tabs {
+      display: inline-flex;
+      gap: 6px;
+      border: 1px solid var(--line);
+      background: var(--paper);
+      border-radius: 8px;
+      padding: 4px;
+      box-shadow: var(--shadow);
+    }
+
+    .tab-btn,
+    .small-btn,
+    .file-btn,
+    .run-btn {
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      border-radius: 7px;
+      cursor: pointer;
+      font-weight: 500;
+    }
+
+    .tab-btn {
+      padding: 8px 12px;
+      min-width: 112px;
+    }
+
+    .tab-btn.is-active,
+    .small-btn.is-active,
+    .file-btn.is-active,
+    .run-btn.is-active {
+      color: var(--ink);
+      border-color: #b9ccc4;
+      background: #e9f2ed;
+    }
+
+    main {
+      padding: 20px clamp(16px, 4vw, 42px) 56px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 310px minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+      min-width: 0;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+      min-width: 0;
+    }
+
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-head h2,
+    .section h3 {
+      margin: 0;
+      font-size: 15px;
+      letter-spacing: 0;
+    }
+
+    .panel-body {
+      padding: 14px;
+    }
+
+    .run-list {
+      display: grid;
+      gap: 7px;
+      max-height: calc(100vh - 192px);
+      overflow: auto;
+      overflow-x: hidden;
+      padding: 10px;
+      min-width: 0;
+    }
+
+    .run-btn {
+      width: 100%;
+      max-width: 100%;
+      text-align: left;
+      padding: 10px;
+      border-color: var(--line);
+      background: #fbfcfb;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .run-btn,
+    .file-btn {
+      display: block;
+      justify-content: flex-start;
+      align-items: flex-start;
+      white-space: normal;
+      overflow: hidden;
+      height: auto;
+      min-height: 0;
+      line-height: 1.35;
+    }
+
+    .run-btn strong {
+      display: block;
+      color: var(--ink);
+      font-size: 13px;
+      margin-bottom: 3px;
+    }
+
+    .run-btn span {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      overflow: hidden;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+
+    .filter-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      padding: 10px 10px 0;
+    }
+
+    .small-btn {
+      padding: 6px 9px;
+      border-color: var(--line);
+      background: var(--paper);
+      font-size: 12px;
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 12px;
+      min-height: 92px;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: .03em;
+      margin-bottom: 7px;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 18px;
+      letter-spacing: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .metric p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 8px;
+      color: var(--muted);
+      background: var(--paper);
+      font-size: 11px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+
+    .badge.green { color: var(--green); background: #eef7f2; border-color: #bcd8ca; }
+    .badge.blue { color: var(--blue); background: #eef4fb; border-color: #c6d7ef; }
+    .badge.amber { color: var(--amber); background: #fff8eb; border-color: #ead6aa; }
+    .badge.red { color: var(--red); background: #fff0f0; border-color: #ecc5c5; }
+    .badge.violet { color: var(--violet); background: #f4f0fb; border-color: #d8cbea; }
+
+    .section {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      margin-top: 12px;
+      overflow: hidden;
+    }
+
+    .section > summary,
+    .section-title {
+      list-style: none;
+      cursor: pointer;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-weight: 500;
+    }
+
+    .section > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .section-content {
+      padding: 14px;
+    }
+
+    .step {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 10px;
+      overflow: hidden;
+      background: #fbfcfb;
+    }
+
+    .step summary {
+      list-style: none;
+      cursor: pointer;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 11px 12px;
+    }
+
+    .step summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .step-title {
+      min-width: 0;
+    }
+
+    .step-title strong {
+      display: block;
+      font-size: 14px;
+    }
+
+    .step-title span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .step-content {
+      border-top: 1px solid var(--line);
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .kv-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .kv-box {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      padding: 10px;
+      min-width: 0;
+    }
+
+    .kv-box b {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #24312e;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    th, td {
+      text-align: left;
+      vertical-align: top;
+      padding: 9px 8px;
+      border-bottom: 1px solid var(--line);
+      overflow-wrap: anywhere;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .03em;
+      background: #fbfcfb;
+      white-space: nowrap;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(0, .9fr);
+      gap: 12px;
+    }
+
+    .artifact-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+
+    .artifact-grid .section {
+      margin-top: 0;
+    }
+
+    .source-link {
+      color: var(--blue);
+      text-decoration: none;
+      overflow-wrap: anywhere;
+    }
+
+    .source-link:hover {
+      text-decoration: underline;
+    }
+
+    .file-layout {
+      display: grid;
+      grid-template-columns: 320px minmax(0, 1fr);
+      gap: 16px;
+    }
+
+    .file-list {
+      padding: 10px;
+      display: grid;
+      gap: 7px;
+      max-height: calc(100vh - 180px);
+      overflow: auto;
+    }
+
+    .file-btn {
+      width: 100%;
+      text-align: left;
+      padding: 10px;
+      border-color: var(--line);
+      background: #fbfcfb;
+    }
+
+    .file-btn strong {
+      display: block;
+      color: var(--ink);
+      font-size: 13px;
+    }
+
+    .file-btn span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 3px;
+      white-space: normal;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+
+    .empty {
+      color: var(--muted);
+      padding: 24px;
+      text-align: center;
+      border: 1px dashed #c6d3ce;
+      border-radius: 8px;
+      background: #fbfcfb;
+    }
+
+    .notice {
+      border: 1px solid #ead6aa;
+      background: #fff8eb;
+      color: #6f4c16;
+      border-radius: 8px;
+      padding: 11px 12px;
+      font-size: 13px;
+      margin-bottom: 12px;
+    }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+    }
+
+    .table-wrap table {
+      min-width: 720px;
+    }
+
+    @media (max-width: 1120px) {
+      .layout,
+      .file-layout,
+      .artifact-grid,
+      .split {
+        grid-template-columns: 1fr;
+      }
+
+      .run-list,
+      .file-list {
+        max-height: 320px;
+      }
+
+      .metric-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 640px) {
+      .title-row {
+        display: block;
+      }
+
+      .status-pill {
+        display: inline-flex;
+        margin-top: 10px;
+      }
+
+      .tabs,
+      .tab-btn {
+        width: 100%;
+      }
+
+      .tabs {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .metric-grid,
+      .artifact-grid,
+      .kv-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .step summary {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="playbook-container shell">
+    <header class="topbar">
+      <div class="title-row">
+        <div>
+          <h1>Portfolio Watch Run Audit</h1>
+          <div class="subtle">Connected-portfolio automation logs, intermediate decisions, and persisted file deltas.</div>
+        </div>
+        <div class="status-pill" id="loadStatus">Loading feed data...</div>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Audit tabs">
+        <button class="btn btn-secondary btn-small tab-btn is-active" data-tab="runs" role="tab">Run Logs</button>
+        <button class="btn btn-secondary btn-small tab-btn" data-tab="files" role="tab">Persist Files</button>
+      </div>
+    </header>
+
+    <main id="app">
+      <div class="empty">Loading automation audit data...</div>
+    </main>
+  </div>
+
+  <script>
+    const PAGE_PARAMS = new URLSearchParams(window.location.search);
+    const USERNAME = PAGE_PARAMS.get("username") || PAGE_PARAMS.get("owner") || "YOUR_ALVA_USERNAME";
+    const FEED_NAME = PAGE_PARAMS.get("feed_name") || PAGE_PARAMS.get("feedName") || "portfolio-watch-automation";
+    const FEED_ID = Number(PAGE_PARAMS.get("feed_id") || PAGE_PARAMS.get("feedId") || 0);
+    const CRONJOB_ID = Number(PAGE_PARAMS.get("cronjob_id") || PAGE_PARAMS.get("cronjobId") || 0);
+    const OFFICIAL_RUN_SOURCE = "cron_push_pipeline";
+    const HISTORICAL_RUN_SOURCE = "historical_cron_deploy_run";
+    const HISTORICAL_MATCH_WINDOW_MS = 100000;
+    const BASE = "/alva/home/" + USERNAME + "/feeds/" + FEED_NAME + "/v1/data";
+    const API_ORIGIN = "https://api-llm.prd.alva.ai";
+
+    const HISTORICAL_CRON_RUNS = [];
+
+    const FILES = [
+      { key: "audit.run_log", label: "Run Audit Log", type: "feed_timeseries", path: BASE + "/audit/run_log", latest: "@last/100", description: "One row per run with step-by-step process, runtime call details, output summary, and persist summary." },
+      { key: "audit.persist_delta", label: "Persist Delta", type: "feed_timeseries", path: BASE + "/audit/persist_delta", latest: "@last/1000", description: "Per-run append/update summary for every tracked persisted output or KV state key." },
+      { key: "portfolio.snapshot", label: "Portfolio Snapshot", type: "feed_timeseries", path: BASE + "/portfolio/snapshot", latest: "@last/100", description: "Run-level Arrays-current portfolio value, context-only delta, theme exposure, warnings, and raw snapshot JSON." },
+      { key: "portfolio.positions", label: "Portfolio Positions", type: "feed_timeseries", path: BASE + "/portfolio/positions", latest: "@last/1000", description: "One normalized current-position row per holding per run, with quantity, Arrays current price, market value, and weight." },
+      { key: "event.items", label: "Event Items", type: "feed_timeseries", path: BASE + "/event/items", latest: "@last/1000", description: "Normalized market/news/Pi/corporate records with dedupe status and metadata." },
+      { key: "finding.records", label: "Analyst Assessments", type: "feed_timeseries", path: BASE + "/finding/records", latest: "@last/500", description: "Event-impact assessments and anomaly attributions plus selected/suppressed state." },
+      { key: "analysis.decision", label: "Alert Decision", type: "feed_timeseries", path: BASE + "/analysis/decision", latest: "@last/100", description: "Final push/no-push decision with prior user-visible alert timeline, event/anomaly lane artifacts, context-only portfolio data, and raw analyst JSON." },
+      { key: "notify.message", label: "Notification Message", type: "feed_timeseries", path: BASE + "/notify/message", latest: "@last/100", description: "Notification sidecar. Quiet runs store the skip sentinel instead of pushing useful body text." },
+      { key: "kv_state", label: "Feed KV State", type: "feed_kv", path: "/alva/home/" + USERNAME + "/feeds/" + FEED_NAME + "/v1/kv/", latest: "", description: "Rolling state for the next run. The playbook shows KV deltas recorded by audit.persist_delta rather than reading private KV files directly." },
+    ];
+
+    const state = {
+      tab: "runs",
+      runFilter: "all",
+      selectedRunAtMs: null,
+      selectedFile: "audit.run_log",
+      runs: [],
+      officialRunAtMs: new Set(),
+      realCronRunAtMs: new Set(),
+      auditRows: [],
+      allPersistRows: [],
+      persistRows: [],
+      fileRows: {},
+      loaded: false,
+      error: null,
+    };
+
+    function createClientConfig() {
+      const params = new URLSearchParams(window.location.search);
+      const pbsvToken = window.alva && window.alva.udf && window.alva.udf.getViewerToken
+        ? window.alva.udf.getViewerToken()
+        : "";
+      const apiOrigin = params.get("api_origin");
+      return {
+        ...(pbsvToken ? { pbsvToken } : {}),
+        ...(apiOrigin ? { baseUrl: apiOrigin.replace(/\/$/, "") } : {}),
+      };
+    }
+
+    async function readAlfsJson(path) {
+      const config = createClientConfig();
+      if (window.AlvaToolkit && AlvaToolkit.AlvaClient && (config.pbsvToken || config.baseUrl)) {
+        try {
+          return await new AlvaToolkit.AlvaClient(config).fs.read({ path });
+        } catch (_) {}
+      }
+      const origin = config.baseUrl || API_ORIGIN;
+      const resp = await fetch(origin + "/api/v1/fs/read?path=" + encodeURIComponent(path));
+      if (!resp.ok) throw new Error("ALFS read failed: " + resp.status + " " + path);
+      return resp.json();
+    }
+
+    function esc(value) {
+      return String(value == null ? "" : value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function clean(value, max) {
+      const text = String(value || "").replace(/\s+/g, " ").trim();
+      return max && text.length > max ? text.slice(0, max - 1) + "..." : text;
+    }
+
+    function parseJson(value, fallback) {
+      if (value && typeof value === "object") return value;
+      const raw = String(value || "").trim();
+      if (!raw) return fallback == null ? null : fallback;
+      try {
+        return JSON.parse(raw);
+      } catch (_) {
+        if (Array.isArray(fallback) && raw.startsWith("[")) {
+          const salvaged = salvageObjectsFromTruncatedArray(raw);
+          if (salvaged.length) return salvaged;
+        }
+        return fallback == null ? null : fallback;
+      }
+    }
+
+    function salvageObjectsFromTruncatedArray(rawValue) {
+      const raw = String(rawValue || "");
+      const arrayAt = raw.indexOf("[");
+      if (arrayAt < 0) return [];
+      const out = [];
+      let depth = 0;
+      let start = -1;
+      let inString = false;
+      let escaped = false;
+      for (let i = arrayAt + 1; i < raw.length; i += 1) {
+        const ch = raw[i];
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+          } else if (ch === "\\") {
+            escaped = true;
+          } else if (ch === '"') {
+            inString = false;
+          }
+          continue;
+        }
+        if (ch === '"') {
+          inString = true;
+          continue;
+        }
+        if (ch === "{") {
+          if (depth === 0) start = i;
+          depth += 1;
+          continue;
+        }
+        if (ch === "}") {
+          depth -= 1;
+          if (depth === 0 && start >= 0) {
+            try {
+              out.push(JSON.parse(raw.slice(start, i + 1)));
+            } catch (_) {}
+            start = -1;
+          }
+        }
+      }
+      return out;
+    }
+
+    function hkt(ms) {
+      const n = Number(ms);
+      if (!Number.isFinite(n)) return "n/a";
+      const d = new Date(n + 8 * 60 * 60 * 1000);
+      const pad = (x) => String(x).padStart(2, "0");
+      return d.getUTCFullYear() + "-" + pad(d.getUTCMonth() + 1) + "-" + pad(d.getUTCDate()) + " " + pad(d.getUTCHours()) + ":" + pad(d.getUTCMinutes()) + " HKT";
+    }
+
+    function shortHkt(ms) {
+      const text = hkt(ms);
+      return text === "n/a" ? text : text.replace("2026-", "");
+    }
+
+    function fmtNum(value, digits) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "--";
+      return n.toLocaleString(undefined, { maximumFractionDigits: digits == null ? 2 : digits });
+    }
+
+    function fmtPct(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "--";
+      return (n * 100).toFixed(1) + "%";
+    }
+
+    function badge(text, tone) {
+      return '<span class="badge ' + esc(tone || "") + '">' + esc(text) + '</span>';
+    }
+
+    function statusTone(status) {
+      const key = String(status || "").toLowerCase();
+      if (key === "selected" || key === "push") return "green";
+      if (key === "suppressed" || key === "not_qualified" || key === "seen_before") return "amber";
+      if (key === "missing_attribution" || key === "no_attribution") return "red";
+      return "blue";
+    }
+
+    function jsonBlock(value) {
+      return '<pre>' + esc(JSON.stringify(value == null ? {} : value, null, 2)) + '</pre>';
+    }
+
+    function rowRunAt(row) {
+      return Number(row.runAtMs || row.runStartedAtMs || row.date || 0);
+    }
+
+    function isOfficialCronRow(row) {
+      return String(row && row.runSource || "") === OFFICIAL_RUN_SOURCE;
+    }
+
+    function isOfficialRunAt(runAtMs) {
+      return state.officialRunAtMs.has(String(Number(runAtMs)));
+    }
+
+    function isRealCronRunAt(runAtMs) {
+      return state.realCronRunAtMs.has(String(Number(runAtMs)));
+    }
+
+    function getMeta(key) {
+      return FILES.find((file) => file.key === key) || FILES[0];
+    }
+
+    function rowsForFile(key) {
+      if (key === "kv_state") {
+        return state.persistRows.filter((row) => row.fileKey === "kv_state");
+      }
+      return (state.fileRows[key] || []).filter((row) => isRealCronRunAt(rowRunAt(row)));
+    }
+
+    function latestRowsForFile(key) {
+      const rows = rowsForFile(key);
+      const latest = Math.max.apply(null, rows.map(rowRunAt).concat([0]));
+      return rows.filter((row) => rowRunAt(row) === latest);
+    }
+
+    function normalizeRun(row, legacy) {
+      const runAtMs = rowRunAt(row);
+      const out = {
+        ...row,
+        runAtMs,
+        legacy: !!legacy,
+      };
+      if (legacy) {
+        const outputSummary = {
+          alertDecision: row.alertDecision || "no_push",
+          urgency: row.urgency || "none",
+          skipReason: row.skipReason || row.reason || "",
+          notificationPreview: row.notificationMessage || "SKIP_NOTIFICATION sentinel",
+          candidateCount: parseJson(row.candidateSummaryJson, {}).candidates ? parseJson(row.candidateSummaryJson, {}).candidates.length : null,
+        };
+        out.status = "legacy_decision_only";
+        out.shouldPush = row.alertDecision === "push" ? "true" : "false";
+        out.outputSummaryJson = JSON.stringify(outputSummary);
+        out.stepLogJson = JSON.stringify([
+          {
+            step: "legacy",
+            node: "Decision record only",
+            environment: "Stored output",
+            action: "This run happened before audit.run_log existed. The playbook can show final decision fields but not internal step replay.",
+            output: outputSummary,
+            gate: "Use newer runs for full step-by-step processing details.",
+          },
+        ]);
+        out.persistSummaryJson = JSON.stringify({ trackedFiles: [], totalRecordsAdded: null });
+      }
+      return out;
+    }
+
+    function runEndMs(run) {
+      return Number(run.createdAtMs) + Number(run.durationMs || 0);
+    }
+
+    function matchScoreForDeployRun(rowAtMs, run) {
+      const start = Number(run.createdAtMs);
+      const end = runEndMs(run);
+      return Math.min(Math.abs(rowAtMs - start), Math.abs(rowAtMs - end));
+    }
+
+    function findHistoricalMatch(rows, run, usedKeys) {
+      const start = Number(run.createdAtMs);
+      const end = runEndMs(run);
+      const candidates = rows
+        .map((row) => {
+          const at = rowRunAt(row);
+          return {
+            row,
+            at,
+            key: String(at),
+            score: matchScoreForDeployRun(at, run),
+          };
+        })
+        .filter((candidate) => {
+          if (!candidate.at || usedKeys.has(candidate.key)) return false;
+          if (candidate.at < start - HISTORICAL_MATCH_WINDOW_MS) return false;
+          if (candidate.at > end + HISTORICAL_MATCH_WINDOW_MS) return false;
+          return candidate.score <= HISTORICAL_MATCH_WINDOW_MS;
+        })
+        .sort((a, b) => a.score - b.score);
+      const best = candidates[0];
+      if (best) usedKeys.add(best.key);
+      return best || null;
+    }
+
+    function historicalStep(run, matchedKind) {
+      return {
+        step: "historical",
+        node: "Historical cron deploy run",
+        environment: "Alva Deploy",
+        input: {
+          cronjobId: CRONJOB_ID,
+          deployRunId: run.runId,
+          workflowRunId: run.workflowRunId,
+          createdAtHkt: hkt(run.createdAtMs),
+        },
+        action: "Confirmed this row from the online push cronjob deploy history. Duplicate/manual candidates from the same HKT hour are not shown as separate cron rows.",
+        output: {
+          status: run.status,
+          durationMs: run.durationMs,
+          matchedRecord: matchedKind || "platform_only",
+        },
+        gate: "Future runs use runSource=cron_push_pipeline. Historical pre-tag runs are displayed only when backed by deploy-run metadata.",
+      };
+    }
+
+    function normalizeHistoricalCronRun(run, auditMatch, decisionMatch) {
+      const matchedAudit = auditMatch && auditMatch.row;
+      const matchedDecision = decisionMatch && decisionMatch.row;
+      if (matchedAudit) {
+        const normalized = normalizeRun(matchedAudit, false);
+        normalized.runAtMs = Number(run.createdAtMs);
+        normalized.auditRunAtMs = auditMatch.at;
+        normalized.deployStartedAtMs = Number(run.createdAtMs);
+        normalized.platformRunId = run.runId;
+        normalized.workflowRunId = run.workflowRunId;
+        normalized.durationMs = run.durationMs;
+        normalized.historicalCron = true;
+        normalized.matchKind = "matched_audit";
+        normalized.runSource = HISTORICAL_RUN_SOURCE;
+        normalized.status = run.status || normalized.status || "completed";
+        const output = parseJson(normalized.outputSummaryJson, {});
+        output.platformRunId = run.runId;
+        output.workflowRunId = run.workflowRunId;
+        output.matchKind = "matched_audit";
+        output.note = "Pre-runSource cron matched to a full audit.run_log row.";
+        normalized.outputSummaryJson = JSON.stringify(output);
+        return normalized;
+      }
+      if (matchedDecision) {
+        const normalized = normalizeRun(matchedDecision, true);
+        normalized.runAtMs = Number(run.createdAtMs);
+        normalized.decisionRunAtMs = decisionMatch.at;
+        normalized.deployStartedAtMs = Number(run.createdAtMs);
+        normalized.platformRunId = run.runId;
+        normalized.workflowRunId = run.workflowRunId;
+        normalized.durationMs = run.durationMs;
+        normalized.historicalCron = true;
+        normalized.matchKind = "matched_decision";
+        normalized.runSource = HISTORICAL_RUN_SOURCE;
+        normalized.status = run.status || "completed";
+        const output = parseJson(normalized.outputSummaryJson, {});
+        output.platformRunId = run.runId;
+        output.workflowRunId = run.workflowRunId;
+        output.matchKind = "matched_decision";
+        output.note = "Pre-audit cron matched to a decision row only. Full intermediate steps were not persisted yet.";
+        normalized.outputSummaryJson = JSON.stringify(output);
+        normalized.stepLogJson = JSON.stringify([
+          historicalStep(run, "matched_decision"),
+          ...parseJson(normalized.stepLogJson, []),
+        ]);
+        return normalized;
+      }
+      return {
+        runAtMs: Number(run.createdAtMs),
+        deployStartedAtMs: Number(run.createdAtMs),
+        platformRunId: run.runId,
+        workflowRunId: run.workflowRunId,
+        durationMs: run.durationMs,
+        status: run.status || "completed",
+        alertDecision: "platform_only",
+        shouldPush: "false",
+        reason: "Historical cron confirmed by deploy metadata; no trusted pre-tag audit or decision row was matched.",
+        runSource: HISTORICAL_RUN_SOURCE,
+        historicalCron: true,
+        legacy: true,
+        matchKind: "platform_only",
+        outputSummaryJson: JSON.stringify({
+          alertDecision: "platform_only",
+          platformRunId: run.runId,
+          workflowRunId: run.workflowRunId,
+          createdAtHkt: hkt(run.createdAtMs),
+          durationMs: run.durationMs,
+          matchKind: "platform_only",
+          note: "The online cron ran, but this older run does not have a reliable persisted step or decision row.",
+        }),
+        stepLogJson: JSON.stringify([historicalStep(run, "platform_only")]),
+        persistSummaryJson: JSON.stringify({ trackedFiles: [], totalRecordsAdded: 0 }),
+      };
+    }
+
+    function buildRuns() {
+      const usedAuditKeys = new Set();
+      const usedDecisionKeys = new Set();
+      const officialRuns = state.auditRows
+        .filter(isOfficialCronRow)
+        .map((row) => {
+          usedAuditKeys.add(String(rowRunAt(row)));
+          return normalizeRun(row, false);
+        });
+      const historicalAuditRows = state.auditRows.filter((row) => !isOfficialCronRow(row));
+      const decisionRows = (state.fileRows["analysis.decision"] || []).filter((row) => !isOfficialCronRow(row));
+      const historicalRuns = HISTORICAL_CRON_RUNS
+        .map((run) => {
+          const auditMatch = findHistoricalMatch(historicalAuditRows, run, usedAuditKeys);
+          const decisionMatch = auditMatch ? null : findHistoricalMatch(decisionRows, run, usedDecisionKeys);
+          return normalizeHistoricalCronRun(run, auditMatch, decisionMatch);
+        });
+      state.runs = officialRuns
+        .concat(historicalRuns)
+        .sort((a, b) => rowRunAt(b) - rowRunAt(a));
+      state.officialRunAtMs = new Set(state.runs.map((row) => String(rowRunAt(row))));
+      state.realCronRunAtMs = new Set();
+      state.runs.forEach((row) => {
+        [row.runAtMs, row.auditRunAtMs, row.decisionRunAtMs].forEach((at) => {
+          if (Number(at)) state.realCronRunAtMs.add(String(Number(at)));
+        });
+      });
+      state.persistRows = state.allPersistRows.filter((row) => isOfficialCronRow(row) || isRealCronRunAt(rowRunAt(row)));
+      if (!state.runs.some((row) => rowRunAt(row) === Number(state.selectedRunAtMs))) {
+        state.selectedRunAtMs = null;
+      }
+      if (!state.selectedRunAtMs && state.runs.length) {
+        state.selectedRunAtMs = rowRunAt(state.runs[0]);
+      }
+    }
+
+    async function loadData() {
+      const status = document.getElementById("loadStatus");
+      status.textContent = "Loading feed " + FEED_ID + "...";
+      try {
+        const reads = [
+          readAlfsJson(BASE + "/audit/run_log/@last/100").catch(() => []),
+          readAlfsJson(BASE + "/audit/persist_delta/@last/1000").catch(() => []),
+        ];
+        FILES.forEach((file) => {
+          if (file.type === "feed_timeseries") {
+            reads.push(readAlfsJson(file.path + "/" + file.latest).catch(() => []));
+          }
+        });
+        const results = await Promise.all(reads);
+        state.auditRows = Array.isArray(results[0]) ? results[0] : [];
+        state.allPersistRows = Array.isArray(results[1]) ? results[1] : [];
+        let idx = 2;
+        FILES.forEach((file) => {
+          if (file.type === "feed_timeseries") {
+            state.fileRows[file.key] = Array.isArray(results[idx]) ? results[idx] : [];
+            idx += 1;
+          }
+        });
+        buildRuns();
+        state.loaded = true;
+        status.textContent = "Loaded " + state.runs.length + " official cron runs, " + state.persistRows.length + " deltas";
+      } catch (err) {
+        state.error = err;
+        status.textContent = "Load failed";
+      }
+      render();
+    }
+
+    function selectedRun() {
+      return state.runs.find((row) => rowRunAt(row) === Number(state.selectedRunAtMs)) || state.runs[0] || null;
+    }
+
+    function runTimeKeys(run) {
+      if (run && typeof run === "object") {
+        return new Set([run.runAtMs, run.auditRunAtMs, run.decisionRunAtMs].filter(Number).map((at) => String(Number(at))));
+      }
+      return new Set([run].filter(Number).map((at) => String(Number(at))));
+    }
+
+    function runDeltas(run) {
+      const keys = runTimeKeys(run);
+      return state.persistRows
+        .filter((row) => keys.has(String(rowRunAt(row))))
+        .sort((a, b) => String(a.fileKey || "").localeCompare(String(b.fileKey || "")));
+    }
+
+    function runRows(run, key) {
+      const keys = runTimeKeys(run);
+      return (state.fileRows[key] || [])
+        .filter((row) => keys.has(String(rowRunAt(row))))
+        .sort((a, b) => {
+          const at = rowRunAt(a) - rowRunAt(b);
+          if (at) return at;
+          return String(a.symbol || "").localeCompare(String(b.symbol || "")) || String(a.sourceType || "").localeCompare(String(b.sourceType || ""));
+        });
+    }
+
+    function runDecisionRow(run) {
+      const rows = runRows(run, "analysis.decision");
+      return rows[rows.length - 1] || run || {};
+    }
+
+    function sourceOriginForType(sourceType) {
+      const type = String(sourceType || "").toLowerCase();
+      if (type === "news" || type === "analyst" || type === "corporate_event" || type === "x_post") return "per_ticker_search";
+      if (type === "breaking_news") return "pi_market_breaking_search";
+      if (type === "theme_news") return "pi_theme_search";
+      if (type === "topic_news") return "arrays_topic_news";
+      if (type === "asset_anomaly") return "asset_anomaly_signal";
+      return "unknown";
+    }
+
+    function sourceOriginLabel(origin) {
+      const key = String(origin || "").toLowerCase();
+      if (key === "per_ticker_search") return "Per-ticker";
+      if (key === "pi_market_breaking_search") return "Pi breaking";
+      if (key === "pi_theme_search") return "Pi theme";
+      if (key === "arrays_topic_news") return "Arrays topic";
+      if (key === "asset_anomaly_signal") return "Anomaly";
+      return "Unknown";
+    }
+
+    function sourceOriginTone(origin) {
+      const key = String(origin || "").toLowerCase();
+      if (key === "per_ticker_search") return "blue";
+      if (key === "pi_market_breaking_search") return "violet";
+      if (key === "pi_theme_search") return "green";
+      if (key === "arrays_topic_news") return "green";
+      if (key === "asset_anomaly_signal") return "amber";
+      return "muted";
+    }
+
+    function eventOriginInfo(row, meta) {
+      const origin = (meta && meta.sourceOrigin) || row.sourceOrigin || sourceOriginForType(row.sourceType || row.candidateType);
+      return {
+        origin,
+        label: (meta && meta.sourceOriginLabel) || row.sourceOriginLabel || sourceOriginLabel(origin),
+        lane: (meta && meta.sourceLane) || row.sourceLane || "",
+        mode: (meta && meta.sourceSearchMode) || row.sourceSearchMode || "",
+      };
+    }
+
+    function sourceEventTimeLine(row, meta) {
+      const hasMetaValue = meta && Object.prototype.hasOwnProperty.call(meta, "sourceEventTime");
+      const raw = hasMetaValue ? meta.sourceEventTime : row.sourceEventTime;
+      const at = Number((meta && meta.sourceEventAtMs) || row.sourceEventAtMs || 0);
+      if (raw === null) return '<div class="subtle">origin event: null</div>';
+      const label = raw || (Number.isFinite(at) && at > 0 ? shortHkt(at) : "");
+      if (!label) return "";
+      const hktLabel = Number.isFinite(at) && at > 0 ? " / " + shortHkt(at) : "";
+      return '<div class="subtle">origin event: ' + esc(String(label)) + esc(hktLabel && String(label) !== shortHkt(at) ? hktLabel : "") + '</div>';
+    }
+
+    function eventSourceTimeDisplay(row, meta) {
+      if (row && row.publishedAtMs) return shortHkt(row.publishedAtMs);
+      if (meta && meta.eventAtMs) return shortHkt(meta.eventAtMs);
+      if (meta && meta.sourceTimeLabel) return String(meta.sourceTimeLabel);
+      if (row && row.sourceTimeLabel) return String(row.sourceTimeLabel);
+      return "n/a";
+    }
+
+    function salvageCandidatesFromTruncatedJson(rawValue) {
+      const raw = String(rawValue || "");
+      const marker = '"candidates"';
+      const markerAt = raw.indexOf(marker);
+      if (markerAt < 0) return [];
+      const arrayAt = raw.indexOf("[", markerAt);
+      if (arrayAt < 0) return [];
+      const out = [];
+      let depth = 0;
+      let start = -1;
+      let inString = false;
+      let escaped = false;
+      for (let i = arrayAt + 1; i < raw.length; i += 1) {
+        const ch = raw[i];
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+          } else if (ch === "\\") {
+            escaped = true;
+          } else if (ch === '"') {
+            inString = false;
+          }
+          continue;
+        }
+        if (ch === '"') {
+          inString = true;
+          continue;
+        }
+        if (ch === "{") {
+          if (depth === 0) start = i;
+          depth += 1;
+          continue;
+        }
+        if (ch === "}") {
+          depth -= 1;
+          if (depth === 0 && start >= 0) {
+            try {
+              out.push(JSON.parse(raw.slice(start, i + 1)));
+            } catch (_) {}
+            start = -1;
+          }
+        }
+      }
+      return out;
+    }
+
+    function synthesizeEventCandidates(run) {
+      return runRows(run, "event.items")
+        .filter((row) => row.dedupeStatus !== "duplicate")
+        .map((row) => {
+          const meta = parseJson(row.metadataJson, {});
+          const origin = eventOriginInfo(row, meta);
+          return {
+            candidateId: "event:" + (row.eventKey || row.sourceType + ":" + row.symbol + ":" + row.date),
+            lane: "event_impact",
+            candidateType: row.sourceType || "event",
+            symbol: row.symbol || "",
+            title: row.title || "",
+            summary: row.summary || "",
+            reason: "Recovered from event.items for this run because full candidate JSON was unavailable.",
+            eventRefs: row.eventKey ? [row.eventKey] : [],
+            sourceOrigin: origin.origin,
+            sourceOriginLabel: origin.label,
+            sourceLane: origin.lane,
+            sourceSearchMode: origin.mode,
+            source: row.source || "",
+            url: row.url || "",
+            dedupeStatus: row.dedupeStatus || "",
+            publishedAtMs: row.publishedAtMs || null,
+            firstSeenAtMs: row.firstSeenAtMs || null,
+            lastSeenAtMs: row.lastSeenAtMs || null,
+          };
+        });
+    }
+
+    function candidateSummaryForRun(run) {
+      const decision = runDecisionRow(run);
+      const compactAudit = parseJson(decision.candidateAuditJson || run.candidateAuditJson, {});
+      if (compactAudit && Array.isArray(compactAudit.candidates)) {
+        return { summary: compactAudit, candidates: compactAudit.candidates };
+      }
+      const rawCandidateSummary = decision.candidateSummaryJson || run.candidateSummaryJson || "";
+      const summary = parseJson(rawCandidateSummary, {});
+      let candidates = Array.isArray(summary.candidates) ? summary.candidates : [];
+      if (!candidates.length) {
+        candidates = salvageCandidatesFromTruncatedJson(rawCandidateSummary);
+        if (candidates.length) {
+          return { summary: { candidateCount: candidates.length, recoveredFromTruncatedJson: true }, candidates };
+        }
+      }
+      if (!candidates.length) {
+        candidates = synthesizeEventCandidates(run);
+        if (candidates.length) {
+          return { summary: { candidateCount: candidates.length, synthesizedFromEventItems: true }, candidates };
+        }
+      }
+      return { summary, candidates };
+    }
+
+    function artifactJsonForRun(run, key, fallback) {
+      const decision = runDecisionRow(run);
+      const value = decision[key] || run[key] || "";
+      return parseJson(value, fallback == null ? [] : fallback);
+    }
+
+    function rowMetadata(row) {
+      if (row && row.metadata && typeof row.metadata === "object") return row.metadata;
+      return parseJson(row && row.metadataJson, {});
+    }
+
+    function normalizedRawEventRow(row) {
+      const meta = rowMetadata(row);
+      return {
+        ...row,
+        metadata: meta,
+        affectedSymbols: row.affectedSymbols || meta.affectedSymbols || [],
+        affectedThemes: row.affectedThemes || meta.affectedThemes || meta.themes || [],
+        sourceLinks: row.sourceLinks || meta.sourceLinks || [],
+        mappingReason: row.mappingReason || meta.mappingReason || meta.whyRelevant || "",
+      };
+    }
+
+    function rawEventsForRun(run) {
+      const direct = artifactJsonForRun(run, "rawEventsJson", null);
+      if (Array.isArray(direct) && direct.length) return direct.map(normalizedRawEventRow);
+      return runRows(run, "event.items").map(normalizedRawEventRow);
+    }
+
+    function rawAnalystForRun(run) {
+      const decision = runDecisionRow(run);
+      return parseJson(decision.rawAnalystJson || run.rawAnalystJson, {});
+    }
+
+    function searchExpansionTraceForRun(run) {
+      const direct = artifactJsonForRun(run, "searchExpansionTraceJson", null);
+      if (direct && typeof direct === "object" && (Array.isArray(direct.allToolCalls) || Array.isArray(direct.sourceExpansionCalls))) return direct;
+      const fetch = parseJson(run && run.dataFetchSummaryJson, {});
+      if (fetch.searchExpansionTrace && typeof fetch.searchExpansionTrace === "object") return fetch.searchExpansionTrace;
+      const llm = parseJson(run && run.llmDecisionJson, {});
+      const summary = llm.breakingNews || fetch.breakingNewsSummary || {};
+      const calls = Array.isArray(summary.toolCalls) ? summary.toolCalls : [];
+      const toolCalls = calls.map((call, idx) => ({
+        order: idx + 1,
+        tool: call.tool || "",
+        purpose: call.purpose || "",
+        lane: call.purpose === "theme_news" ? "theme_news" : "market_breaking",
+        query: clean(call.query || "", 260),
+        theme: call.theme || "",
+        topic: call.topic || "",
+        resultFilter: call.resultFilter || "",
+        freshness: call.freshness || "",
+        resultCount: Number(call.resultCount) || 0,
+        limit: call.limit || null,
+        startHkt: call.startHkt || "",
+        endHkt: call.endHkt || "",
+        limitReached: !!call.limitReached,
+        error: call.error || "",
+      }));
+      return {
+        agentCalled: !!summary.agentCalled,
+        queryPlanning: summary.queryPlanning || "",
+        sourceExpansionPolicy: summary.sourceExpansionPolicy || "Recovered from legacy llmDecisionJson/dataFetchSummaryJson.",
+        toolCallCount: toolCalls.length,
+        indexedXDiscovery: summary.indexedXDiscovery || null,
+        indexedXDiscoveryCalls: toolCalls.filter((call) => call.tool === "searchArraysIndexedX"),
+        xDiscoveryCalls: toolCalls.filter((call) => call.tool === "searchArraysIndexedX" || call.tool === "searchGrokX"),
+        grokDiscoveryCalls: toolCalls.filter((call) => call.tool === "searchGrokX"),
+        sourceExpansionCalls: toolCalls.filter((call) => call.tool === "searchBrave" && call.purpose === "source_expansion"),
+        themeNewsCalls: toolCalls.filter((call) => call.tool === "searchBrave" && call.purpose === "theme_news"),
+        arraysTopicNewsCalls: toolCalls.filter((call) => call.tool === "searchArraysMarketNewsTopic"),
+        allToolCalls: toolCalls,
+        searchAudit: Array.isArray(summary.searchAudit) ? summary.searchAudit : [],
+        themeTopicMappings: Array.isArray(summary.themeTopicMappings) ? summary.themeTopicMappings : [],
+        parsedEventCount: summary.parsedEventCount || 0,
+        rawEventRecords: summary.rawEventRecords || 0,
+        error: summary.error || "",
+      };
+    }
+
+    function finalStatusesForRun(run) {
+      const direct = artifactJsonForRun(run, "finalStatusesJson", null);
+      if (direct && (Array.isArray(direct.eventCandidates) || Array.isArray(direct.anomalies))) {
+        return {
+          eventCandidates: direct.eventCandidates || [],
+          anomalies: direct.anomalies || [],
+        };
+      }
+      const raw = rawAnalystForRun(run);
+      const statuses = Array.isArray(raw.eventCandidateStatuses) ? raw.eventCandidateStatuses.map((row) => ({
+        candidateId: row.candidate_id || row.candidateId || "",
+        status: row.status || "not_qualified",
+        reason: row.reason || "",
+        linkedEventFindingId: row.linked_event_finding_id || row.linkedEventFindingId || "",
+      })) : [];
+      if (statuses.length) return { eventCandidates: statuses, anomalies: [] };
+      const candidates = eventCandidatesForRun(run);
+      const qualified = qualifiedEventsForRun(run);
+      const statusByCandidate = {};
+      qualified.forEach((finding) => {
+        (finding.eventRefs || []).forEach((ref) => {
+          const candidateId = String(ref || "").indexOf("event:") === 0 ? String(ref) : "event:" + ref;
+          statusByCandidate[candidateId] = {
+            candidateId,
+            symbol: finding.primaryAsset || "",
+            title: finding.summary || finding.findingId || "",
+            status: finding.status || (finding.selected ? "selected" : "suppressed"),
+            reason: finding.selected ? "Selected for notification." : (finding.suppressionReason || "Qualified by analyst but not selected for notification."),
+            linkedEventFindingId: finding.findingId || "",
+          };
+        });
+      });
+      const synthesized = candidates.map((candidate) => {
+        if (statusByCandidate[candidate.candidateId]) {
+          return {
+            ...statusByCandidate[candidate.candidateId],
+            symbol: statusByCandidate[candidate.candidateId].symbol || candidate.symbol || "",
+            title: candidate.title || statusByCandidate[candidate.candidateId].title || candidate.candidateId || "",
+          };
+        }
+        const finalStatus = candidate.finalStatus || {};
+        return {
+          candidateId: candidate.candidateId || "",
+          symbol: candidate.symbol || candidate.primaryAsset || "",
+          title: candidate.title || candidate.candidateId || "",
+          status: finalStatus.status || "unknown",
+          reason: finalStatus.reason || "This historical row did not persist a final event-candidate reason. Future runs write finalStatusesJson for every selected, suppressed, and not_qualified item.",
+          linkedEventFindingId: finalStatus.linkedEventFindingId || "",
+        };
+      });
+      return { eventCandidates: synthesized, anomalies: [] };
+    }
+
+    function eventCandidatesForRun(run) {
+      const direct = artifactJsonForRun(run, "eventCandidatesJson", null);
+      if (Array.isArray(direct) && direct.length) return direct;
+      const summary = parseJson((runDecisionRow(run).candidateSummaryJson || run.candidateSummaryJson), {});
+      if (Array.isArray(summary.eventCandidates) && summary.eventCandidates.length) return summary.eventCandidates;
+      return candidateSummaryForRun(run).candidates.filter((candidate) => candidate.lane === "event_impact" || candidate.candidateType !== "asset_anomaly");
+    }
+
+    function qualifiedEventsForRun(run) {
+      const direct = artifactJsonForRun(run, "qualifiedEventsJson", null);
+      if (Array.isArray(direct) && direct.length) return direct;
+      const summary = parseJson((runDecisionRow(run).candidateSummaryJson || run.candidateSummaryJson), {});
+      if (Array.isArray(summary.qualifiedEvents) && summary.qualifiedEvents.length) return summary.qualifiedEvents;
+      const raw = rawAnalystForRun(run);
+      const decision = raw.decision || {};
+      const selectedIds = []
+        .concat(decision.selected_event_impact_finding_ids || [])
+        .concat(decision.selected_anomaly_attribution_finding_ids || [])
+        .map(String);
+      const suppression = decision.suppression_reasons || {};
+      return (raw.eventImpactFindings || []).map((row) => {
+        const id = row.finding_id || row.findingId || "";
+        const selected = selectedIds.indexOf(String(id)) >= 0;
+        return {
+          findingId: id,
+          findingType: "event_impact",
+          primaryAsset: row.primary_asset || row.primaryAsset || "",
+          status: selected ? "selected" : "suppressed",
+          selected,
+          summary: row.summary || "",
+          dedupeKey: row.dedupe_key || row.dedupeKey || "",
+          suppressionReason: selected ? "" : (suppression[id] || ""),
+          confidence: row.confidence || "",
+          exposureImpact: row.exposure_impact || row.exposureImpact || null,
+          eventRefs: row.event_refs || row.eventRefs || [],
+          dataQualityNotes: row.data_quality_notes || row.dataQualityNotes || [],
+          payload: row,
+        };
+      });
+    }
+
+    function selectedEventsForRun(run) {
+      const direct = artifactJsonForRun(run, "selectedEventsJson", null);
+      if (Array.isArray(direct) && direct.length) return direct;
+      return qualifiedEventsForRun(run).filter((row) => row.selected || row.status === "selected");
+    }
+
+    function anomaliesForRun(run) {
+      const direct = artifactJsonForRun(run, "anomaliesJson", null);
+      if (Array.isArray(direct) && direct.length) return direct;
+      const summary = parseJson((runDecisionRow(run).candidateSummaryJson || run.candidateSummaryJson), {});
+      if (Array.isArray(summary.anomalies) && summary.anomalies.length) return summary.anomalies;
+      return anomalySignalsForRun(run).map((signal) => ({
+        anomalyId: "anomaly:" + (signal.symbol || ""),
+        symbol: signal.symbol || "",
+        title: (signal.symbol || "") + " asset anomaly",
+        summary: "Recovered anomaly signal from legacy audit fields.",
+        anomalyMetrics: signal,
+      }));
+    }
+
+    function anomalyAttributionsForRun(run) {
+      const direct = artifactJsonForRun(run, "anomalyAttributionsJson", null);
+      if (Array.isArray(direct) && direct.length) return direct;
+      const summary = parseJson((runDecisionRow(run).candidateSummaryJson || run.candidateSummaryJson), {});
+      if (Array.isArray(summary.anomalyAttributions) && summary.anomalyAttributions.length) return summary.anomalyAttributions;
+      const findings = runRows(run, "finding.records")
+        .filter((row) => row.findingType === "anomaly_attribution")
+        .map((row) => {
+          const payload = parseJson(row.payloadJson, {});
+          return {
+            anomalyId: "anomaly:" + (row.primaryAsset || ""),
+            symbol: row.primaryAsset || "",
+            title: (row.primaryAsset || "") + " anomaly attribution",
+            summary: row.summary || "",
+            anomalyMetrics: payload.anomaly_metrics || payload.anomalyMetrics || {},
+            finalStatus: {
+              status: row.selected === "true" ? "selected" : "suppressed",
+              reason: row.selected === "true" ? "Selected for notification." : (row.suppressionReason || ""),
+              linkedAttributionFindingId: row.findingId || "",
+            },
+            attribution: {
+              findingId: row.findingId || "",
+              findingType: row.findingType || "anomaly_attribution",
+              primaryAsset: row.primaryAsset || "",
+              status: row.selected === "true" ? "selected" : "suppressed",
+              selected: row.selected === "true",
+              summary: row.summary || "",
+              dedupeKey: row.dedupeKey || "",
+              suppressionReason: row.suppressionReason || "",
+              attributionStatus: payload.attribution_status || payload.attributionStatus || "",
+              supportingEvents: payload.supporting_events || payload.supportingEvents || [],
+              dataQualityNotes: payload.data_quality_notes || payload.dataQualityNotes || [],
+              payload,
+            },
+          };
+        });
+      if (findings.length) return findings;
+      return anomaliesForRun(run).map((anomaly) => ({
+        ...anomaly,
+        finalStatus: {
+          status: "no_attribution",
+          reason: "No persisted anomaly attribution was found for this legacy run.",
+          linkedAttributionFindingId: "",
+        },
+        attribution: null,
+      }));
+    }
+
+    function anomalySignalsForRun(run) {
+      const decision = runDecisionRow(run);
+      const compactSignals = parseJson(decision.anomalySignalsJson || run.anomalySignalsJson, {});
+      if (compactSignals && Array.isArray(compactSignals.signals)) {
+        return compactSignals.signals;
+      }
+      const steps = parseJson(run && run.stepLogJson, []);
+      const out = [];
+      const seen = new Set();
+      steps.forEach((step) => {
+        const output = step && step.output && typeof step.output === "object" ? step.output : {};
+        const signals = Array.isArray(output.abnormalSignals) ? output.abnormalSignals : [];
+        signals.forEach((signal) => {
+          const key = String(signal.symbol || "") + ":" + String((signal.triggerKinds || []).join(",")) + ":" + String((signal.reasons || []).join(","));
+          if (!seen.has(key)) {
+            seen.add(key);
+            out.push({ ...signal, source: "step_output" });
+          }
+        });
+      });
+      candidateSummaryForRun(run).candidates
+        .filter((candidate) => candidate.candidateType === "asset_anomaly" || candidate.lane === "anomaly_attribution")
+        .forEach((candidate) => {
+          const metrics = candidate.anomalyMetrics || {};
+          const key = String(metrics.symbol || candidate.symbol || "") + ":" + String((metrics.triggerKinds || []).join(",")) + ":" + String((metrics.reasons || []).join(","));
+          if (!seen.has(key)) {
+            seen.add(key);
+            out.push({ ...metrics, symbol: metrics.symbol || candidate.symbol, source: "candidate_metrics" });
+          }
+        });
+      return out.sort((a, b) => String(a.symbol || "").localeCompare(String(b.symbol || "")));
+    }
+
+    function renderMetric(label, value, note) {
+      return '<div class="metric"><span>' + esc(label) + '</span><strong>' + esc(value) + '</strong><p>' + esc(note || "") + '</p></div>';
+    }
+
+    function renderRunList() {
+      const rows = state.runs.filter((run) => {
+        if (state.runFilter === "push") return run.alertDecision === "push" || run.shouldPush === "true";
+        return true;
+      });
+      const filters = [
+        ["all", "All"],
+        ["push", "Push only"],
+      ].map(([key, label]) => '<button class="btn btn-secondary btn-extra-small small-btn ' + (state.runFilter === key ? "is-active" : "") + '" data-run-filter="' + key + '">' + label + '</button>').join("");
+      const buttons = rows.map((run) => {
+        const output = parseJson(run.outputSummaryJson, {});
+        const active = rowRunAt(run) === Number(state.selectedRunAtMs);
+        const decision = run.alertDecision || output.alertDecision || "no_push";
+        const tone = decision === "push" ? "green" : (decision === "platform_only" || run.legacy ? "amber" : "blue");
+        const kind = run.matchKind === "matched_audit" ? "full audit" : run.matchKind === "matched_decision" ? "decision-only" : run.matchKind === "platform_only" ? "platform-only" : "full audit";
+        const summary = clean(kind + " · " + (run.skipReason || output.skipReason || run.reason || run.status || ""), 170);
+        return '<button class="btn btn-secondary btn-small run-btn ' + (active ? "is-active" : "") + '" data-run="' + rowRunAt(run) + '">' +
+          '<strong>' + esc(shortHkt(rowRunAt(run))) + " " + badge(decision, tone) + '</strong>' +
+          '<span>' + esc(summary) + '</span>' +
+          '</button>';
+      }).join("");
+      return '<aside class="panel"><div class="panel-head"><h2>Official Cron Runs</h2>' + badge(rows.length + " shown", "blue") + '</div><div class="filter-row">' + filters + '</div><div class="run-list">' + (buttons || '<div class="empty">Waiting for the next official cron audit row. Manual verification rows are hidden.</div>') + '</div></aside>';
+    }
+
+    function renderStep(step, idx) {
+      const env = String(step.environment || "");
+      const tone = env.indexOf("Alva Ask") >= 0 ? "violet" : env.indexOf("Code") >= 0 ? "green" : "blue";
+      const open = idx < 2 ? " open" : "";
+      return '<details class="step"' + open + '>' +
+        '<summary>' +
+        badge("Step " + esc(step.step), tone) +
+        '<div class="step-title"><strong>' + esc(step.node || "Step") + '</strong><span>' + esc(clean(step.action || "", 140)) + '</span></div>' +
+        badge(env || "Stored", tone) +
+        '</summary>' +
+        '<div class="step-content">' +
+        '<div class="kv-grid">' +
+        '<div class="kv-box"><b>Input</b>' + jsonBlock(step.input || {}) + '</div>' +
+        '<div class="kv-box"><b>Output</b>' + jsonBlock(step.output || {}) + '</div>' +
+        '</div>' +
+        '<div class="kv-grid">' +
+        '<div class="kv-box"><b>Action</b><pre>' + esc(step.action || "") + '</pre></div>' +
+        '<div class="kv-box"><b>Gate / decision rule</b><pre>' + esc(step.gate || "") + '</pre></div>' +
+        '</div>' +
+        '</div>' +
+        '</details>';
+    }
+
+    function renderSearchExpansionTrace(run) {
+      const trace = searchExpansionTraceForRun(run);
+      if (!trace || (!trace.toolCallCount && !(trace.searchAudit || []).length)) {
+        return '<div class="empty">No Pi search expansion trace is available for this run.</div>';
+      }
+      const calls = Array.isArray(trace.allToolCalls) ? trace.allToolCalls : [];
+      const indexed = trace.indexedXDiscovery || {};
+      const indexedTopTweets = Array.isArray(indexed.topTweets) ? indexed.topTweets : [];
+      const indexedRows = indexedTopTweets.map((tweet) => '<tr>' +
+        '<td>' + esc(tweet.rank || "") + '</td>' +
+        '<td>' + esc(tweet.handle || "") + '<div class="subtle">' + esc(tweet.content_type || "") + '</div></td>' +
+        '<td><a href="' + esc(tweet.url || "#") + '" target="_blank" rel="noopener noreferrer">' + esc(clean(tweet.text || "", 300)) + '</a><div class="subtle">' + esc(tweet.published_at_hkt || tweet.published_at_iso || "") + '</div></td>' +
+        '<td>' + esc(tweet.engagement_score == null ? (tweet.metrics && tweet.metrics.engagement_score == null ? "--" : tweet.metrics && tweet.metrics.engagement_score) : tweet.engagement_score) + '</td>' +
+        '</tr>').join("");
+      const rows = calls.map((call) => {
+        const status = call.limitReached ? "limit" : (call.error ? "error" : "ok");
+        const detail = [
+          call.resultFilter ? "filter=" + call.resultFilter : "",
+          call.freshness ? "freshness=" + call.freshness : "",
+          call.theme ? "theme=" + call.theme : "",
+          call.topic ? "topic=" + call.topic : "",
+          call.startHkt || call.endHkt ? [call.startHkt, call.endHkt].filter(Boolean).join(" -> ") : "",
+        ].filter(Boolean).join(" / ");
+        const toolColor = call.tool === "searchBrave" && call.purpose === "source_expansion"
+          ? "violet"
+          : call.tool === "searchArraysIndexedX" || call.tool === "searchGrokX"
+          ? "blue"
+          : "green";
+        return '<tr>' +
+          '<td>' + esc(call.order || "") + '</td>' +
+          '<td>' + badge(call.tool || "", toolColor) + '<div class="subtle">' + esc(call.purpose || call.lane || "") + '</div></td>' +
+          '<td>' + esc(clean(call.query || "", 360)) + '<div class="subtle">' + esc(detail) + '</div></td>' +
+          '<td>' + esc(call.resultCount == null ? "--" : call.resultCount) + '</td>' +
+          '<td>' + badge(status, status === "ok" ? "green" : status === "limit" ? "amber" : "red") + '<div class="subtle">' + esc(clean(call.error || "", 160)) + '</div></td>' +
+          '</tr>';
+      }).join("");
+      const auditRows = (trace.searchAudit || []).map((row) => '<tr>' +
+        '<td>' + esc(row.lane || "") + '</td>' +
+        '<td>' + esc(row.theme || "") + '</td>' +
+        '<td>' + esc(clean(row.query || "", 320)) + '</td>' +
+        '<td>' + esc((row.tools_used || row.toolsUsed || []).join(", ")) + '</td>' +
+        '<td>' + esc(row.candidate_count == null ? row.candidateCount == null ? "--" : row.candidateCount : row.candidate_count) + '</td>' +
+        '<td>' + esc(row.result_assessment || row.resultAssessment || "") + '</td>' +
+        '</tr>').join("");
+      return '<div class="notice">' + esc(trace.sourceExpansionPolicy || "Trace of Pi discovery and source expansion calls.") + '</div>' +
+        '<div class="kv-grid">' +
+        '<div class="kv-box"><b>Trace summary</b>' + jsonBlock({
+          agentCalled: trace.agentCalled,
+          queryPlanning: trace.queryPlanning,
+          toolCallCount: trace.toolCallCount,
+          indexedXPagesFetched: indexed.fetchedPages,
+          indexedXPageLimit: indexed.pageLimit,
+          indexedXMaxPages: indexed.maxPages,
+          indexedXRowsFetched: indexed.fetchedRows,
+          indexedXEligibleRows: indexed.eligibleRows,
+          indexedXKeptRows: indexed.keptRows,
+          indexedXDiscoveryCalls: (trace.indexedXDiscoveryCalls || []).length,
+          grokDiscoveryCalls: (trace.grokDiscoveryCalls || []).length,
+          sourceExpansionCalls: (trace.sourceExpansionCalls || []).length,
+          themeNewsCalls: (trace.themeNewsCalls || []).length,
+          arraysTopicNewsCalls: (trace.arraysTopicNewsCalls || []).length,
+          parsedEventCount: trace.parsedEventCount,
+          rawEventRecords: trace.rawEventRecords,
+          error: trace.error || "",
+        }) + '</div>' +
+        '<div class="kv-box"><b>Theme topic mappings</b>' + jsonBlock(trace.themeTopicMappings || []) + '</div>' +
+        '</div>' +
+        (indexedTopTweets.length ? '<details class="section" open style="margin-top:10px"><summary><h3>Indexed X Top Tweets</h3>' + badge(indexedTopTweets.length + " shown", "blue") + '</summary><div class="section-content"><div class="notice">Code fetched recent indexed X posts with no text query, paged backward through the configured window, ranked unique rows by engagement, and supplied the top list to Pi for breaking-news judgment.</div><div class="table-wrap"><table><thead><tr><th>Rank</th><th>Handle</th><th>Tweet</th><th>Score</th></tr></thead><tbody>' + indexedRows + '</tbody></table></div></div></details>' : '') +
+        '<div class="table-wrap"><table><thead><tr><th>#</th><th>Tool / purpose</th><th>Query / filters</th><th>Rows</th><th>Status</th></tr></thead><tbody>' + (rows || '<tr><td colspan="5">No tool calls.</td></tr>') + '</tbody></table></div>' +
+        '<details class="section" style="margin-top:10px"><summary><h3>Pi Search Audit</h3>' + badge((trace.searchAudit || []).length + " rows", "blue") + '</summary><div class="section-content">' +
+        '<div class="table-wrap"><table><thead><tr><th>Lane</th><th>Theme</th><th>Query</th><th>Tools</th><th>Candidates</th><th>Assessment</th></tr></thead><tbody>' + (auditRows || '<tr><td colspan="6">No search_audit rows returned by Pi.</td></tr>') + '</tbody></table></div>' +
+        '</div></details>';
+    }
+
+    function renderRawEvents(run) {
+      const rows = rawEventsForRun(run);
+      if (!rows.length) {
+        return '<div class="empty">No raw event/source records persisted for this run.</div>';
+      }
+      const qualifiedByEventKey = {};
+      qualifiedEventsForRun(run).forEach((finding) => {
+        (finding.eventRefs || []).forEach((ref) => {
+          const key = String(ref || "");
+          if (!key) return;
+          if (!qualifiedByEventKey[key]) qualifiedByEventKey[key] = [];
+          qualifiedByEventKey[key].push(finding);
+        });
+      });
+      const html = rows.map((row) => {
+        const meta = rowMetadata(row);
+        const origin = eventOriginInfo(row, meta);
+        const link = row.url ? '<a class="source-link" href="' + esc(row.url) + '" target="_blank" rel="noopener noreferrer">open</a>' : "";
+        const originEventTime = sourceEventTimeLine(row, meta);
+        const affected = (row.affectedSymbols || []).join(", ");
+        const themes = (row.affectedThemes || []).join(", ");
+        const qualifiedMatches = qualifiedByEventKey[row.eventKey] || [];
+        const qualifiedTag = qualifiedMatches.length
+          ? qualifiedMatches.map((finding) => {
+            const status = finding.status || (finding.selected ? "selected" : "suppressed");
+            return badge("qualified event", statusTone(status)) +
+              '<div class="subtle">' + esc(status + (finding.findingId ? " · " + finding.findingId : "")) + '</div>';
+          }).join("")
+          : '<span class="subtle">--</span>';
+        return '<tr>' +
+          '<td>' + esc(eventSourceTimeDisplay(row, meta)) + '</td>' +
+          '<td>' + badge(row.sourceType || "event", row.sourceType === "x_post" ? "violet" : row.sourceType === "corporate_event" ? "amber" : "blue") + '</td>' +
+          '<td>' + badge(origin.label, sourceOriginTone(origin.origin)) + '<div class="subtle">' + esc(origin.lane || origin.mode || "") + '</div></td>' +
+          '<td>' + esc(row.symbol || "") + '<div class="subtle">' + esc(affected || "") + (themes ? " / " + esc(themes) : "") + '</div></td>' +
+          '<td>' + badge(row.dedupeStatus || "", row.dedupeStatus === "new" ? "green" : row.dedupeStatus === "seen_before" ? "amber" : "blue") + '</td>' +
+          '<td>' + qualifiedTag + '</td>' +
+          '<td><strong>' + esc(clean(row.title || "", 110)) + '</strong><div class="subtle">' + esc(clean(row.summary || "", 260)) + '</div>' + (link ? '<div>' + link + '</div>' : '') + '</td>' +
+          '<td><code>' + esc(clean(row.eventKey || "", 120)) + '</code><div class="subtle">' + esc(row.source || "") + '</div>' + originEventTime + '<details><summary class="subtle">metadata</summary>' + jsonBlock(meta) + '</details></td>' +
+          '</tr>';
+      }).join("");
+      return '<div class="notice">Future runs show the exact compact <code>normalizedEvent.records</code> packet used to build Event Candidates. Historical runs may fall back to <code>event.items</code>.</div>' +
+        '<div class="table-wrap"><table><thead><tr><th>Source time</th><th>Type</th><th>Origin</th><th>Symbol / affected</th><th>Dedupe</th><th>Qualified event</th><th>Title / summary</th><th>Event key / source / metadata</th></tr></thead><tbody>' + html + '</tbody></table></div>';
+    }
+
+    function renderAnomalySignals(run) {
+      const signals = anomalySignalsForRun(run);
+      if (!signals.length) {
+        return '<div class="empty">No anomaly signals persisted for this run.</div>';
+      }
+      const html = signals.map((signal) => {
+        const marketLine = signal.marketDataSymbol && signal.marketDataSymbol !== signal.symbol
+          ? "market: " + signal.marketDataSymbol + (signal.marketDataBasis ? " / " + signal.marketDataBasis : "")
+          : (signal.marketDataBasis || "");
+        return '<tr>' +
+          '<td><strong>' + esc(signal.symbol || "") + '</strong><div class="subtle">' + esc(marketLine || signal.source || "") + '</div></td>' +
+          '<td>' + esc((signal.triggerKinds || []).join(", ") || "--") + '<div class="subtle">' + esc((signal.reasons || []).join(", ") || "") + '</div></td>' +
+          '<td>' + esc(fmtNum(signal.oneDayPct, 2)) + '%<div class="subtle">' + esc(signal.oneDayBasis || "") + '</div></td>' +
+          '<td>' + esc(fmtNum(signal.fiveDayPct, 2)) + '%</td>' +
+          '<td>' + esc(fmtNum(signal.cumulativeVolumeMultiple || signal.sessionCumulativeRvol || signal.volumeMultiple, 2)) + 'x<div class="subtle">' + esc(signal.volumeBasis || signal.volumeInterval || "") + '</div></td>' +
+          '<td>' + esc(fmtNum(signal.latestPrice || signal.close, 3)) + '<div class="subtle">' + esc(signal.latestPriceAsOfHkt || signal.latestDateHkt || signal.liveAsOfHkt || "") + '</div></td>' +
+          '<td><details><summary class="subtle">raw signal</summary>' + jsonBlock(signal) + '</details></td>' +
+          '</tr>';
+      }).join("");
+      return '<div class="table-wrap"><table><thead><tr><th>Asset</th><th>Trigger</th><th>1D</th><th>5D</th><th>Volume</th><th>Latest price</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
+    }
+
+    function renderEventCandidates(run) {
+      const candidates = eventCandidatesForRun(run);
+      const final = finalStatusesForRun(run).eventCandidates || [];
+      const statusById = {};
+      final.forEach((row) => { if (row.candidateId) statusById[row.candidateId] = row; });
+      if (!candidates.length) {
+        return '<div class="empty">No event candidates persisted for this run.</div>';
+      }
+      const html = candidates.map((candidate) => {
+        const origin = eventOriginInfo(candidate, {});
+        const status = candidate.finalStatus || statusById[candidate.candidateId] || {};
+        const statusText = status.status || "unknown";
+        const originEventTime = sourceEventTimeLine(candidate, {});
+        const sourceTime = eventSourceTimeDisplay(candidate, {});
+        const affected = (candidate.affectedSymbols || []).join(", ");
+        const themes = (candidate.affectedThemes || []).join(", ");
+        const exposure = candidate.portfolioExposureText || (candidate.portfolioExposurePct == null ? "" : fmtNum(candidate.portfolioExposurePct * 100, 1) + "%");
+        return '<tr>' +
+          '<td>' + badge(statusText, statusTone(statusText)) + '<div class="subtle">' + esc(clean(status.reason || "No final reason persisted.", 220)) + '</div></td>' +
+          '<td>' + badge(origin.label, sourceOriginTone(origin.origin)) + '<div class="subtle">' + esc(origin.lane || origin.mode || "") + '</div></td>' +
+          '<td>' + esc(candidate.symbol || candidate.primaryAsset || "") + '<div class="subtle">' + esc(affected || "") + (themes ? " / " + esc(themes) : "") + (exposure ? " / " + esc(exposure) : "") + '</div></td>' +
+          '<td><strong>' + esc(clean(candidate.title || candidate.candidateId || "", 120)) + '</strong><div class="subtle">' + esc(clean(candidate.summary || "", 260)) + '</div></td>' +
+          '<td>' + esc(clean(candidate.reason || "", 220)) + '</td>' +
+          '<td>' + esc((candidate.eventRefs || []).join(", ")) + '<div class="subtle">' + esc(candidate.dedupeStatus || "") + (sourceTime && sourceTime !== "n/a" ? " / source: " + esc(sourceTime) : "") + '</div>' + originEventTime + '</td>' +
+          '<td><details><summary class="subtle">candidate JSON</summary>' + jsonBlock(candidate) + '</details></td>' +
+          '</tr>';
+      }).join("");
+      return '<div class="notice">Event candidates are the long list sent to the analyst. Every row should end with selected, suppressed, or not_qualified plus a reason.</div>' +
+        '<div class="table-wrap"><table><thead><tr><th>Final status</th><th>Origin</th><th>Asset</th><th>Title / summary</th><th>Why reviewed</th><th>Event refs</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
+    }
+
+    function renderQualifiedEvents(run) {
+      const rows = qualifiedEventsForRun(run);
+      if (!rows.length) {
+        return '<div class="empty">No qualified events. The analyst did not promote any event candidate into an event-impact assessment.</div>';
+      }
+      const html = rows.map((row) => {
+        const exposure = row.exposureImpact || {};
+        return '<tr>' +
+          '<td>' + badge(row.status || (row.selected ? "selected" : "suppressed"), statusTone(row.status || (row.selected ? "selected" : "suppressed"))) + '<div class="subtle">' + esc(clean(row.suppressionReason || "", 220)) + '</div></td>' +
+          '<td><strong>' + esc(row.primaryAsset || "") + '</strong><div class="subtle">' + esc(row.confidence || "") + '</div></td>' +
+          '<td>' + esc(clean(row.summary || "", 320)) + '</td>' +
+          '<td>' + esc(exposure.total_exposure_pct == null ? "--" : exposure.total_exposure_pct + "%") + '<div class="subtle">' + esc(clean(exposure.calculation || "", 240)) + '</div></td>' +
+          '<td>' + esc((row.eventRefs || []).join(", ")) + '</td>' +
+          '<td><details><summary class="subtle">assessment JSON</summary>' + jsonBlock(row) + '</details></td>' +
+          '</tr>';
+      }).join("");
+      return '<div class="table-wrap"><table><thead><tr><th>Status / reason</th><th>Asset</th><th>Assessment</th><th>Exposure impact</th><th>Event refs</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
+    }
+
+    function renderSelectedEvents(run) {
+      const rows = selectedEventsForRun(run);
+      if (!rows.length) {
+        return '<div class="empty">No selected event exposure impacts for this run.</div>';
+      }
+      const html = rows.map((row) => {
+        const exposure = row.exposureImpact || {};
+        return '<tr>' +
+          '<td>' + badge("selected", "green") + '</td>' +
+          '<td><strong>' + esc(row.primaryAsset || "") + '</strong><div class="subtle">' + esc(row.confidence || "") + '</div></td>' +
+          '<td>' + esc(clean(row.summary || "", 360)) + '</td>' +
+          '<td>' + esc(exposure.total_exposure_pct == null ? "--" : exposure.total_exposure_pct + "%") + '<div class="subtle">' + esc(clean(exposure.calculation || "", 260)) + '</div></td>' +
+          '<td><details><summary class="subtle">selected event JSON</summary>' + jsonBlock(row) + '</details></td>' +
+          '</tr>';
+      }).join("");
+      return '<div class="table-wrap"><table><thead><tr><th>Status</th><th>Asset</th><th>Message basis</th><th>Exposure</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
+    }
+
+    function renderAnomalyAttributions(run) {
+      const rows = anomalyAttributionsForRun(run);
+      if (!rows.length) {
+        return '<div class="empty">No computed anomalies or anomaly attributions persisted for this run.</div>';
+      }
+      const html = rows.map((row) => {
+        const metrics = row.anomalyMetrics || (row.attribution && row.attribution.payload && (row.attribution.payload.anomaly_metrics || row.attribution.payload.anomalyMetrics)) || {};
+        const attribution = row.attribution || {};
+        const status = row.finalStatus || {};
+        const marketLine = metrics.marketDataSymbol && metrics.marketDataSymbol !== (row.symbol || attribution.primaryAsset)
+          ? "market: " + metrics.marketDataSymbol + (metrics.marketDataBasis ? " / " + metrics.marketDataBasis : "")
+          : (metrics.marketDataBasis || "");
+        return '<tr>' +
+          '<td>' + badge(status.status || "unknown", statusTone(status.status)) + '<div class="subtle">' + esc(clean(status.reason || "", 240)) + '</div></td>' +
+          '<td><strong>' + esc(row.symbol || attribution.primaryAsset || "") + '</strong><div class="subtle">' + esc((metrics.triggerKinds || []).join(", ")) + (marketLine ? " / " + esc(marketLine) : "") + '</div></td>' +
+          '<td>' + esc(fmtNum(metrics.oneDayPct, 2)) + '%<div class="subtle">' + esc(metrics.oneDayBasis || "") + '</div></td>' +
+          '<td>' + esc(fmtNum(metrics.fiveDayPct, 2)) + '%</td>' +
+          '<td>' + esc(fmtNum(metrics.cumulativeVolumeMultiple || metrics.sessionCumulativeRvol || metrics.volumeMultiple, 2)) + 'x</td>' +
+          '<td>' + badge(attribution.attributionStatus || "no attribution", attribution.attributionStatus === "plausible" || attribution.attributionStatus === "confirmed" ? "green" : "amber") + '<div class="subtle">' + esc(clean(attribution.summary || row.summary || "", 260)) + '</div></td>' +
+          '<td><details><summary class="subtle">anomaly + attribution JSON</summary>' + jsonBlock(row) + '</details></td>' +
+          '</tr>';
+      }).join("");
+      return '<div class="notice">Anomalies are computed facts, not candidates. The analyst attribution explains each anomaly and marks the final selected/suppressed state.</div>' +
+        '<div class="table-wrap"><table><thead><tr><th>Final status</th><th>Asset</th><th>1D</th><th>5D</th><th>Volume</th><th>Attribution</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
+    }
+
+    function renderFinalStatusLedger(run) {
+      const statuses = finalStatusesForRun(run);
+      const eventStatuses = statuses.eventCandidates || [];
+      const anomalyStatuses = statuses.anomalies || [];
+      if (!eventStatuses.length && !anomalyStatuses.length) {
+        return '<div class="empty">No final status ledger is available for this run.</div>';
+      }
+      const eventRows = eventStatuses.map((row) => '<tr>' +
+        '<td>' + badge("event", "blue") + '</td>' +
+        '<td>' + esc(row.symbol || "") + '</td>' +
+        '<td>' + esc(row.title || row.candidateId || "") + '</td>' +
+        '<td>' + badge(row.status || "unknown", statusTone(row.status)) + '</td>' +
+        '<td>' + esc(clean(row.reason || "", 420)) + '</td>' +
+        '<td>' + esc(row.linkedEventFindingId || "") + '</td>' +
+        '</tr>').join("");
+      const anomalyRows = anomalyStatuses.map((row) => '<tr>' +
+        '<td>' + badge("anomaly", "violet") + '</td>' +
+        '<td>' + esc(row.symbol || "") + '</td>' +
+        '<td>' + esc(row.anomalyId || "") + '</td>' +
+        '<td>' + badge(row.status || "unknown", statusTone(row.status)) + '</td>' +
+        '<td>' + esc(clean(row.reason || "", 420)) + '</td>' +
+        '<td>' + esc(row.linkedAttributionFindingId || "") + '</td>' +
+        '</tr>').join("");
+      return '<div class="notice">This ledger is the final state of the long list after the analyst pass. Suppressed, not_qualified, and missing_attribution rows should always carry the reason that kept them out of the notification.</div>' +
+        '<div class="table-wrap"><table><thead><tr><th>Lane</th><th>Asset</th><th>Item</th><th>Status</th><th>Reason</th><th>Linked assessment</th></tr></thead><tbody>' + (eventRows + anomalyRows || '<tr><td colspan="6">No statuses.</td></tr>') + '</tbody></table></div>';
+    }
+
+    function renderRunDetails(run) {
+      if (!run) return '<div class="empty">No official cron audit row loaded yet. The next scheduled online push pipeline run will appear here after it finishes.</div>';
+      const steps = parseJson(run.stepLogJson, []);
+      const fetch = parseJson(run.dataFetchSummaryJson, {});
+      const llm = parseJson(run.llmDecisionJson, {});
+      const output = parseJson(run.outputSummaryJson, {});
+      const persist = parseJson(run.persistSummaryJson, {});
+      const warnings = parseJson(run.warningsJson, []);
+      const deltas = runDeltas(run);
+      const decision = run.alertDecision || output.alertDecision || "no_push";
+      const duration = Number(run.durationMs);
+      const runKind = run.matchKind === "matched_audit" || (!run.historicalCron && !run.legacy)
+        ? "full audit"
+        : run.matchKind === "matched_decision"
+          ? "decision-only"
+          : "platform-only";
+      const legacyNotice = run.historicalCron
+        ? '<div class="notice">Historical cron row from deploy metadata. ' + esc(runKind) + ' means: matched_audit has full persisted steps; decision-only has final decision fields only; platform-only confirms the cron ran but does not invent missing intermediate logs.</div>'
+        : "";
+      const metrics = [
+        renderMetric("Run time", hkt(rowRunAt(run)), run.status || "completed"),
+        renderMetric("Decision", decision, output.skipReason || run.skipReason || run.reason || ""),
+        renderMetric("Duration", Number.isFinite(duration) ? (duration / 1000).toFixed(1) + "s" : "--", run.historicalCron ? "deploy run duration" : "runtime measured inside automation"),
+        renderMetric("Event", fmtNum(fetch.rawEventCount || output.eventRows || 0, 0), "normalized " + fmtNum(fetch.normalizedEventCount || 0, 0)),
+        renderMetric("Persisted", fmtNum(persist.totalRecordsAdded, 0), "tracked append/update count"),
+      ].join("");
+      const deltasTable = renderDeltasTable(deltas, false);
+      const notification = output.notificationPreview || run.notificationPreview || run.notificationMessage || "";
+      const rawEvents = rawEventsForRun(run);
+      const eventCandidates = eventCandidatesForRun(run);
+      const qualifiedEvents = qualifiedEventsForRun(run);
+      const anomalyRows = anomalyAttributionsForRun(run);
+      const finalStatuses = finalStatusesForRun(run);
+      const finalStatusCount = (finalStatuses.eventCandidates || []).length + (finalStatuses.anomalies || []).length;
+      return '<section class="panel">' +
+        '<div class="panel-head"><h2>Run ' + esc(hkt(rowRunAt(run))) + '</h2><div>' + badge(decision, decision === "push" ? "green" : decision === "platform_only" ? "amber" : "blue") + " " + badge(runKind, runKind === "full audit" ? "green" : "amber") + '</div></div>' +
+        '<div class="panel-body">' +
+        legacyNotice +
+        '<div class="metric-grid">' + metrics + '</div>' +
+        '<details class="section" open><summary><h3>Search Expansion Trace</h3>' + badge(searchExpansionTraceForRun(run).toolCallCount + " calls", "violet") + '</summary><div class="section-content">' + renderSearchExpansionTrace(run) + '</div></details>' +
+        '<div class="artifact-grid">' +
+        '<details class="section" open><summary><h3>Raw Events</h3>' + badge(rawEvents.length + " rows", "blue") + '</summary><div class="section-content">' + renderRawEvents(run) + '</div></details>' +
+        '<details class="section" open><summary><h3>Event Candidates</h3>' + badge(eventCandidates.length + " items", "blue") + '</summary><div class="section-content">' + renderEventCandidates(run) + '</div></details>' +
+        '<details class="section" open><summary><h3>Qualified Events</h3>' + badge(qualifiedEvents.length + " assessed", "green") + '</summary><div class="section-content">' + renderQualifiedEvents(run) + '</div></details>' +
+        '<details class="section" open><summary><h3>Anomalies & Attributions</h3>' + badge(anomalyRows.length + " assets", "violet") + '</summary><div class="section-content">' + renderAnomalyAttributions(run) + '</div></details>' +
+        '<details class="section" open><summary><h3>Final Status Ledger</h3>' + badge(finalStatusCount + " statuses", "blue") + '</summary><div class="section-content">' + renderFinalStatusLedger(run) + '</div></details>' +
+        '</div>' +
+        '<div class="split">' +
+        '<details class="section" open><summary><h3>Data Fetch Summary</h3>' + badge((fetch.marketDataCoverage || []).length + " assets", "blue") + '</summary><div class="section-content">' + renderFetch(fetch) + '</div></details>' +
+        '<details class="section" open><summary><h3>Runtime Calls</h3>' + badge(runtimeCallBadge(llm), runtimeCallTone(llm)) + '</summary><div class="section-content">' + renderRuntimeCalls(llm) + '</div></details>' +
+        '</div>' +
+        '<details class="section" open><summary><h3>Step-by-step Processing</h3>' + badge(steps.length + " steps", "green") + '</summary><div class="section-content">' + (steps.length ? steps.map(renderStep).join("") : '<div class="empty">No step log available.</div>') + '</div></details>' +
+        '<div class="split">' +
+        '<details class="section" open><summary><h3>Persist Delta For This Run</h3>' + badge(deltas.length + " rows", "blue") + '</summary><div class="section-content">' + deltasTable + '</div></details>' +
+        '<details class="section" open><summary><h3>Final Output</h3>' + badge(output.alertDecision || decision, decision === "push" ? "green" : "blue") + '</summary><div class="section-content">' +
+        '<div class="kv-grid"><div class="kv-box"><b>Notification preview</b><pre>' + esc(notification || "No notification body.") + '</pre></div><div class="kv-box"><b>Output summary</b>' + jsonBlock(output) + '</div></div>' +
+        (warnings && warnings.length ? '<div class="kv-box" style="margin-top:10px"><b>Warnings</b>' + jsonBlock(warnings) + '</div>' : "") +
+        '</div></details>' +
+        '</div>' +
+        '</div></section>';
+    }
+
+    function renderFetch(fetch) {
+      const coverage = fetch.marketDataCoverage || [];
+      const rows = coverage.map((row) => '<tr><td>' + esc(row.symbol) + '</td><td>' + esc(row.dailyBars) + '</td><td>' + esc(row.minuteBars == null ? "n/a" : row.minuteBars) + '</td><td>' + esc(row.hourlyBars) + '</td><td>' + esc(row.latestDailyBarHkt) + '</td><td>' + esc(row.latestMinuteBarHkt || "n/a") + '</td><td>' + esc(row.latestHourlyBarHkt) + '</td></tr>').join("");
+      const breaking = fetch.breakingNewsSummary || {};
+      const themeNews = fetch.themeNewsSummary || {};
+      const themeExtraction = fetch.themeExtractionSummary || {};
+      return '<div class="kv-grid">' +
+        '<div class="kv-box"><b>Fetch window and counts</b>' + jsonBlock({
+          windowStartHkt: fetch.windowStartHkt,
+          windowEndHkt: fetch.windowEndHkt,
+          rawEventCount: fetch.rawEventCount,
+          rawEventSourceCounts: fetch.rawEventSourceCounts,
+          normalizedEventDedupeCounts: fetch.normalizedEventDedupeCounts,
+          macroKeys: fetch.macroKeys,
+          warningCount: fetch.warningCount,
+        }) + '</div>' +
+        '<div class="kv-box"><b>Macro freshness</b>' + jsonBlock(fetch.macroFreshness || []) + '</div>' +
+        '<div class="kv-box"><b>Alva Ask theme extraction</b>' + jsonBlock(themeExtraction) + '</div>' +
+        '<div class="kv-box"><b>Pi event-search summary</b>' + jsonBlock(breaking) + '</div>' +
+        '<div class="kv-box"><b>Pi theme-news lane summary</b>' + jsonBlock(themeNews) + '</div>' +
+        '<div class="kv-box"><b>Market data coverage</b><table><thead><tr><th>Asset</th><th>1d bars</th><th>1min bars</th><th>1h bars</th><th>Latest 1d</th><th>Latest 1min</th><th>Latest 1h</th></tr></thead><tbody>' + (rows || '<tr><td colspan="7">No coverage rows.</td></tr>') + '</tbody></table></div>' +
+        '</div>';
+    }
+
+    function runtimeCallBadge(llm) {
+      if (!llm || (!llm.portfolioReader && !llm.analyst && !llm.breakingNews && !llm.themeNews && !llm.themeExtractor)) return "legacy";
+      const breakingEnv = llm.breakingNews && llm.breakingNews.environment ? String(llm.breakingNews.environment) : "";
+      const themeEnv = llm.themeNews && llm.themeNews.environment ? String(llm.themeNews.environment) : "";
+      const themeExtractorEnv = llm.themeExtractor && llm.themeExtractor.environment ? String(llm.themeExtractor.environment) : "";
+      const portfolioEnv = llm.portfolioReader && llm.portfolioReader.environment ? String(llm.portfolioReader.environment) : "";
+      const analystEnv = llm.analyst && llm.analyst.environment ? String(llm.analyst.environment) : "";
+      if (analystEnv && analystEnv !== "not_called") return analystEnv;
+      if (themeExtractorEnv && themeExtractorEnv !== "not_called") return themeExtractorEnv;
+      if (breakingEnv && breakingEnv !== "not_called_or_failed") return breakingEnv;
+      if (themeEnv) return themeEnv;
+      if (portfolioEnv) return portfolioEnv;
+      return "stored";
+    }
+
+    function runtimeCallTone(llm) {
+      const label = runtimeCallBadge(llm);
+      if (label.indexOf("Alva Ask") >= 0) return "violet";
+      if (label.indexOf("Code") >= 0) return "green";
+      return "blue";
+    }
+
+    function renderRuntimeCalls(llm) {
+      if (!llm || (!llm.portfolioReader && !llm.analyst && !llm.breakingNews && !llm.themeNews && !llm.themeExtractor)) return '<div class="empty">No runtime call detail available for this legacy run.</div>';
+      return '<div class="kv-grid">' +
+        '<div class="kv-box"><b>Portfolio ingest / API read</b>' + jsonBlock(llm.portfolioReader || {}) + '</div>' +
+        '<div class="kv-box"><b>Alva Ask theme extraction</b>' + jsonBlock(llm.themeExtractor || {}) + '</div>' +
+        '<div class="kv-box"><b>Pi event-search loop</b>' + jsonBlock(llm.breakingNews || {}) + '</div>' +
+        '<div class="kv-box"><b>Pi theme-news lane</b>' + jsonBlock(llm.themeNews || {}) + '</div>' +
+        '<div class="kv-box"><b>Analyst gate</b>' + jsonBlock(llm.analyst || {}) + '</div>' +
+        '</div>';
+    }
+
+    function renderDeltasTable(rows, compact) {
+      if (!rows.length) return '<div class="empty">No delta rows for this selection.</div>';
+      const html = rows.map((row) => {
+        const delta = parseJson(row.deltaJson, {});
+        return '<tr>' +
+          '<td>' + esc(shortHkt(rowRunAt(row))) + '</td>' +
+          '<td>' + esc(row.fileKey || "") + '</td>' +
+          '<td>' + badge(row.operation || "", row.operation === "append" ? "green" : row.operation === "put" ? "violet" : "amber") + '</td>' +
+          '<td>' + esc(row.recordsAdded == null ? "--" : row.recordsAdded) + '</td>' +
+          '<td>' + esc(row.deltaSummary || "") + (compact ? "" : '<details><summary class="subtle">delta JSON</summary>' + jsonBlock(delta) + '</details>') + '</td>' +
+          '</tr>';
+      }).join("");
+      return '<div class="table-wrap"><table><thead><tr><th>Run</th><th>File</th><th>Op</th><th>Rows</th><th>Delta</th></tr></thead><tbody>' + html + '</tbody></table></div>';
+    }
+
+    function renderRunsTab() {
+      return '<div class="layout">' + renderRunList() + renderRunDetails(selectedRun()) + '</div>';
+    }
+
+    function renderFileList() {
+      const buttons = FILES.map((file) => {
+        const count = rowsForFile(file.key).length;
+        return '<button class="btn btn-secondary btn-small file-btn ' + (state.selectedFile === file.key ? "is-active" : "") + '" data-file="' + esc(file.key) + '">' +
+          '<strong>' + esc(file.label) + '</strong><span>' + esc(file.key + " · " + count + " loaded") + '</span>' +
+          '</button>';
+      }).join("");
+      return '<aside class="panel"><div class="panel-head"><h2>Persist Files</h2>' + badge(FILES.length + " tracked", "blue") + '</div><div class="file-list">' + buttons + '</div></aside>';
+    }
+
+    function renderFileDetails() {
+      const meta = getMeta(state.selectedFile);
+      const rows = rowsForFile(state.selectedFile);
+      const latestRows = latestRowsForFile(state.selectedFile);
+      const fileDeltas = state.persistRows
+        .filter((row) => row.fileKey === state.selectedFile)
+        .sort((a, b) => rowRunAt(b) - rowRunAt(a));
+      const latestRun = latestRows.length ? Math.max.apply(null, latestRows.map(rowRunAt)) : 0;
+      const latestPreview = latestRows.slice(0, 60);
+      const columns = inferColumns(latestPreview);
+      const table = renderRowsTable(latestPreview, columns);
+      const raw = latestPreview.length === 1 ? latestPreview[0] : latestPreview;
+      return '<section class="panel">' +
+        '<div class="panel-head"><h2>' + esc(meta.label) + '</h2><div>' + badge(meta.type, meta.type === "feed_kv" ? "violet" : "green") + " " + badge(rows.length + " rows loaded", "blue") + '</div></div>' +
+        '<div class="panel-body">' +
+        '<div class="metric-grid">' +
+        renderMetric("File key", meta.key, meta.description) +
+        renderMetric("Latest version", latestRun ? hkt(latestRun) : "n/a", latestRows.length + " rows in latest run/version") +
+        renderMetric("Storage type", meta.type, meta.path) +
+        renderMetric("Deltas", fileDeltas.length, "recorded by audit.persist_delta") +
+        renderMetric("Feed id", String(FEED_ID), FEED_NAME) +
+        '</div>' +
+        (meta.key === "kv_state" ? '<div class="notice">KV state is tracked through audit.persist_delta. The playbook does not read private KV contents directly; it shows which keys were updated and the recorded delta summary.</div>' : "") +
+        '<details class="section" open><summary><h3>Latest Version Rows</h3>' + badge(latestPreview.length + " shown", "green") + '</summary><div class="section-content">' + table + '</div></details>' +
+        '<details class="section"><summary><h3>Latest Raw JSON</h3>' + badge("readable", "blue") + '</summary><div class="section-content">' + jsonBlock(raw) + '</div></details>' +
+        '<details class="section" open><summary><h3>Every Run Delta For This File</h3>' + badge(fileDeltas.length + " deltas", "violet") + '</summary><div class="section-content">' + renderDeltasTable(fileDeltas, false) + '</div></details>' +
+        '</div></section>';
+    }
+
+    function inferColumns(rows) {
+      const preferred = ["date", "runAtMs", "fileKey", "operation", "recordsAdded", "accountId", "symbol", "assetClass", "weight", "alertDecision", "urgency", "sourceType", "dedupeStatus", "title", "findingId", "findingType", "selected", "summary", "deltaSummary"];
+      const keys = [];
+      rows.forEach((row) => {
+        Object.keys(row || {}).forEach((key) => {
+          if (keys.indexOf(key) < 0) keys.push(key);
+        });
+      });
+      const out = preferred.filter((key) => keys.indexOf(key) >= 0);
+      keys.forEach((key) => {
+        if (out.length < 9 && out.indexOf(key) < 0 && !/Json$/.test(key) && key !== "body") out.push(key);
+      });
+      return out.slice(0, 9);
+    }
+
+    function cellValue(row, key) {
+      if (key === "date" || key === "runAtMs") return shortHkt(row[key]);
+      const value = row[key];
+      if (value && typeof value === "object") return JSON.stringify(value);
+      return clean(value, 220);
+    }
+
+    function renderRowsTable(rows, columns) {
+      if (!rows.length) return '<div class="empty">No rows loaded for this file.</div>';
+      const head = columns.map((key) => '<th>' + esc(key) + '</th>').join("");
+      const body = rows.map((row) => '<tr>' + columns.map((key) => '<td>' + esc(cellValue(row, key)) + '</td>').join("") + '</tr>').join("");
+      return '<div class="table-wrap"><table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+    }
+
+    function renderFilesTab() {
+      return '<div class="file-layout">' + renderFileList() + renderFileDetails() + '</div>';
+    }
+
+    function render() {
+      const app = document.getElementById("app");
+      document.querySelectorAll(".tab-btn").forEach((btn) => {
+        btn.classList.toggle("is-active", btn.dataset.tab === state.tab);
+      });
+      if (state.error) {
+        app.innerHTML = '<div class="empty">Failed to load audit data: ' + esc(state.error.message || state.error) + '</div>';
+        return;
+      }
+      if (!state.loaded) {
+        app.innerHTML = '<div class="empty">Loading automation audit data...</div>';
+        return;
+      }
+      app.innerHTML = state.tab === "runs" ? renderRunsTab() : renderFilesTab();
+      bindDynamicEvents();
+    }
+
+    function bindDynamicEvents() {
+      document.querySelectorAll("[data-run]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.selectedRunAtMs = Number(btn.dataset.run);
+          render();
+        });
+      });
+      document.querySelectorAll("[data-run-filter]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.runFilter = btn.dataset.runFilter;
+          render();
+        });
+      });
+      document.querySelectorAll("[data-file]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.selectedFile = btn.dataset.file;
+          render();
+        });
+      });
+    }
+
+    document.querySelectorAll(".tab-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.tab = btn.dataset.tab;
+        render();
+      });
+    });
+
+    loadData();
+  </script>
+</body>
+</html>
