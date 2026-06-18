@@ -1400,12 +1400,6 @@
       });
     }
 
-    function selectedEventsForRun(run) {
-      const direct = artifactJsonForRun(run, "selectedEventsJson", null);
-      if (Array.isArray(direct) && direct.length) return direct;
-      return qualifiedEventsForRun(run).filter((row) => row.selected || row.status === "selected");
-    }
-
     function anomaliesForRun(run) {
       const direct = artifactJsonForRun(run, "anomaliesJson", null);
       if (Array.isArray(direct) && direct.length) return direct;
@@ -1420,18 +1414,50 @@
       }));
     }
 
-    function anomalyAttributionsForRun(run) {
-      const direct = artifactJsonForRun(run, "anomalyAttributionsJson", null);
+    function anomalyAttributionPacketsForRun(run) {
+      const direct = artifactJsonForRun(run, "anomalyAttributionPacketsJson", null);
       if (Array.isArray(direct) && direct.length) return direct;
       const summary = parseJson((runDecisionRow(run).candidateSummaryJson || run.candidateSummaryJson), {});
-      if (Array.isArray(summary.anomalyAttributions) && summary.anomalyAttributions.length) return summary.anomalyAttributions;
+      if (Array.isArray(summary.anomalyAttributionPackets) && summary.anomalyAttributionPackets.length) return summary.anomalyAttributionPackets;
+      const llm = parseJson(run && run.llmDecisionJson, {});
+      const agents = llm.anomalyAttributionAgents || {};
+      return Array.isArray(agents.packets) ? agents.packets : [];
+    }
+
+    function packetForAnomalyRow(row, packets) {
+      const anomalyId = String(row && row.anomalyId || "");
+      const symbol = String(row && (row.symbol || row.primaryAsset || row.attribution && row.attribution.primaryAsset) || "").toUpperCase();
+      return (packets || []).find((packet) => {
+        const packetAnomalyId = String(packet && packet.anomalyId || "");
+        const packetSymbol = String(packet && packet.symbol || "").toUpperCase();
+        return (anomalyId && packetAnomalyId === anomalyId) || (symbol && packetSymbol === symbol);
+      }) || null;
+    }
+
+    function attachAnomalyAttributionPackets(rows, packets) {
+      return (rows || []).map((row) => {
+        if (row && row.attributionPacket) return row;
+        const packet = packetForAnomalyRow(row, packets);
+        return packet ? { ...row, attributionPacket: packet } : row;
+      });
+    }
+
+    function anomalyAttributionsForRun(run) {
+      const packets = anomalyAttributionPacketsForRun(run);
+      const direct = artifactJsonForRun(run, "anomalyAttributionsJson", null);
+      if (Array.isArray(direct) && direct.length) return attachAnomalyAttributionPackets(direct, packets);
+      const summary = parseJson((runDecisionRow(run).candidateSummaryJson || run.candidateSummaryJson), {});
+      if (Array.isArray(summary.anomalyAttributions) && summary.anomalyAttributions.length) return attachAnomalyAttributionPackets(summary.anomalyAttributions, packets);
       const findings = runRows(run, "finding.records")
         .filter((row) => row.findingType === "anomaly_attribution")
         .map((row) => {
           const payload = parseJson(row.payloadJson, {});
-          return {
+          const base = {
             anomalyId: "anomaly:" + (row.primaryAsset || ""),
             symbol: row.primaryAsset || "",
+          };
+          return {
+            ...base,
             title: (row.primaryAsset || "") + " anomaly attribution",
             summary: row.summary || "",
             anomalyMetrics: payload.anomaly_metrics || payload.anomalyMetrics || {},
@@ -1440,6 +1466,7 @@
               reason: row.selected === "true" ? "Selected for notification." : (row.suppressionReason || ""),
               linkedAttributionFindingId: row.findingId || "",
             },
+            attributionPacket: packetForAnomalyRow(base, packets),
             attribution: {
               findingId: row.findingId || "",
               findingType: row.findingType || "anomaly_attribution",
@@ -1464,6 +1491,7 @@
           reason: "No persisted anomaly attribution was found for this legacy run.",
           linkedAttributionFindingId: "",
         },
+        attributionPacket: packetForAnomalyRow(anomaly, packets),
         attribution: null,
       }));
     }
@@ -1742,24 +1770,6 @@
       return '<div class="table-wrap"><table><thead><tr><th>Status / reason</th><th>Asset</th><th>Assessment</th><th>Exposure impact</th><th>Event refs</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
     }
 
-    function renderSelectedEvents(run) {
-      const rows = selectedEventsForRun(run);
-      if (!rows.length) {
-        return '<div class="empty">No selected event exposure impacts for this run.</div>';
-      }
-      const html = rows.map((row) => {
-        const exposure = row.exposureImpact || {};
-        return '<tr>' +
-          '<td>' + badge("selected", "green") + '</td>' +
-          '<td><strong>' + esc(row.primaryAsset || "") + '</strong><div class="subtle">' + esc(row.confidence || "") + '</div></td>' +
-          '<td>' + esc(clean(row.summary || "", 360)) + '</td>' +
-          '<td>' + esc(exposure.total_exposure_pct == null ? "--" : exposure.total_exposure_pct + "%") + '<div class="subtle">' + esc(clean(exposure.calculation || "", 260)) + '</div></td>' +
-          '<td><details><summary class="subtle">selected event JSON</summary>' + jsonBlock(row) + '</details></td>' +
-          '</tr>';
-      }).join("");
-      return '<div class="table-wrap"><table><thead><tr><th>Status</th><th>Asset</th><th>Message basis</th><th>Exposure</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
-    }
-
     function renderAnomalyAttributions(run) {
       const rows = anomalyAttributionsForRun(run);
       if (!rows.length) {
@@ -1768,21 +1778,31 @@
       const html = rows.map((row) => {
         const metrics = row.anomalyMetrics || (row.attribution && row.attribution.payload && (row.attribution.payload.anomaly_metrics || row.attribution.payload.anomalyMetrics)) || {};
         const attribution = row.attribution || {};
+        const packet = row.attributionPacket || {};
         const status = row.finalStatus || {};
         const marketLine = metrics.marketDataSymbol && metrics.marketDataSymbol !== (row.symbol || attribution.primaryAsset)
           ? "market: " + metrics.marketDataSymbol + (metrics.marketDataBasis ? " / " + metrics.marketDataBasis : "")
           : (metrics.marketDataBasis || "");
+        const packetLine = packet.attributionPacketId
+          ? badge("agent packet", packet.agentStatus === "completed" ? "violet" : "amber") +
+            '<div class="subtle">' + esc([
+              packet.attributionStatus || "",
+              packet.confidence ? "confidence " + packet.confidence : "",
+              packet.skillhubSkill || "",
+            ].filter(Boolean).join(" / ")) + '</div>' +
+            (packet.summary ? '<div class="subtle">' + esc(clean(packet.summary, 220)) + '</div>' : '')
+          : '<div class="subtle">No per-asset attribution packet found.</div>';
         return '<tr>' +
           '<td>' + badge(status.status || "unknown", statusTone(status.status)) + '<div class="subtle">' + esc(clean(status.reason || "", 240)) + '</div></td>' +
           '<td><strong>' + esc(row.symbol || attribution.primaryAsset || "") + '</strong><div class="subtle">' + esc((metrics.triggerKinds || []).join(", ")) + (marketLine ? " / " + esc(marketLine) : "") + '</div></td>' +
           '<td>' + esc(fmtNum(metrics.oneDayPct, 2)) + '%<div class="subtle">' + esc(metrics.oneDayBasis || "") + '</div></td>' +
           '<td>' + esc(fmtNum(metrics.fiveDayPct, 2)) + '%</td>' +
           '<td>' + esc(fmtNum(metrics.cumulativeVolumeMultiple || metrics.sessionCumulativeRvol || metrics.volumeMultiple, 2)) + 'x</td>' +
-          '<td>' + badge(attribution.attributionStatus || "no attribution", attribution.attributionStatus === "plausible" || attribution.attributionStatus === "confirmed" ? "green" : "amber") + '<div class="subtle">' + esc(clean(attribution.summary || row.summary || "", 260)) + '</div></td>' +
+          '<td>' + badge(attribution.attributionStatus || "no attribution", attribution.attributionStatus === "plausible" || attribution.attributionStatus === "confirmed" ? "green" : "amber") + '<div class="subtle">' + esc(clean(attribution.summary || row.summary || "", 260)) + '</div>' + packetLine + '</td>' +
           '<td><details><summary class="subtle">anomaly + attribution JSON</summary>' + jsonBlock(row) + '</details></td>' +
           '</tr>';
       }).join("");
-      return '<div class="notice">Anomalies are computed facts, not candidates. The analyst attribution explains each anomaly and marks the final selected/suppressed state.</div>' +
+      return '<div class="notice">Anomalies are computed facts, not candidates. Each computed anomalous asset first gets a per-asset attribution-agent packet, then the final analyst turns that packet into final selected/suppressed wording.</div>' +
         '<div class="table-wrap"><table><thead><tr><th>Final status</th><th>Asset</th><th>1D</th><th>5D</th><th>Volume</th><th>Attribution</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
     }
 
@@ -1900,13 +1920,15 @@
     }
 
     function runtimeCallBadge(llm) {
-      if (!llm || (!llm.portfolioReader && !llm.analyst && !llm.breakingNews && !llm.themeNews && !llm.themeExtractor)) return "legacy";
+      if (!llm || (!llm.portfolioReader && !llm.analyst && !llm.breakingNews && !llm.themeNews && !llm.themeExtractor && !llm.anomalyAttributionAgents)) return "legacy";
       const breakingEnv = llm.breakingNews && llm.breakingNews.environment ? String(llm.breakingNews.environment) : "";
       const themeEnv = llm.themeNews && llm.themeNews.environment ? String(llm.themeNews.environment) : "";
       const themeExtractorEnv = llm.themeExtractor && llm.themeExtractor.environment ? String(llm.themeExtractor.environment) : "";
+      const anomalyAttributionEnv = llm.anomalyAttributionAgents && llm.anomalyAttributionAgents.environment ? String(llm.anomalyAttributionAgents.environment) : "";
       const portfolioEnv = llm.portfolioReader && llm.portfolioReader.environment ? String(llm.portfolioReader.environment) : "";
       const analystEnv = llm.analyst && llm.analyst.environment ? String(llm.analyst.environment) : "";
       if (analystEnv && analystEnv !== "not_called") return analystEnv;
+      if (anomalyAttributionEnv && anomalyAttributionEnv !== "not_called") return anomalyAttributionEnv;
       if (themeExtractorEnv && themeExtractorEnv !== "not_called") return themeExtractorEnv;
       if (breakingEnv && breakingEnv !== "not_called_or_failed") return breakingEnv;
       if (themeEnv) return themeEnv;
@@ -1922,12 +1944,13 @@
     }
 
     function renderRuntimeCalls(llm) {
-      if (!llm || (!llm.portfolioReader && !llm.analyst && !llm.breakingNews && !llm.themeNews && !llm.themeExtractor)) return '<div class="empty">No runtime call detail available for this legacy run.</div>';
+      if (!llm || (!llm.portfolioReader && !llm.analyst && !llm.breakingNews && !llm.themeNews && !llm.themeExtractor && !llm.anomalyAttributionAgents)) return '<div class="empty">No runtime call detail available for this legacy run.</div>';
       return '<div class="kv-grid">' +
         '<div class="kv-box"><b>Portfolio ingest / API read</b>' + jsonBlock(llm.portfolioReader || {}) + '</div>' +
         '<div class="kv-box"><b>Alva Ask theme extraction</b>' + jsonBlock(llm.themeExtractor || {}) + '</div>' +
         '<div class="kv-box"><b>Pi event-search loop</b>' + jsonBlock(llm.breakingNews || {}) + '</div>' +
         '<div class="kv-box"><b>Pi theme-news lane</b>' + jsonBlock(llm.themeNews || {}) + '</div>' +
+        '<div class="kv-box"><b>Alva Ask anomaly attribution agents</b>' + jsonBlock(llm.anomalyAttributionAgents || {}) + '</div>' +
         '<div class="kv-box"><b>Analyst gate</b>' + jsonBlock(llm.analyst || {}) + '</div>' +
         '</div>';
     }

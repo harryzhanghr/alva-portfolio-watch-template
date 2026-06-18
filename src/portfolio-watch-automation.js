@@ -20,6 +20,7 @@ const CONFIG = {
   priceSignalVersion: "asset_anomaly_v5_latest_1min_z2_no_5d_trigger",
   volumeSignalVersion: "hourly_cumulative_volume_v3_us_equity_rth",
   themeExtractionVersion: "portfolio_theme_extraction_v1_alva_ask",
+  anomalyAttributionVersion: "per_asset_alva_ask_why_the_move_v1",
   latestPriceInterval: "1min",
   latestPriceLookbackHours: 36,
   latestPriceLimit: 2400,
@@ -42,6 +43,7 @@ const CONFIG = {
   maxPromptEvents: 100,
   maxPromptCandidates: 50,
   maxAnalystPromptChars: 1000000,
+  maxAnomalyAttributionPromptChars: 1000000,
   maxPiPromptContextChars: 1000000,
   priorAlertTimelineDays: 7,
   maxPriorAlertTimelineRows: 200,
@@ -182,6 +184,7 @@ feed.def("analysis", {
     str("qualifiedEventsJson"),
     str("selectedEventsJson"),
     str("anomaliesJson"),
+    str("anomalyAttributionPacketsJson"),
     str("anomalyAttributionsJson"),
     str("finalStatusesJson"),
     str("searchExpansionTraceJson"),
@@ -218,6 +221,7 @@ feed.def("audit", {
     str("qualifiedEventsJson"),
     str("selectedEventsJson"),
     str("anomaliesJson"),
+    str("anomalyAttributionPacketsJson"),
     str("anomalyAttributionsJson"),
     str("finalStatusesJson"),
     str("searchExpansionTraceJson"),
@@ -3011,6 +3015,233 @@ function priceSignalMap(signals) {
   return out;
 }
 
+function anomalyThemes(snapshot, anomaly) {
+  const holding = bySymbol(snapshot)[anomaly.symbol] || bySymbol(snapshot)[anomaly.marketDataSymbol] || {};
+  return themesForHolding(snapshot, holding).map(normalizeThemeName).filter(Boolean);
+}
+
+function compactHoldingForAnomalyAgent(snapshot, anomaly) {
+  const holding = bySymbol(snapshot)[anomaly.symbol] || {};
+  return {
+    symbol: holding.symbol || anomaly.symbol || "",
+    marketDataSymbol: anomaly.marketDataSymbol || anomaly.symbol || "",
+    assetClass: holding.assetClass || "",
+    side: holding.side || "",
+    quantity: holding.quantity,
+    currentPrice: holding.currentPrice,
+    marketValue: holding.marketValue,
+    weight: round(holding.allocation || 0, 4),
+    themes: themesForHolding(snapshot, holding),
+    instrumentDetails: holding.instrumentDetails || {},
+  };
+}
+
+function eventMatchesAnomalyContext(item, anomaly, snapshot) {
+  if (!item || !anomaly) return false;
+  const symbols = eventAffectedSymbols(item, snapshot).map((symbol) => String(symbol || "").toUpperCase());
+  const symbol = String(anomaly.symbol || "").toUpperCase();
+  const marketDataSymbol = String(anomaly.marketDataSymbol || "").toUpperCase();
+  if (symbols.indexOf(symbol) >= 0 || (marketDataSymbol && symbols.indexOf(marketDataSymbol) >= 0)) return true;
+  const itemThemes = eventAffectedThemes(item, snapshot, symbols).map(normalizeThemeName);
+  const aThemes = anomalyThemes(snapshot, anomaly);
+  if (itemThemes.some((theme) => aThemes.indexOf(theme) >= 0)) return true;
+  const metadata = item.metadata || {};
+  const riskFactors = (metadata.riskFactors || []).map(normalizeThemeName);
+  if (riskFactors.length && aThemes.some((theme) => riskFactors.indexOf(theme) >= 0)) return true;
+  return !!metadata.portfolioRelevanceBasis && !symbols.length;
+}
+
+function relatedEventsForAnomaly(anomaly, eventRecords, eventCandidates, snapshot) {
+  const eventByKey = {};
+  (eventRecords || []).forEach((event) => {
+    if (event && event.eventKey) eventByKey[event.eventKey] = event;
+  });
+  const relatedKeys = {};
+  (eventCandidates || []).forEach((candidate) => {
+    if (!candidate) return;
+    const linked = (candidate.affectedSymbols || []).indexOf(anomaly.symbol) >= 0 ||
+      (candidate.affectedSymbols || []).indexOf(anomaly.marketDataSymbol) >= 0 ||
+      !!candidate.portfolioLevelEvent ||
+      (candidate.affectedThemes || []).some((theme) => anomalyThemes(snapshot, anomaly).indexOf(normalizeThemeName(theme)) >= 0);
+    if (!linked) return;
+    (candidate.eventRefs || []).forEach((key) => {
+      if (key) relatedKeys[key] = true;
+    });
+  });
+  (eventRecords || []).forEach((event) => {
+    if (eventMatchesAnomalyContext(event, anomaly, snapshot) && event.eventKey) relatedKeys[event.eventKey] = true;
+  });
+  return Object.keys(relatedKeys)
+    .map((key) => eventByKey[key])
+    .filter(Boolean)
+    .slice(0, 60);
+}
+
+function buildAnomalyAttributionPrompt(input) {
+  return [
+    "You are a per-asset Anomaly Attribution Agent for a portfolio watch automation.",
+    "Your job is to explain one computed held-asset anomaly before the final portfolio analyst writes the user message.",
+    "",
+    "Use the Skill Hub why-the-move methodology when available: skill_id = carl-2/discord-why-the-move.",
+    "If the Alva Ask environment exposes a Skill Hub/tool path for that skill, use it. If not, apply the same method directly: decompose market / sector / asset-specific drivers, test timing / direction / size, require sourced support, and do not invent catalysts.",
+    "",
+    "Rules:",
+    "- This is attribution only, not a push/no-push decision.",
+    "- Use available tools if the supplied packet looks stale, wrong, or too thin.",
+    "- Do not invent facts, prices, catalysts, source links, or causal chains.",
+    "- A current event is not automatically the cause. It must fit timing, direction, and size.",
+    "- A narrative can be context, but not a fresh catalyst unless there is a dated new fact or clear same-session market reaction.",
+    "- If attribution is not strong, return weak_correlation or unexplained and say what the best grounded guess is.",
+    "",
+    "Return JSON only. It MUST begin with { and end with }.",
+    "Schema:",
+    "{",
+    '  "anomaly_id":"",',
+    '  "symbol":"",',
+    '  "market_data_symbol":"",',
+    '  "headline":"",',
+    '  "summary":"",',
+    '  "attribution_status":"confirmed|plausible|weak_correlation|unexplained",',
+    '  "driver_split":{"market":"","sector":"","asset_specific":""},',
+    '  "supporting_events":[],',
+    '  "source_links":[],',
+    '  "data_quality_notes":[],',
+    '  "confidence":"low|medium|high",',
+    '  "as_of_hkt":""',
+    "}",
+    "",
+    "Input JSON:",
+    compactJson(input, CONFIG.maxAnomalyAttributionPromptChars),
+  ].join("\n");
+}
+
+function normalizeAnomalyAttributionPacket(parsed, anomaly, runAtMs, rawText, errorText, sessionId) {
+  const payload = parsed && typeof parsed === "object" ? parsed : {};
+  const status = clean(payload.attribution_status || payload.attributionStatus || "", 60);
+  const allowed = { confirmed: true, plausible: true, weak_correlation: true, unexplained: true };
+  return {
+    attributionPacketId: "attrib:" + (anomaly.anomalyId || anomaly.symbol || "unknown"),
+    anomalyId: anomaly.anomalyId || "",
+    symbol: anomaly.symbol || anomaly.primaryAsset || "",
+    marketDataSymbol: anomaly.marketDataSymbol || anomaly.symbol || "",
+    underlyingSymbol: anomaly.underlyingSymbol || "",
+    environment: "Alva Ask (LLM)",
+    call: "ask(buildAnomalyAttributionPrompt(anomalyInput))",
+    skillhubSkill: "carl-2/discord-why-the-move",
+    version: CONFIG.anomalyAttributionVersion,
+    agentStatus: errorText ? "agent_error" : "completed",
+    error: errorText || "",
+    headline: clean(payload.headline || "", 220),
+    summary: errorText
+      ? "Anomaly attribution agent failed or returned unparseable JSON; final analyst should still review this anomaly as real but attribution-uncertain."
+      : clean(payload.summary || "", 900),
+    attributionStatus: allowed[status] ? status : (errorText ? "unexplained" : "weak_correlation"),
+    driverSplit: payload.driver_split || payload.driverSplit || {},
+    supportingEvents: Array.isArray(payload.supporting_events) ? payload.supporting_events : (payload.supportingEvents || []),
+    sourceLinks: Array.isArray(payload.source_links) ? payload.source_links : (payload.sourceLinks || []),
+    dataQualityNotes: Array.isArray(payload.data_quality_notes)
+      ? payload.data_quality_notes
+      : (payload.dataQualityNotes || (errorText ? [errorText] : [])),
+    confidence: payload.confidence || (errorText ? "low" : "medium"),
+    asOfHkt: payload.as_of_hkt || payload.asOfHkt || hkt(runAtMs),
+    rawTextPreview: clean(rawText || "", 1200),
+    sessionId: sessionId || "",
+  };
+}
+
+function runAnomalyAttributionAgents(anomalies, context) {
+  const packets = [];
+  const warnings = context.warnings || [];
+  (anomalies || []).forEach((anomaly, idx) => {
+    const relatedEventRecords = relatedEventsForAnomaly(anomaly, context.eventRecords || [], context.eventCandidates || [], context.snapshot || {});
+    const promptInput = {
+      run_at_hkt: context.runAtHkt || hkt(context.runAtMs),
+      account_id: ACCOUNT_ID,
+      anomaly_index: idx + 1,
+      anomaly,
+      holding: compactHoldingForAnomalyAgent(context.snapshot || {}, anomaly),
+      related_event_records: relatedEventRecords.map(compactRawEventForAnalyst),
+      event_candidates_for_context: (context.eventCandidates || [])
+        .filter((candidate) => {
+          if (!candidate) return false;
+          if ((candidate.affectedSymbols || []).indexOf(anomaly.symbol) >= 0) return true;
+          if ((candidate.affectedSymbols || []).indexOf(anomaly.marketDataSymbol) >= 0) return true;
+          if (candidate.portfolioLevelEvent) return true;
+          const holdingThemes = anomalyThemes(context.snapshot || {}, anomaly);
+          return (candidate.affectedThemes || []).some((theme) => holdingThemes.indexOf(normalizeThemeName(theme)) >= 0);
+        })
+        .slice(0, 30)
+        .map(compactEventCandidateForAnalyst),
+      portfolio_snapshot_context: {
+        totalValue: context.snapshot && context.snapshot.totalValue,
+        cash: context.snapshot && context.snapshot.cash,
+        valuationBasis: context.snapshot && context.snapshot.priceBasis,
+        topHoldings: ((context.snapshot && context.snapshot.holdings) || []).slice(0, 10).map((h) => ({
+          symbol: h.symbol,
+          weight: round(h.allocation || 0, 4),
+          themes: themesForHolding(context.snapshot || {}, h),
+        })),
+      },
+      macro_context: context.macro || {},
+      prior_alert_history: context.priorAlertHistory || [],
+      source_contract: {
+        price: "Current move metrics come from Arrays latest 1min extended-hours price versus previous regular close when available.",
+        volume: "Volume anomaly is hourly cumulative volume versus historical same-time cumulative volume.",
+        events: "Related event records are starting context only. Verify or ignore them if timing/direction/size does not fit the anomaly.",
+      },
+    };
+    let rawText = "";
+    let sessionId = "";
+    try {
+      const result = ask(buildAnomalyAttributionPrompt(promptInput), { effort: "high" });
+      rawText = String(result && result.text || "");
+      sessionId = String(result && result.session_id || "");
+      const parsed = safeParseJson(rawText);
+      if (!parsed) throw new Error("Anomaly attribution prompt did not return parseable JSON");
+      packets.push(normalizeAnomalyAttributionPacket(parsed, anomaly, context.runAtMs, rawText, "", sessionId));
+    } catch (err) {
+      const error = String(err && err.message ? err.message : err).slice(0, 260);
+      warnings.push({ source: "anomaly-attribution-agent:" + (anomaly.symbol || "unknown"), error });
+      packets.push(normalizeAnomalyAttributionPacket(null, anomaly, context.runAtMs, rawText, error, sessionId));
+    }
+  });
+  return packets;
+}
+
+function compactAnomalyAttributionPacketForAnalyst(packet) {
+  const row = packet || {};
+  return {
+    attributionPacketId: row.attributionPacketId || "",
+    anomalyId: row.anomalyId || "",
+    symbol: row.symbol || "",
+    marketDataSymbol: row.marketDataSymbol || "",
+    skillhubSkill: row.skillhubSkill || "",
+    agentStatus: row.agentStatus || "",
+    headline: clean(row.headline || "", 180),
+    summary: clean(row.summary || "", 700),
+    attributionStatus: row.attributionStatus || "",
+    driverSplit: row.driverSplit || {},
+    supportingEvents: row.supportingEvents || [],
+    sourceLinks: (row.sourceLinks || []).slice(0, 6),
+    dataQualityNotes: row.dataQualityNotes || [],
+    confidence: row.confidence || "",
+    asOfHkt: row.asOfHkt || "",
+    error: row.error || "",
+  };
+}
+
+function compactAnomalyAttributionPacketForAudit(packet) {
+  const row = compactAnomalyAttributionPacketForAnalyst(packet);
+  return {
+    ...row,
+    environment: (packet && packet.environment) || "Alva Ask (LLM)",
+    call: (packet && packet.call) || "ask(buildAnomalyAttributionPrompt(anomalyInput))",
+    version: (packet && packet.version) || CONFIG.anomalyAttributionVersion,
+    rawTextPreview: clean((packet && packet.rawTextPreview) || "", 1200),
+    sessionId: (packet && packet.sessionId) || "",
+  };
+}
+
 function buildAnomalies(snapshot, priceSignals) {
   const anomalies = [];
   const holdingBySymbol = bySymbol(snapshot);
@@ -3179,10 +3410,11 @@ function buildAnalystPrompt(input) {
     "",
     "B) Anomaly lane",
     "- asset_anomalies are already computed anomalies, not candidates.",
-    "- Produce one anomalyAttributionFinding for every asset anomaly when possible, combining price and volume triggers for that asset.",
-    "- Ask: is there a plausible source-backed reason, a weak correlation, or is it unexplained?",
-    "- If no good attribution exists, still return an attribution with attribution_status=unexplained or weak_correlation and explain why.",
-    "- Asset anomalies are worth reporting even when attribution is not confirmed. If attribution is weak, say it is weak and offer the best grounded guess, clearly labeled as a guess.",
+    "- anomaly_attribution_packets are prepared by one per-asset Alva Ask Anomaly Attribution Agent using the Skill Hub why-the-move methodology when available.",
+    "- Use those packets as the attribution starting point. Do not redo attribution from scratch unless the packet looks wrong, stale, or weak enough to verify with tools.",
+    "- Produce one final anomalyAttributionFinding for every asset anomaly when possible, combining price and volume triggers for that asset.",
+    "- If the dedicated packet says weak_correlation, unexplained, or agent_error, still return an attribution with that uncertainty clearly labeled.",
+    "- Asset anomalies are worth reporting even when attribution is not confirmed. If attribution is weak, say it is weak and offer the best grounded guess only as a guess.",
     "",
     "4. Novelty and materiality gate",
     "- prior_alert_history is the past 7 days of user-visible run timeline. Empty runs show only that no push was sent; they are not prior suppressed reasoning.",
@@ -3197,15 +3429,23 @@ function buildAnalystPrompt(input) {
     "- Current portfolio valuation uses connected-account quantity times Arrays latest 1min price when available, plus connected-account cash. Broker currentPrice, broker marketValue, cost basis, realized P&L, and unrealized P&L are intentionally omitted.",
     "- oneDayPct/currentMovePct use latest 1min extended-hours price versus previous regular-session close when available. lastClosedOneDayPct is completed-close context only.",
     "- Volume anomaly uses hourly cumulative volume versus historical same-time cumulative volume. US-listed equities/ETFs, including crypto-related equities, use the US regular-session volume day capped at 16:00 ET after hours; direct crypto assets use UTC-day volume.",
+    "- anomaly_attribution_packets are agent analysis packets, not final findings. Convert them into anomalyAttributionFindings and decide selected/suppressed at the final decision layer.",
     "- If submitted derived fields look inconsistent, recompute from base fields where possible; otherwise lower confidence and add data_quality_notes.",
     "",
-    "6. Message style",
-    "- Write like a sharp human portfolio analyst, not a template.",
-    "- Be concise and specific. Mention tickers, exposure, uncertainty, and what changed.",
-    "- Do not say 'there is news about X' unless you explain why it matters for this portfolio.",
-    "- It is okay to say 'worth watching', 'not enough to overread yet', or 'attribution is still weak' when true.",
-    "- When appropriate, add a brief human note for meaningful portfolio moves, for example a sharp portfolio rally, but keep it grounded and secondary to the analysis.",
-    "- No buy/sell advice. Do not treat price targets as your recommendation. Keep notification_message under 1400 characters.",
+    "6. Notification writing style",
+    "- notification_message is user-facing. Private decision fields may mention push/no_push, selected, suppressed, candidates, qualification, or why this run is worth interrupting; notification_message should not.",
+    "- Focus on what the investor needs to know now, not why the automation decided to send a notification.",
+    "- Lead with the market/portfolio read in natural language.",
+    "- Write like a real portfolio analyst sending a concise note after checking the book. Vary the opening based on the situation: sometimes direct, sometimes cautious, sometimes slightly conversational, but it should not feel like a fixed template.",
+    "- Avoid internal workflow words such as push, selected, candidate, qualified, cleanest item, clears the bar, interruption bar.",
+    "- Use short paragraphs or bullets when there is more than one distinct point.",
+    "- If both event impact and anomaly attribution are selected, make both visible as separate thoughts, without forcing rigid section headers.",
+    "- Include source links for selected event findings when available. Prefer inline Markdown links like [source name](url), attached to the phrase that states the sourced fact, for example [fresh macro reporting](url). Use 1-2 links max and avoid a separate Sources line unless inline links would make the sentence awkward.",
+    "- Aim for 600-900 characters; use up to 1100 only when both event and anomaly need to be covered.",
+    "- The message should answer what changed, why it matters for this portfolio, and what is uncertain or worth watching next.",
+    "- Mention exposure, tickers, and key move metrics only when they help the user understand importance.",
+    "- Sound like a sharp human analyst, not a news digest, template, or system log.",
+    "- No buy/sell advice. Do not treat price targets as your recommendation.",
     "",
     "Return JSON only. It MUST begin with { and end with }.",
     "Schema:",
@@ -3217,7 +3457,7 @@ function buildAnalystPrompt(input) {
     '    {"finding_id":"", "finding_type":"event_impact", "primary_asset":"", "summary":"", "dedupe_key":"", "affected_holdings":[], "affected_buckets":[], "exposure_impact":{"direct_exposure_pct":null,"related_bucket_exposure_pct":null,"total_exposure_pct":null,"calculation":"","confidence":"low|medium|high"}, "position_impacts":[], "repetition_context":{"is_repeated_exposure":false,"new_information":"","matched_prior_alert":""}, "event_refs":[], "data_quality_notes":[], "confidence":"low|medium|high"}',
     "  ],",
     '  "anomalyAttributionFindings": [',
-    '    {"finding_id":"", "finding_type":"anomaly_attribution", "primary_asset":"", "summary":"", "dedupe_key":"", "anomaly_metrics":{}, "attribution_status":"confirmed|plausible|weak_correlation|unexplained", "supporting_events":[], "data_quality_notes":[], "confidence":"low|medium|high"}',
+    '    {"finding_id":"", "finding_type":"anomaly_attribution", "primary_asset":"", "summary":"", "dedupe_key":"", "attribution_packet_id":"", "anomaly_metrics":{}, "attribution_status":"confirmed|plausible|weak_correlation|unexplained", "supporting_events":[], "data_quality_notes":[], "confidence":"low|medium|high"}',
     "  ],",
     '  "decision": {',
     '    "alert_decision":"push|no_push",',
@@ -3372,11 +3612,17 @@ function compactAssessmentForAudit(finding, decision) {
   };
 }
 
-function buildLaneArtifacts(eventCandidates, anomalies, analyst) {
+function buildLaneArtifacts(eventCandidates, anomalies, analyst, anomalyAttributionPackets) {
   analyst = analyst || { findings: [], decision: buildFallbackDecision("unknown") };
   const decision = analyst.decision || {};
   const eventFindings = (analyst.findings || []).filter((finding) => finding.findingType === "event_impact");
   const anomalyFindings = (analyst.findings || []).filter((finding) => finding.findingType === "anomaly_attribution");
+  const packetByAnomalyId = {};
+  const packetBySymbol = {};
+  (anomalyAttributionPackets || []).forEach((packet) => {
+    if (packet && packet.anomalyId) packetByAnomalyId[packet.anomalyId] = packet;
+    if (packet && packet.symbol) packetBySymbol[String(packet.symbol || "").toUpperCase()] = packet;
+  });
   const analystStatusByCandidate = {};
   (analyst.eventCandidateStatuses || []).forEach((row) => {
     if (row && row.candidateId) analystStatusByCandidate[row.candidateId] = row;
@@ -3428,8 +3674,10 @@ function buildLaneArtifacts(eventCandidates, anomalies, analyst) {
   const anomalyAttributions = (anomalies || []).map((anomaly) => {
     const symbol = String(anomaly.symbol || "").toUpperCase();
     const matched = anomalyBySymbol[symbol];
+    const packet = packetByAnomalyId[anomaly.anomalyId] || packetBySymbol[symbol] || null;
     return {
       ...compactAnomalyForAudit(anomaly),
+      attributionPacket: packet ? compactAnomalyAttributionPacketForAudit(packet) : null,
       finalStatus: matched
         ? {
           status: matched.status,
@@ -3498,7 +3746,7 @@ function buildPersistDeltaRows(input) {
   const findings = (input.analyst && input.analyst.findings) || [];
   const decision = input.analyst && input.analyst.decision ? input.analyst.decision : {};
   const alertEntry = input.alertEntry || {};
-  const laneArtifacts = input.laneArtifacts || buildLaneArtifacts(input.eventCandidates || [], input.anomalies || [], input.analyst || {});
+  const laneArtifacts = input.laneArtifacts || buildLaneArtifacts(input.eventCandidates || [], input.anomalies || [], input.analyst || {}, input.anomalyAttributionPackets || []);
   const eventStored = Math.min(eventRecords.length, 160);
   const kvKeys = [
     "lastSnapshot",
@@ -3611,6 +3859,7 @@ function buildPersistDeltaRows(input) {
         qualifiedEventCount: laneArtifacts.qualifiedEvents.length,
         selectedEventCount: laneArtifacts.selectedEvents.length,
         anomalyCount: (input.anomalies || []).length,
+        anomalyAttributionPacketCount: (input.anomalyAttributionPackets || []).length,
         anomalyAttributionCount: laneArtifacts.anomalyAttributions.length,
         abnormalAssets: (input.priceSignals || []).filter((s) => s && s.abnormal).map((s) => s.symbol),
       },
@@ -3702,7 +3951,7 @@ function buildRunAudit(input) {
   const candidates = input.candidates || eventCandidates.concat(anomalies.map(anomalyAsLegacyCandidate));
   const analyst = input.analyst || { findings: [], decision: buildFallbackDecision("unknown") };
   const decision = analyst.decision || {};
-  const laneArtifacts = input.laneArtifacts || buildLaneArtifacts(eventCandidates, anomalies, analyst);
+  const laneArtifacts = input.laneArtifacts || buildLaneArtifacts(eventCandidates, anomalies, analyst, input.anomalyAttributionPackets || []);
   const abnormalSignals = priceSignals
     .filter((signal) => signal && signal.abnormal)
     .map((signal) => ({
@@ -3784,6 +4033,17 @@ function buildRunAudit(input) {
       anomalyStatuses: laneArtifacts.finalStatuses.anomalies,
       rawAnalystJson: input.rawAnalystJson || "",
     },
+    anomalyAttributionAgents: {
+      environment: (input.anomalyAttributionPackets || []).length ? "Alva Ask (LLM)" : "not_called",
+      call: (input.anomalyAttributionPackets || []).length ? "ask(buildAnomalyAttributionPrompt(anomalyInput)) once per computed asset anomaly" : "skipped",
+      toolLoop: "alva_ask_managed_if_needed",
+      browsing: "alva_ask_managed_if_needed",
+      skillhubSkill: "carl-2/discord-why-the-move",
+      version: CONFIG.anomalyAttributionVersion,
+      promptContextCharCap: CONFIG.maxAnomalyAttributionPromptChars,
+      packetCount: (input.anomalyAttributionPackets || []).length,
+      packets: (input.anomalyAttributionPackets || []).map(compactAnomalyAttributionPacketForAudit),
+    },
     breakingNews: {
       environment: input.breakingNewsSummary && input.breakingNewsSummary.agentCalled ? "Pi Agent" : "not_called_or_failed",
       call: input.breakingNewsSummary && input.breakingNewsSummary.agentCalled
@@ -3838,6 +4098,7 @@ function buildRunAudit(input) {
     qualifiedEventCount: laneArtifacts.qualifiedEvents.length,
     selectedEventCount: laneArtifacts.selectedEvents.length,
     anomalyCount: anomalies.length,
+    anomalyAttributionPacketCount: (input.anomalyAttributionPackets || []).length,
     anomalyAttributionCount: laneArtifacts.anomalyAttributions.length,
     abnormalSignals,
     candidateLaneCounts,
@@ -3901,17 +4162,20 @@ function buildRunAudit(input) {
     },
     {
       step: 5,
-      node: "Market data and event fetch",
-      environment: "Code + Pi Agent",
+      node: "Per-holding market data and source fetch",
+      environment: "Code",
       input: { holdings: (snapshot.holdings || []).map((h) => h.symbol), windowStartHkt: hkt(input.fetchStartMs), windowEndHkt: hkt(input.runAtMs) },
-	      action: "For each holding, fetch daily bars, latest 1min extended-hours bars, hourly bars, market news, price-target news, and earnings calendar. After price marking and current-theme extraction, fetch timestamped macro context and recent Arrays indexed X top-engagement tweets in code, then run one objective-centric Pi event-search agent. Pi judges supplied hot tweets for investment-related breaking-news eligibility, uses Brave source expansion only for qualifying indexed-X anchors, maps current themes to supported Arrays market-news topics, calls searchArraysMarketNewsTopic inside the Pi loop, and returns holding-linked events or portfolio-level risk-factor events.",
-      output: dataFetchSummary,
+      action: "For each current holding, resolve marketDataSymbol, then fetch daily bars, latest 1min extended-hours bars, hourly bars, market news, price-target news, and earnings calendar. For option holdings, market data and per-ticker source lookup use the underlying equity, while the option contract remains the held symbol.",
+      output: {
+        marketDataCoverage: dataFetchSummary.marketDataCoverage || [],
+        perTickerSourceCounts: dataFetchSummary.rawEventSourceCounts || {},
+      },
       gate: "If more than 20% of holdings lack usable daily-bar price coverage, fail the run.",
     },
     {
       step: 6,
-      node: "Price mark and anomaly metrics",
-      environment: "Code",
+      node: "Price mark, anomaly metrics, and theme extraction",
+      environment: "Code + Alva Ask (LLM)",
       input: { priceSignalVersion: CONFIG.priceSignalVersion, volumeSignalVersion: CONFIG.volumeSignalVersion },
 	      action: "Mark equity positions to Arrays latest 1min price when available; compute total value from cash plus priced positions; compute price metrics and hourly cumulative-volume anomaly metrics. Then call Alva Ask once to extract current holding themes for this run before the Pi event-search agent uses theme context.",
       output: {
@@ -3926,7 +4190,26 @@ function buildRunAudit(input) {
     },
     {
       step: 7,
-      node: "Context update and event-candidate build",
+      node: "Macro and Pi event-search loop",
+      environment: "Code + Pi Agent",
+      input: {
+        windowStartHkt: hkt(input.fetchStartMs),
+        windowEndHkt: hkt(input.runAtMs),
+        themeCount: (input.currentThemes || []).length,
+      },
+      action: "Fetch timestamped macro context and recent Arrays indexed X top-engagement tweets in code, then run one objective-centric Pi event-search agent. Pi judges supplied hot tweets for investment-related breaking-news eligibility, uses Brave source expansion only for qualifying indexed-X anchors, maps current themes to supported Arrays market-news topics, calls searchArraysMarketNewsTopic inside the Pi loop, and returns holding-linked events or portfolio-level risk-factor events. Code then normalizes all raw event records and applies event dedupe status.",
+      output: {
+        macroFreshness: dataFetchSummary.macroFreshness || [],
+        breakingNewsSummary: dataFetchSummary.breakingNewsSummary || {},
+        themeNewsSummary: dataFetchSummary.themeNewsSummary || {},
+        normalizedEventCount: dataFetchSummary.normalizedEventCount || rawEvents.length,
+        eventDedupeCounts: eventStatusCounts,
+      },
+      gate: "Pi, not code-side ticker matching, maps returned breaking/theme/topic events to current holdings. Source-returned tickers are context only. Truly market-moving portfolio-level macro/policy/risk events may proceed without exact holding symbols when Pi supplies risk-factor context.",
+    },
+    {
+      step: 8,
+      node: "Event-candidate build",
       environment: "Code",
       input: { previousSnapshot: !!input.previous, rawEventCount: rawEvents.length },
       action: "Compute portfolio delta and dynamic theme exposure for analyst context, dedupe event records, and build event_candidates from all non-duplicate source records, including portfolio-level macro/policy/risk events that do not name a specific holding. Broad market/theme/topic events remain one event object with affectedSymbols[] and affectedThemes[] instead of being duplicated per holding.",
@@ -3939,7 +4222,7 @@ function buildRunAudit(input) {
       gate: "Portfolio delta and theme exposure are context only, not standalone candidates. Event candidate code only drops same-run duplicates; missing exact symbol mapping is not a code-level rejection. Semantic relevance, exposure impact, freshness, novelty, qualification, and materiality are analyst responsibilities.",
     },
     {
-      step: 8,
+      step: 9,
       node: "Asset anomaly build",
       environment: "Code",
       input: { abnormalSignals },
@@ -3948,10 +4231,21 @@ function buildRunAudit(input) {
         anomalyCount: anomalies.length,
         anomalySymbols: anomalies.map((anomaly) => anomaly.symbol),
       },
-      gate: "Anomaly attribution is separate from event impact. The analyst should return one attribution per anomaly. Anomalies are worth reporting even when attribution is weak, with uncertainty labeled clearly; code does not suppress it after the anomaly trigger fires.",
+      gate: "Anomaly attribution is separate from event impact. The next step creates one attribution-agent packet per anomaly, and the final analyst converts that packet into final wording/status. Anomalies are worth reporting even when attribution is weak, with uncertainty labeled clearly; code does not suppress it after the anomaly trigger fires.",
     },
     {
-      step: 9,
+      step: 10,
+      node: "Per-asset anomaly attribution Agents",
+      environment: (input.anomalyAttributionPackets || []).length ? "Alva Ask (LLM)" : "Code",
+      input: { anomalyCount: anomalies.length },
+      action: (input.anomalyAttributionPackets || []).length
+        ? "For each computed asset anomaly, call a dedicated Alva Ask attribution agent with anomaly metrics, related event context, macro context, portfolio context, and prior user-visible alert timeline. The prompt instructs the agent to use the Skill Hub why-the-move methodology when available."
+        : "Skip attribution-agent calls because there are no computed asset anomalies.",
+      output: llmDecision.anomalyAttributionAgents,
+      gate: "Each packet is attribution context for the final analyst, not the final push/no-push decision. If a packet fails, store agent_error and keep the anomaly alive for final analyst review.",
+    },
+    {
+      step: 11,
       node: "Analyst decision",
       environment: input.analystCallMode === "alva_ask" ? "Alva Ask (LLM)" : "Code",
       input: input.analystPromptSummary || { reason: "LLM skipped" },
@@ -3959,10 +4253,10 @@ function buildRunAudit(input) {
         ? "Call ask(buildAnalystPrompt(analystInput)) and parse JSON decision."
         : "Use deterministic fallback decision because this run did not need an analyst call.",
       output: llmDecision.analyst,
-      gate: "The analyst handles two separate flows: event candidates -> qualified events with exposure impact, and computed anomalies -> anomaly attributions. Selection/suppression is the final decision state, recorded in the final status ledger, not a separate event-lane stage. prior_alert_history is a past-7-day user-visible run timeline; empty runs are not suppressed reasoning. Portfolio delta/theme exposure are context only. Alva Ask may use available tools if it needs to verify stale or suspicious submitted data, and must return JSON only.",
+      gate: "The analyst handles two separate flows: event candidates -> qualified events with exposure impact, and computed anomalies plus attribution packets -> final anomaly attributions. Selection/suppression is the final decision state, recorded in the final status ledger, not a separate event-lane stage. prior_alert_history is a past-7-day user-visible run timeline; empty runs are not suppressed reasoning. Portfolio delta/theme exposure are context only. Alva Ask may use available tools if it needs to verify stale or suspicious submitted data, and must return JSON only.",
     },
     {
-      step: 10,
+      step: 12,
       node: "Persist and notify",
       environment: "Code",
       input: { selectedFindingIds: decision.selectedFindingIds || [] },
@@ -4105,6 +4399,16 @@ function buildRunAudit(input) {
     const normalizedEvent = normalizeEvent(rawEvents, eventIndex, runAtMs);
     const eventCandidates = buildEventCandidates(snapshot, normalizedEvent.records);
     const anomalies = buildAnomalies(snapshot, priceSignals);
+    const anomalyAttributionPackets = runAnomalyAttributionAgents(anomalies, {
+      runAtMs,
+      runAtHkt: hkt(runAtMs),
+      snapshot,
+      eventRecords: normalizedEvent.records,
+      eventCandidates,
+      macro,
+      priorAlertHistory: priorAlertTimeline,
+      warnings,
+    });
     const candidates = eventCandidates.concat(anomalies.map(anomalyAsLegacyCandidate));
     const reviewItemCount = eventCandidates.length + anomalies.length;
     let analyst = { findings: [], decision: buildFallbackDecision("no_material_candidates") };
@@ -4117,6 +4421,7 @@ function buildRunAudit(input) {
         run_at_hkt: hkt(runAtMs),
         event_candidates_to_review: eventCandidates.slice(0, CONFIG.maxPromptCandidates).map(compactEventCandidateForAnalyst),
         asset_anomalies: anomalies,
+        anomaly_attribution_packets: anomalyAttributionPackets.map(compactAnomalyAttributionPacketForAnalyst),
         asset_anomaly_metrics: priceSignals
           .filter((signal) => signal && (signal.abnormal || anomalies.some((anomaly) => anomaly.symbol === signal.symbol)))
           .map(compactPriceSignalForAnalyst),
@@ -4164,10 +4469,11 @@ function buildRunAudit(input) {
         toolLoop: "alva_ask_managed_if_needed",
         browsing: "alva_ask_managed_if_needed",
         suppliedJsonOnly: false,
-        requiredInputs: ["prior_alert_history", "event_candidates_to_review", "asset_anomalies", "asset_anomaly_metrics", "portfolio_context"],
+        requiredInputs: ["prior_alert_history", "event_candidates_to_review", "asset_anomalies", "anomaly_attribution_packets", "asset_anomaly_metrics", "portfolio_context"],
         inputCounts: {
           eventCandidates: eventCandidates.length,
           assetAnomalies: anomalies.length,
+          anomalyAttributionPackets: anomalyAttributionPackets.length,
           totalReviewItems: reviewItemCount,
           eventRecords: analystInput.event_records.length,
           priorAlertHistoryRows: analystInput.prior_alert_history.length,
@@ -4176,6 +4482,7 @@ function buildRunAudit(input) {
           eventRecords: CONFIG.maxPromptEvents,
           eventCandidates: CONFIG.maxPromptCandidates,
           analystPromptChars: CONFIG.maxAnalystPromptChars,
+          anomalyAttributionPromptChars: CONFIG.maxAnomalyAttributionPromptChars,
           priorAlertTimelineDays: CONFIG.priorAlertTimelineDays,
           priorAlertTimelineRows: CONFIG.maxPriorAlertTimelineRows,
         },
@@ -4190,7 +4497,7 @@ function buildRunAudit(input) {
     }
 
     const selectedFindings = analyst.findings.filter((f) => analyst.decision.selectedFindingIds.indexOf(f.findingId) >= 0);
-    const laneArtifacts = buildLaneArtifacts(eventCandidates, anomalies, analyst);
+    const laneArtifacts = buildLaneArtifacts(eventCandidates, anomalies, analyst, anomalyAttributionPackets);
 
     const shouldPush = analyst.decision.alertDecision === "push" && analyst.decision.notificationMessage && selectedFindings.length > 0;
     const notifyBody = shouldPush ? analyst.decision.notificationMessage : SKIP;
@@ -4286,10 +4593,11 @@ function buildRunAudit(input) {
       qualifiedEventsJson: compactJson(laneArtifacts.qualifiedEvents, 80000),
       selectedEventsJson: compactJson(laneArtifacts.selectedEvents, 60000),
       anomaliesJson: compactJson(laneArtifacts.anomalies, 60000),
+      anomalyAttributionPacketsJson: compactJson(anomalyAttributionPackets.map(compactAnomalyAttributionPacketForAudit), 120000),
       anomalyAttributionsJson: compactJson(laneArtifacts.anomalyAttributions, 90000),
       finalStatusesJson: compactJson(laneArtifacts.finalStatuses, 160000),
       searchExpansionTraceJson: compactJson(searchExpansionTrace, 120000),
-      candidateSummaryJson: compactJson({ eventCandidates, qualifiedEvents: laneArtifacts.qualifiedEvents, selectedEvents: laneArtifacts.selectedEvents, anomalies, anomalyAttributions: laneArtifacts.anomalyAttributions, finalStatuses: laneArtifacts.finalStatuses, candidates, priceSignals }, 160000),
+      candidateSummaryJson: compactJson({ eventCandidates, qualifiedEvents: laneArtifacts.qualifiedEvents, selectedEvents: laneArtifacts.selectedEvents, anomalies, anomalyAttributionPackets: anomalyAttributionPackets.map(compactAnomalyAttributionPacketForAudit), anomalyAttributions: laneArtifacts.anomalyAttributions, finalStatuses: laneArtifacts.finalStatuses, candidates, priceSignals }, 160000),
       candidateAuditJson: compactJson(decisionAuditArtifacts.candidateAudit),
       anomalySignalsJson: compactJson(decisionAuditArtifacts.anomalySignals),
       rawAnalystJson,
@@ -4353,6 +4661,7 @@ function buildRunAudit(input) {
       priceSignals,
       eventCandidates,
       anomalies,
+      anomalyAttributionPackets,
       candidates,
       laneArtifacts,
       warnings,
@@ -4380,6 +4689,7 @@ function buildRunAudit(input) {
       priceSignals,
       eventCandidates,
       anomalies,
+      anomalyAttributionPackets,
       priceFailures,
       macro,
       snapshot,
@@ -4416,6 +4726,7 @@ function buildRunAudit(input) {
       qualifiedEventsJson: compactJson(laneArtifacts.qualifiedEvents, 80000),
       selectedEventsJson: compactJson(laneArtifacts.selectedEvents, 60000),
       anomaliesJson: compactJson(laneArtifacts.anomalies, 60000),
+      anomalyAttributionPacketsJson: compactJson(anomalyAttributionPackets.map(compactAnomalyAttributionPacketForAudit), 120000),
       anomalyAttributionsJson: compactJson(laneArtifacts.anomalyAttributions, 90000),
       finalStatusesJson: compactJson(laneArtifacts.finalStatuses, 160000),
       searchExpansionTraceJson: compactJson(audit.searchExpansionTrace, 120000),

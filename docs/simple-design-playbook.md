@@ -33,8 +33,9 @@ In a deployed Alva account, the implemented automation is a private feed:
   sent only when the decision layer selects material, non-repeated findings.
 
 The feed persists portfolio snapshots, position rows, raw event records,
-event candidates, qualified/selected events, computed anomalies, anomaly
-attributions, alert decisions, and a `notify/message` push sidecar.
+event candidates, qualified event assessments, computed anomalies,
+per-asset anomaly attribution packets, final anomaly attributions, alert
+decisions, final status reasons, and a `notify/message` push sidecar.
 
 Current production price / portfolio basis:
 
@@ -54,9 +55,12 @@ Current production price / portfolio basis:
   context.
 - Asset anomaly checks use one attribution lane per asset. Any price or volume
   trigger opens one asset-level attribution task; the system does not create
-  separate price and volume attributions for the same asset. Anomalies are
-  worth reporting even when attribution is weak; weak or guessed attribution
-  must be labeled clearly instead of being presented as certainty.
+  separate price and volume attributions for the same asset. Each computed
+  anomalous asset first gets its own Alva Ask attribution agent packet using
+  why-the-move style reasoning; the final analyst then decides the final
+  wording and selected/suppressed state. Anomalies are worth reporting even
+  when attribution is weak; weak or guessed attribution must be labeled clearly
+  instead of being presented as certainty.
 - Volume anomaly checks use hourly cumulative volume rather than daily bars or
   single-hour spikes: US-listed equities/ETFs and options on US equities use
   regular-session cumulative volume up to the latest regular-session hourly
@@ -108,8 +112,9 @@ Current production price / portfolio basis:
 Before adapting this template for a new account, the Alva Skill Agent should do
 a dry run against the user's connected portfolio, then inspect `audit.run_log`,
 `analysis.decision`, and `notify.message`. A successful quiet run should persist
-portfolio state, raw events, event candidates, final statuses, and the skip
-sentinel without exposing broker cost basis or P&L.
+portfolio state, raw events, event candidates, computed anomalies, anomaly
+attribution packets when anomalies exist, final statuses, and the skip sentinel
+without exposing broker cost basis or P&L.
 
 ## Blind spots
 

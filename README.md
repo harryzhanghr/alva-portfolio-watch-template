@@ -12,11 +12,13 @@ they were interrupted.
 - `src/portfolio-watch-automation.js`  
   Production-style Alva automation source. It reads a connected portfolio,
   fetches market/event data, computes price and volume anomalies, runs Pi event
-  search, runs Alva Ask analyst review, persists audit artifacts, and writes a
-  notification sidecar.
+  search, runs one Alva Ask anomaly-attribution agent per computed anomalous
+  asset, runs final Alva Ask analyst review, persists audit artifacts, and
+  writes a notification sidecar.
 - `playbooks/audit-log/index.html`  
   A reusable audit playbook UI for inspecting official cron runs, raw events,
-  event candidates, qualified events, anomaly attributions, final status
+  event candidates, qualified event assessments, computed anomalies,
+  per-asset attribution packets, final anomaly attributions, final status
   reasons, persisted file deltas, and notification output.
 - `playbooks/audit-log/README.md`  
   Audit UI configuration notes.
@@ -115,8 +117,10 @@ missing.
 - Event lane and anomaly lane are separate.
 - Event candidates are a review long list, not pre-approved findings.
 - Anomalies are computed facts, not event candidates.
-- Alva Ask analyst decides qualification, attribution, selected/suppressed
-  status, and final push/no-push.
+- Each computed anomaly gets a per-asset Alva Ask attribution packet before the
+  final analyst pass.
+- Alva Ask analyst decides event qualification, final anomaly wording,
+  selected/suppressed status, and final push/no-push.
 - Code should not run a deterministic post-analyst repeat-suppression override.
 - Every no-push path should still persist audit artifacts.
 
@@ -169,21 +173,18 @@ a meaningful anomaly attribution.
 10. Normalize and dedupe raw event records.
 11. Build event candidates from all non-duplicate event records.
 12. Build computed asset anomalies from price/volume triggers.
-13. Send event candidates and anomalies to the Alva Ask analyst.
-14. Persist raw events, candidates, qualified events, final statuses, anomaly
-   attributions, and notification output.
-15. Push only if the analyst selected at least one finding and wrote a message.
+13. Run one Alva Ask anomaly-attribution agent per computed anomalous asset.
+14. Send event candidates, computed anomalies, and attribution packets to the
+   final Alva Ask analyst.
+15. Persist raw events, event candidates, qualified event assessments, computed
+   anomalies, attribution packets, final anomaly attributions, final status
+   reasons, and notification output.
+16. Push only if the analyst selected at least one finding and wrote a message.
 
-## Playbook Links
+## Playbooks
 
-The detailed playbooks live outside this README so the repo front page stays
-focused on setup and reuse:
-
-- Compact Design Playbook: https://alva.ai/u/harryzz/playbooks/portfolio-watch-flow-no-thesis
-- Pseudo-Code Automation Spec: https://alva.ai/u/harryzz/playbooks/portfolio-watch-automation-spec
-
-Local Markdown snapshots are also kept in this repo for agents that prefer file
-context:
+The repo keeps local Markdown snapshots so agents can adapt the template without
+needing access to the template author's private Alva workspace:
 
 - [docs/simple-design-playbook.md](docs/simple-design-playbook.md)
 - [docs/pseudo-code-playbook.md](docs/pseudo-code-playbook.md)

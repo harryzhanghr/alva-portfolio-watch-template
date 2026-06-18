@@ -2,9 +2,7 @@
 
 ## Problem
 
-In the breaking-news lane, Pi may discover an event from a fresh X post, but the underlying source can be older.
-
-Example: an X post about CFTC crypto perpetuals relief looked fresh, but the official CFTC source was published earlier. The automation should let the analyst see that distinction.
+In the breaking-news lane, Pi may discover an event from a fresh X post, but the underlying source can be older. The automation should let the analyst see that distinction.
 
 ## Requirement
 
@@ -40,19 +38,3 @@ The analyst should compare:
 - `source_event_time`
 
 If the X post is fresh but `source_event_time` is old, treat it as a resurfaced / newly discussed older event unless there is clear new market reaction or new information.
-
-## CFTC Example
-
-X discovery:
-
-- NewsRamp X post about CFTC no-action relief for crypto perpetual futures.
-
-Better attached source time:
-
-```json
-{
-  "source_event_time": "2026-06-12"
-}
-```
-
-The analyst can then understand: the X post is fresh, but the official CFTC event is not fresh to this run.

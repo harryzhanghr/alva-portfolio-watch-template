@@ -45,6 +45,8 @@ The run is healthy if:
 - portfolio ingest returns holdings;
 - positions use connected quantity and Arrays current price when available;
 - raw events and event candidates are persisted;
+- computed anomalies create per-asset anomaly attribution packets when anomaly
+  triggers exist;
 - quiet runs write `<|SKIP_NOTIFICATION|>`;
 - no private template data appears in outputs;
 - the audit playbook can load the configured feed path.
@@ -55,6 +57,8 @@ Enable user-visible notifications only after confirming:
 
 - the analyst JSON parses;
 - final statuses are populated for event candidates and anomalies;
+- the per-asset anomaly attribution agent is configured before the final
+  analyst and references Skill Hub why-the-move methodology when available;
 - no deterministic post-analyst repeat override is present;
 - selected findings are required before push;
 - notification copy does not contain buy/sell advice.
