@@ -2291,17 +2291,42 @@ function relatedHoldingsFromPiItem(item, snapshot) {
       ""
     ).toUpperCase();
     if (!symbol || !holdingBy[symbol]) return;
+    const relation = normalizeRelation(value.relation || value.relationship || value.relation_type || value.relationType || "portfolio_relevance");
+    const confidence = normalizeConfidence(value.confidence);
     byHolding[symbol] = {
       symbol,
-      relation: clean(value.relation || value.relationship || value.relation_type || value.relationType || "portfolio_relevance", 80),
-      confidence: normalizeConfidence(value.confidence),
+      relation,
+      confidence,
       rationale: clean(value.rationale || value.reason || value.why_relevant || value.whyRelevant || "", 320),
+      mappingStrength: strongHoldingRelation(relation, confidence) ? "holding_level" : "context_only",
       mappingSource: "pi_agentic_event_mapping",
     };
   });
   return Object.keys(byHolding)
     .sort((a, b) => ((holdingBy[b] && holdingBy[b].allocation) || 0) - ((holdingBy[a] && holdingBy[a].allocation) || 0))
     .map((symbol) => byHolding[symbol]);
+}
+
+function normalizeRelation(value) {
+  return clean(value || "", 80).toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function strongHoldingRelation(relation, confidence) {
+  const normalized = normalizeRelation(relation);
+  if (normalized === "direct") return true;
+  if (normalized === "peer_competitor") return true;
+  if (normalized === "supplier_customer" || normalized === "customer_supplier") return true;
+  if (normalized === "option_underlying") return true;
+  if (normalized === "other" && confidence === "high") return true;
+  return false;
+}
+
+function contextOnlyRelatedHoldings(rows) {
+  return (rows || []).filter((row) => row && row.mappingStrength !== "holding_level");
+}
+
+function holdingLevelRelatedHoldings(rows) {
+  return (rows || []).filter((row) => row && row.mappingStrength === "holding_level");
 }
 
 function piEventSourceType(item, themeNews) {
@@ -2404,8 +2429,10 @@ function normalizeBreakingNewsRecords(parsed, snapshot, runAtMs, currentThemes) 
 	  if (!title && !summary) return;
 	  const themeNews = isThemeNewsEvent(item);
 	  const sourceType = piEventSourceType(item, themeNews);
-	  const relatedHoldings = relatedHoldingsFromPiItem(item, snapshot);
-	  const matchedSymbols = relatedHoldings.map((row) => row.symbol);
+		  const allRelatedHoldings = relatedHoldingsFromPiItem(item, snapshot);
+		  const relatedHoldings = holdingLevelRelatedHoldings(allRelatedHoldings);
+		  const contextualRelatedHoldings = contextOnlyRelatedHoldings(allRelatedHoldings);
+		  const matchedSymbols = relatedHoldings.map((row) => row.symbol);
 	  const riskFactors = normalizedItemRiskFactors(item);
 	  const eventThemes = uniqueCompactStrings(normalizedItemThemes(item).concat(riskFactors), 80).map(normalizeThemeName).filter(Boolean);
 	  const sourceRelatedTickers = sourceRelatedTickersFromPiItem(item);
@@ -2460,14 +2487,18 @@ function normalizeBreakingNewsRecords(parsed, snapshot, runAtMs, currentThemes) 
 	    "",
 	    700
 	  );
-	  const mappingReason = clean(
-	    item.mapping_reason ||
-	    item.mappingReason ||
-	    relatedHoldings.map((row) => row.symbol + ": " + (row.rationale || row.relation || "")).join("; ") ||
-	    portfolioRelevanceBasis ||
-	    "",
-	    700
-	  );
+		  const rawPiMappingReason = clean(item.mapping_reason || item.mappingReason || "", 700);
+		  const mappingReason = clean(
+		    (matchedSymbols.length ? rawPiMappingReason : "") ||
+		    relatedHoldings.map((row) => row.symbol + ": " + (row.rationale || row.relation || "")).join("; ") ||
+		    portfolioRelevanceBasis ||
+		    (contextualRelatedHoldings.length
+		      ? "Context-only thematic read-through returned by Pi for " + contextualRelatedHoldings.map((row) => row.symbol).join(", ") + "; code did not treat these as affected holdings."
+		      : "") ||
+		    rawPiMappingReason ||
+		    "",
+		    700
+		  );
 	  const sourceOrigin = sourceType === "topic_news"
 	    ? "arrays_topic_news"
 	    : (themeNews ? "pi_theme_search" : "pi_market_breaking_search");
@@ -2492,7 +2523,8 @@ function normalizeBreakingNewsRecords(parsed, snapshot, runAtMs, currentThemes) 
 	        : (item.source_kind ? "Pi event-search loop: " + item.source_kind : "Pi event-search loop")),
       url: links[0] || "",
       publishedAtMs,
-      mappingReason,
+		        mappingReason,
+		        rawPiMappingReason,
       metadata: {
         sourceLinks: links,
         confidence: item.confidence || "",
@@ -2504,8 +2536,10 @@ function normalizeBreakingNewsRecords(parsed, snapshot, runAtMs, currentThemes) 
 	        portfolioRelevanceBasis,
 	        affectedThemes,
 	        affectedSymbols: matchedSymbols,
-	        linkedHoldings,
-	        relatedHoldings,
+		        linkedHoldings,
+		        relatedHoldings,
+		        contextualRelatedHoldings,
+		        allRelatedHoldings,
 		        sourceRelatedTickers,
 		        tickers: sourceRelatedTickers,
 		        sourceTweetId,
@@ -2514,7 +2548,7 @@ function normalizeBreakingNewsRecords(parsed, snapshot, runAtMs, currentThemes) 
 		        sourceTweetEngagementScore: Number.isFinite(sourceTweetEngagementScore) ? round(sourceTweetEngagementScore, 3) : null,
 		        expandedFromTweetId,
 		        expandedFromTweetUrl,
-		        holdingMappingPolicy: matchedSymbols.length ? "pi_agent_related_holdings_only" : "pi_agent_related_holdings_or_portfolio_level",
+			        holdingMappingPolicy: matchedSymbols.length ? "pi_agent_holding_level_related_holdings_only" : "pi_agent_context_only_or_portfolio_level",
 	        portfolioLevelEvent: !matchedSymbols.length,
 	        piBreakingNews: !themeNews,
 	        piThemeNews: themeNews,
@@ -2763,9 +2797,10 @@ async function fetchBreakingNews(snapshot, currentThemes, fetchStartMs, runAtMs,
 		      "Do not use source_expansion to discover market_breaking events that were not anchored to a supplied indexed-X tweet. Brave expansion can confirm and enrich an indexed-X candidate, not create a new market_breaking candidate.",
 		      "For theme/industry news, first map every supplied current portfolio theme to supported Arrays market-news topics. Use no_supported_topic when none fit. When a topic fits, call searchArraysMarketNewsTopic to inspect actual source rows before returning any topic-derived event.",
 	      "You may also build Brave news queries from supplied current portfolio theme context when useful, especially when topic mapping is too broad or needs source context.",
-	      "For returned single-name or theme events, agentically map them to current holdings using current_portfolio_holdings and return related_holdings[]. Use exact holding_symbol values from the supplied portfolio. Source-returned tickers are context only, not an automatic mapping.",
+	      "For returned single-name or theme events, agentically map them to current holdings using current_portfolio_holdings and return related_holdings[] only when there is a holding-level relation. Use exact holding_symbol values from the supplied portfolio. Source-returned tickers are context only, not an automatic mapping.",
 	      "When deciding related_holdings, use the event source text from tool rows (source_text/content/summary/description) plus source metadata. Do not map a holding from title and URL alone; if the source text is missing or too thin, use source expansion when appropriate or omit the event.",
-	      "A holding can be related even when not directly mentioned: peer/competitor read-through, supplier/customer exposure, shared theme/industry, macro/rates/oil/FX/liquidity sensitivity, crypto beta, or option-underlying exposure can all be valid if you explain the relation.",
+	      "A holding-level relation requires direct mention, peer/competitor read-through, supplier/customer exposure, option-underlying exposure, or another first-order link grounded in the source. Shared theme/industry, broad AI-infrastructure read-through, macro/rates/oil/FX/liquidity sensitivity, crypto beta, or generic sector sympathy is context-only: put it in themes/risk_factors/portfolio_relevance_basis, not related_holdings[].",
+	      "For data-center power/capex, energy-supply, or AI-infrastructure buildout events, do not map memory, semiconductor, server, or networking holdings merely because they share the AI-infrastructure theme. Map them only if the source directly mentions that holding, its product market, its customer/supplier chain, or a concrete first-order demand/supply/pricing transmission.",
 	      "Do not drop a truly market-moving macro, policy, liquidity, geopolitical, rates, oil, or broad risk-appetite event only because it has no exact holding symbol. For those portfolio-level events, return related_holdings: [], symbols: [], risk_factors, and portfolio_relevance_basis. If an event has neither exact holding relevance nor a credible portfolio-level risk-factor basis, do not return it.",
 	      "After each tool result, reflect on whether the query was on-objective. If results are stale, generic, or off-topic, try a sharper query within budget rather than returning bad events.",
 	      "Only return events that are new enough for the supplied window and plausibly material to markets, sectors, macro, major listed assets, or the supplied theme/industry exposures.",
@@ -2824,7 +2859,7 @@ async function fetchBreakingNews(snapshot, currentThemes, fetchStartMs, runAtMs,
 		      "6. Optionally call searchBrave for theme_news discovery using purpose='theme_news', result_filter='news', and the theme name in the theme parameter. Use the supplied theme context, not prebuilt query strings.",
 		      "7. Deduplicate same-event variants across indexed X, Brave, and Arrays topic rows. Do not return an event only because a tool result existed.",
 		      "8. For each returned event, set event_scope to market_breaking or theme_news. For Arrays topic rows, use event_scope='theme_news' and source_kind='arrays_topic_news'. For Brave theme rows, include matched_theme and the actual search_query you used.",
-		      "9. For each returned event, fill related_holdings with exact holding_symbol values from current_portfolio_holdings when a holding-level relation exists. Include relation, confidence, and rationale grounded in the source_text/content/summary/description you saw. Source tickers may go in source_related_tickers but must not substitute for related_holdings. For portfolio-level macro/policy/risk events with no exact holding relation, leave related_holdings empty and provide risk_factors plus portfolio_relevance_basis.",
+			      "9. For each returned event, fill related_holdings with exact holding_symbol values from current_portfolio_holdings only when a holding-level relation exists. Include relation, confidence, and rationale grounded in the source_text/content/summary/description you saw. Source tickers may go in source_related_tickers but must not substitute for related_holdings. For portfolio-level macro/policy/risk/theme events with no exact holding-level relation, leave related_holdings empty and provide risk_factors plus portfolio_relevance_basis.",
 		      "10. For each returned event, published_at_iso must be copied from the discovery/source row timestamp when available. For indexed-X market_breaking events, this must be the supplied tweet's published_at_iso; if no timestamp is available, leave it blank and include source_time_label if present.",
 		      "11. For indexed-X market_breaking events, source_event_time should be the original/official source timestamp/date when found, otherwise the earliest credible non-X source time, otherwise null. It may be older than published_at_iso and must not replace the X freshness field.",
 		      "12. In search_audit, include the code-provided indexed-X discovery attempt, every meaningful tool attempt, lane, theme when applicable, tools_used, candidate_count, and a short result_assessment such as useful/refined/noisy/no_event.",
@@ -2836,7 +2871,7 @@ async function fetchBreakingNews(snapshot, currentThemes, fetchStartMs, runAtMs,
       '    {"theme":"memory", "topics":["TECHNOLOGY","MANUFACTURING"], "status":"mapped|no_supported_topic", "reason":"why these Arrays market-news topics fit this portfolio theme"}',
       "  ],",
       '  "events": [',
-		      '    {"event_id":"stable short id", "event_scope":"market_breaking|theme_news", "title":"", "summary":"", "source_text_excerpt":"short excerpt from source_text/content/summary used for mapping", "published_at_iso":"", "source_time_label":"", "source_event_time":null, "source_tweet_id":"", "source_tweet_url":"", "source_tweet_rank":1, "source_tweet_engagement_score":0, "expanded_from_tweet_url":"", "source_related_tickers":["TICKER"], "themes":["theme-a"], "risk_factors":["rates","liquidity"], "portfolio_relevance_basis":"why this can matter to the current portfolio even if no exact holding symbol applies", "matched_theme":"theme-a", "search_query":"", "source_links":["https://..."], "source_kind":"indexed_x|mixed|news|arrays_topic_news", "confidence":"low|medium|high", "why_relevant":"", "related_holdings":[{"holding_symbol":"TICKER", "relation":"direct|peer_competitor|supplier_customer|theme_readthrough|macro_sensitivity|sector_readthrough|liquidity_beta|option_underlying|other", "confidence":"low|medium|high", "rationale":"why this event matters to this holding"}]}',
+		      '    {"event_id":"stable short id", "event_scope":"market_breaking|theme_news", "title":"", "summary":"", "source_text_excerpt":"short excerpt from source_text/content/summary used for mapping", "published_at_iso":"", "source_time_label":"", "source_event_time":null, "source_tweet_id":"", "source_tweet_url":"", "source_tweet_rank":1, "source_tweet_engagement_score":0, "expanded_from_tweet_url":"", "source_related_tickers":["TICKER"], "themes":["theme-a"], "risk_factors":["rates","liquidity"], "portfolio_relevance_basis":"why this can matter to the current portfolio even if no exact holding-level relation applies", "matched_theme":"theme-a", "search_query":"", "source_links":["https://..."], "source_kind":"indexed_x|mixed|news|arrays_topic_news", "confidence":"low|medium|high", "why_relevant":"", "related_holdings":[{"holding_symbol":"TICKER", "relation":"direct|peer_competitor|supplier_customer|customer_supplier|option_underlying|other", "confidence":"low|medium|high", "rationale":"source-grounded first-order relation to this holding"}]}',
 	      "  ],",
 	      '  "search_audit": [{"query":"arrays_indexed_x_top_engagement_recent_90m", "lane":"market_breaking|theme_news", "theme":"", "tools_used":["searchArraysIndexedX(code)"], "candidate_count":0, "result_assessment":"useful|refined|noisy|no_event"}]',
       "}",
@@ -3081,19 +3116,81 @@ function compactHoldingForAnomalyAgent(snapshot, anomaly) {
   };
 }
 
+function relatedHoldingSymbol(row) {
+  return String(
+    row && (
+      row.holding_symbol ||
+      row.holdingSymbol ||
+      row.symbol ||
+      row.ticker ||
+      ""
+    ) || ""
+  ).toUpperCase();
+}
+
+function topLevelRiskFactors(item) {
+  const metadata = item && item.metadata || {};
+  return uniqueCompactStrings(
+    []
+      .concat(item && item.riskFactors || [])
+      .concat(item && item.risk_factors || [])
+      .concat(metadata.riskFactors || [])
+      .concat(metadata.risk_factors || []),
+    80
+  ).map(normalizeThemeName).filter(Boolean);
+}
+
+function portfolioEventCanInformAnomaly(item, anomaly, snapshot) {
+  const metadata = item && item.metadata || {};
+  const portfolioLevel = !!(item && item.portfolioLevelEvent) || !!metadata.portfolioLevelEvent;
+  if (!portfolioLevel) return false;
+  const factors = topLevelRiskFactors(item);
+  if (!factors.length) return false;
+  const broadMacro = {
+    rates: true,
+    inflation: true,
+    cpi: true,
+    jobs: true,
+    fomc: true,
+    liquidity: true,
+    credit: true,
+    dollar: true,
+    fx: true,
+    oil: true,
+    crude: true,
+    sanctions: true,
+    geopolitical: true,
+    "risk-appetite": true,
+    "broad-risk-appetite": true,
+  };
+  if (factors.some((factor) => broadMacro[factor])) return true;
+  const holdingThemes = anomalyThemes(snapshot, anomaly);
+  return holdingThemes.some((theme) => factors.indexOf(theme) >= 0 && broadMacro[theme]);
+}
+
 function eventMatchesAnomalyContext(item, anomaly, snapshot) {
   if (!item || !anomaly) return false;
-  const symbols = eventAffectedSymbols(item, snapshot).map((symbol) => String(symbol || "").toUpperCase());
   const symbol = String(anomaly.symbol || "").toUpperCase();
-  const marketDataSymbol = String(anomaly.marketDataSymbol || "").toUpperCase();
-  if (symbols.indexOf(symbol) >= 0 || (marketDataSymbol && symbols.indexOf(marketDataSymbol) >= 0)) return true;
-  const itemThemes = eventAffectedThemes(item, snapshot, symbols).map(normalizeThemeName);
-  const aThemes = anomalyThemes(snapshot, anomaly);
-  if (itemThemes.some((theme) => aThemes.indexOf(theme) >= 0)) return true;
+  const marketDataSymbol = String(anomaly.marketDataSymbol || anomaly.symbol || "").toUpperCase();
+  const symbols = eventAffectedSymbols(item, snapshot).map((row) => String(row || "").toUpperCase());
+  if (symbols.indexOf(symbol) >= 0 || symbols.indexOf(marketDataSymbol) >= 0) return true;
   const metadata = item.metadata || {};
-  const riskFactors = (metadata.riskFactors || []).map(normalizeThemeName);
-  if (riskFactors.length && aThemes.some((theme) => riskFactors.indexOf(theme) >= 0)) return true;
-  return !!metadata.portfolioRelevanceBasis && !symbols.length;
+  const related = uniqueSymbols(
+    []
+      .concat(item.relatedHoldings || [])
+      .concat(metadata.relatedHoldings || [])
+      .filter((row) => !row || !row.mappingStrength || row.mappingStrength === "holding_level")
+      .map(relatedHoldingSymbol)
+  );
+  if (related.indexOf(symbol) >= 0 || related.indexOf(marketDataSymbol) >= 0) return true;
+  const sourceTickers = normalizeTickerRows(
+    []
+      .concat(item.sourceRelatedTickers || [])
+      .concat(metadata.sourceRelatedTickers || [])
+      .concat(metadata.tickers || [])
+  );
+  if (sourceTickers.indexOf(symbol) >= 0 || sourceTickers.indexOf(marketDataSymbol) >= 0) return true;
+  return portfolioEventCanInformAnomaly(item, anomaly, snapshot);
 }
 
 function relatedEventsForAnomaly(anomaly, eventRecords, eventCandidates, snapshot) {
@@ -3104,10 +3201,7 @@ function relatedEventsForAnomaly(anomaly, eventRecords, eventCandidates, snapsho
   const relatedKeys = {};
   (eventCandidates || []).forEach((candidate) => {
     if (!candidate) return;
-    const linked = (candidate.affectedSymbols || []).indexOf(anomaly.symbol) >= 0 ||
-      (candidate.affectedSymbols || []).indexOf(anomaly.marketDataSymbol) >= 0 ||
-      !!candidate.portfolioLevelEvent ||
-      (candidate.affectedThemes || []).some((theme) => anomalyThemes(snapshot, anomaly).indexOf(normalizeThemeName(theme)) >= 0);
+	    const linked = eventMatchesAnomalyContext(candidate, anomaly, snapshot);
     if (!linked) return;
     (candidate.eventRefs || []).forEach((key) => {
       if (key) relatedKeys[key] = true;
@@ -3133,10 +3227,12 @@ function buildAnomalyAttributionPrompt(input) {
     "Rules:",
     "- This is attribution only, not a push/no-push decision.",
     "- Use available tools if the supplied packet looks stale, wrong, or too thin.",
-    "- Do not invent facts, prices, catalysts, source links, or causal chains.",
-    "- A current event is not automatically the cause. It must fit timing, direction, and size.",
-    "- A narrative can be context, but not a fresh catalyst unless there is a dated new fact or clear same-session market reaction.",
-    "- If attribution is not strong, return weak_correlation or unexplained and say what the best grounded guess is.",
+	    "- Do not invent facts, prices, catalysts, source links, or causal chains.",
+	    "- A current event is not automatically the cause. It must fit timing, direction, and size.",
+	    "- A narrative can be context, but not a fresh catalyst unless there is a dated new fact or clear same-session market reaction.",
+	    "- related_event_records and event_candidates_for_context are possible context, not causal evidence. Do not treat a portfolio-level or context-only thematic event as a supporting event for this asset unless the source directly names the asset, its product market, peer, customer/supplier chain, or there is clear same-session market reaction in this asset group.",
+	    "- Broad data-center power/capex or AI-infrastructure buildout news is not by itself a memory, semiconductor, server, or networking catalyst. If it lacks direct product-market transmission, classify it as background context or weak_correlation, not plausible/confirmed attribution.",
+	    "- If attribution is not strong, return weak_correlation or unexplained and say what the best grounded guess is.",
     "",
     "Return JSON only. It MUST begin with { and end with }.",
     "Schema:",
@@ -3206,15 +3302,10 @@ function runAnomalyAttributionAgents(anomalies, context) {
       anomaly,
       holding: compactHoldingForAnomalyAgent(context.snapshot || {}, anomaly),
       related_event_records: relatedEventRecords.map(compactRawEventForAnalyst),
-      event_candidates_for_context: (context.eventCandidates || [])
-        .filter((candidate) => {
-          if (!candidate) return false;
-          if ((candidate.affectedSymbols || []).indexOf(anomaly.symbol) >= 0) return true;
-          if ((candidate.affectedSymbols || []).indexOf(anomaly.marketDataSymbol) >= 0) return true;
-          if (candidate.portfolioLevelEvent) return true;
-          const holdingThemes = anomalyThemes(context.snapshot || {}, anomaly);
-          return (candidate.affectedThemes || []).some((theme) => holdingThemes.indexOf(normalizeThemeName(theme)) >= 0);
-        })
+	      event_candidates_for_context: (context.eventCandidates || [])
+	        .filter((candidate) => {
+	          return eventMatchesAnomalyContext(candidate, anomaly, context.snapshot || {});
+	        })
         .slice(0, 30)
         .map(compactEventCandidateForAnalyst),
       portfolio_snapshot_context: {
@@ -3449,19 +3540,21 @@ function buildAnalystPrompt(input) {
     "- For anticipated events, judge the setup, not just whether the source is breaking news. Opinion, preview, commentary, analyst, or calendar rows can support a setup alert when they clarify market expectations, disagreement, positioning, key watchpoints, or risk/reward around a near-term catalyst tied to material portfolio exposure.",
     "- Return eventCandidateStatuses for every event candidate. candidate_id must copy the candidateId exactly, including the event: prefix, with status selected, suppressed, or not_qualified and a concise reason.",
     "- Use not_qualified for any candidate you do not promote into an eventImpactFinding, including stale, routine, weak, repeated, or semantically wrong rows. Use suppressed only when you created a linked eventImpactFinding but decided it should not be selected for the notification.",
-    "- For candidates that become real events worth analysis, create eventImpactFindings with exposure_impact.",
-    "- Ask: what changed, which current holdings/themes/risk buckets may be affected, and how large is the likely direct or related exposure?",
-    "- Estimate exposure from current holdings, weights, themes, and theme_exposure. Show the calculation briefly in exposure_impact.",
-    "- Do not suppress a directly relevant event just because no anomaly was supplied. First judge whether the event is material on its own, then use current price/volume context or tools if needed. If suppressed, explain the real reason.",
+	    "- For candidates that become real events worth analysis, create eventImpactFindings with exposure_impact.",
+	    "- Ask: what changed, which current holdings/themes/risk buckets may be affected, and how large is the likely direct or related exposure?",
+	    "- Estimate exposure from current holdings, weights, themes, and theme_exposure. Show the calculation briefly in exposure_impact.",
+	    "- Direct exposure comes only from affectedSymbols or a source-grounded holding-level relation. Context-only theme/risk read-through can be discussed as a bucket, but do not add unrelated holdings into a direct exposure calculation.",
+	    "- Do not suppress a directly relevant event just because no anomaly was supplied. First judge whether the event is material on its own, then use current price/volume context or tools if needed. If suppressed, explain the real reason.",
     "- Treat portfolio delta and theme exposure as context only, not standalone findings.",
     "",
     "B) Anomaly lane",
     "- asset_anomalies are already computed anomalies, not candidates.",
     "- anomaly_attribution_packets are prepared by one per-asset Alva Ask Anomaly Attribution Agent using the Skill Hub why-the-move methodology when available.",
     "- Use those packets as the attribution starting point. Do not redo attribution from scratch unless the packet looks wrong, stale, or weak enough to verify with tools.",
-    "- Produce one final anomalyAttributionFinding for every asset anomaly when possible, combining price and volume triggers for that asset.",
-    "- If the dedicated packet says weak_correlation, unexplained, or agent_error, still return an attribution with that uncertainty clearly labeled.",
-    "- Asset anomalies are worth reporting even when attribution is not confirmed. If attribution is weak, say it is weak and offer the best grounded guess only as a guess.",
+	    "- Produce one final anomalyAttributionFinding for every asset anomaly when possible, combining price and volume triggers for that asset.",
+	    "- If the dedicated packet says weak_correlation, unexplained, or agent_error, still return an attribution with that uncertainty clearly labeled.",
+	    "- Asset anomalies are worth reporting even when attribution is not confirmed. If attribution is weak, say it is weak and offer the best grounded guess only as a guess.",
+	    "- Do not merge event-impact and anomaly-attribution lanes into one causal story unless there is first-order evidence. A broad portfolio/theme event may be worth noting separately while an asset move remains continuation, weak_correlation, or unexplained.",
     "",
     "4. Novelty and materiality gate",
     "- prior_alert_history is the past 7 days of user-visible run timeline. Empty runs show only that no push was sent; they are not prior suppressed reasoning.",
@@ -3484,9 +3577,10 @@ function buildAnalystPrompt(input) {
     "6. Notification writing style",
     "- notification_message is user-facing. Private decision fields may mention push/no_push, selected, suppressed, candidates, qualification, or why this run is worth interrupting; notification_message should not.",
     "- Focus on what the investor needs to know now, not why the automation decided to send a notification.",
-    "- Lead with the market/portfolio read in natural language.",
-    "- Write like a real portfolio analyst sending a concise note after checking the book. Vary the opening based on the situation: sometimes direct, sometimes cautious, sometimes slightly conversational, but it should not feel like a fixed template.",
-    "- Avoid internal workflow words such as push, selected, candidate, qualified, cleanest item, clears the bar, interruption bar.",
+	    "- Lead with the market/portfolio read in natural language.",
+	    "- Write like a real portfolio analyst sending a concise note after checking the book. Vary the opening based on the situation: sometimes direct, sometimes cautious, sometimes slightly conversational, but it should not feel like a fixed template.",
+	    "- Avoid causal verbs such as behind, drove, explains, or because of unless the selected attribution is supported by first-order evidence. For broad thematic read-throughs, use context language and keep the event separate from the price-move attribution.",
+	    "- Avoid internal workflow words such as push, selected, candidate, qualified, cleanest item, clears the bar, interruption bar.",
     "- Use short paragraphs or bullets when there is more than one distinct point.",
     "- If both event impact and anomaly attribution are selected, make both visible as separate thoughts, without forcing rigid section headers.",
     "- Include source links for selected event findings when available. Prefer inline Markdown links like [source name](url), attached to the phrase that states the sourced fact, for example [fresh macro reporting](url). Use 1-2 links max and avoid a separate Sources line unless inline links would make the sentence awkward.",

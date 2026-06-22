@@ -83,11 +83,12 @@ Current production price / portfolio basis:
   current theme context, supported Arrays market-news topics, source-text-aware
   tools, indexed X discovery context, and budgets. Pi maps each theme to supported topics or
   `no_supported_topic`, calls `searchArraysMarketNewsTopic` inside the agent
-  loop when useful, and returns holding-linked events with `related_holdings[]`
-  or portfolio-level macro/policy/risk events with `risk_factors` and
-  `portfolio_relevance_basis`. Source-returned tickers are context only, not
-  automatic mappings. Pi may still run supplemental Brave theme_news searches
-  when useful.
+  loop when useful, and returns `related_holdings[]` only for holding-level
+  relations or portfolio-level macro/policy/risk/theme events with
+  `risk_factors` and `portfolio_relevance_basis`. Source-returned tickers,
+  shared-theme read-through, and generic AI-infrastructure sympathy are context
+  only, not automatic mappings. Pi may still run supplemental Brave theme_news
+  searches when useful.
 - Mark-to-market movement is explicitly not treated as a user trade and is
   context only unless the asset also has a current anomaly trigger.
 - `cashChangeUsd` is tracked separately from cash percentage drift, so
@@ -128,13 +129,16 @@ This is the first production version. Current blind spots:
 - Per-asset X search is no longer part of the deterministic source loop. Market-wide X discovery happens through code calling `/api/v1/social-feeds/x/search` without `q`, paging backward through the latest 90-minute indexed window up to 5 pages of 200 original/quote posts, ranking unique rows by engagement, and passing up to 50 top rows into the Pi event-search loop. Pi does not plan/refine Grok or text-search queries. For indexed-X breaking-news rows, Pi should first try to attach `source_event_time` from the original / official source; if that is unavailable, it can use the earliest credible media/source link. Source-expansion Brave lookup uses `result_filter="web"` and is not constrained to the recent event window.
 - Broad macro/theme/topic events are represented once with `affectedSymbols[]`,
   `affectedThemes[]`, and optional `riskFactors`. For Pi events, affected
-  symbols come only from Pi-returned `related_holdings[]`, not code-side
-  ticker/theme matching; however, an event is no longer dropped merely because
-  `related_holdings[]` is empty when it has a credible portfolio-level
-  macro/policy/risk relevance basis. Deterministic per-ticker source rows carry
-  code-populated `sourceRelatedTickers` and `relatedHoldings` from the query
-  symbol and current holding, including `option_underlying` when the fetched
-  `marketDataSymbol` differs from the held symbol.
+  symbols come only from Pi-returned `related_holdings[]` that code classifies
+  as holding-level (`direct`, peer, supplier/customer, option-underlying, or
+  another first-order source-grounded relation), not code-side ticker/theme
+  matching and not context-only `theme_readthrough`. An event is no longer
+  dropped merely because `related_holdings[]` is empty when it has a credible
+  portfolio-level macro/policy/risk/theme relevance basis. Deterministic
+  per-ticker source rows carry code-populated `sourceRelatedTickers` and
+  `relatedHoldings` from the query symbol and current holding, including
+  `option_underlying` when the fetched `marketDataSymbol` differs from the held
+  symbol.
 - Crypto-specific derivatives/on-chain attribution is not yet wired generically.
   Direct crypto assets and crypto-related equities can still be monitored through
   price, volume, market news, and theme/event attribution.
