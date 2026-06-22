@@ -125,13 +125,16 @@ This is the first production version. Current blind spots:
   event search, but the option contract itself remains unpriced until an
   option-specific valuation source is added.
 - ETF look-through exposure is not yet wired.
-- Per-asset X search is no longer part of the deterministic source loop. Market-wide X discovery happens through code calling `/api/v1/social-feeds/x/search` without `q`, paging backward through the latest 90-minute indexed window up to 5 pages of 200 original/quote posts, ranking unique rows by engagement, and passing up to 25 top rows into the Pi event-search loop. Pi does not plan/refine Grok or text-search queries. For indexed-X breaking-news rows, Pi should first try to attach `source_event_time` from the original / official source; if that is unavailable, it can use the earliest credible media/source link. Source-expansion Brave lookup uses `result_filter="web"` and is not constrained to the recent event window.
+- Per-asset X search is no longer part of the deterministic source loop. Market-wide X discovery happens through code calling `/api/v1/social-feeds/x/search` without `q`, paging backward through the latest 90-minute indexed window up to 5 pages of 200 original/quote posts, ranking unique rows by engagement, and passing up to 50 top rows into the Pi event-search loop. Pi does not plan/refine Grok or text-search queries. For indexed-X breaking-news rows, Pi should first try to attach `source_event_time` from the original / official source; if that is unavailable, it can use the earliest credible media/source link. Source-expansion Brave lookup uses `result_filter="web"` and is not constrained to the recent event window.
 - Broad macro/theme/topic events are represented once with `affectedSymbols[]`,
   `affectedThemes[]`, and optional `riskFactors`. For Pi events, affected
   symbols come only from Pi-returned `related_holdings[]`, not code-side
   ticker/theme matching; however, an event is no longer dropped merely because
   `related_holdings[]` is empty when it has a credible portfolio-level
-  macro/policy/risk relevance basis.
+  macro/policy/risk relevance basis. Deterministic per-ticker source rows carry
+  code-populated `sourceRelatedTickers` and `relatedHoldings` from the query
+  symbol and current holding, including `option_underlying` when the fetched
+  `marketDataSymbol` differs from the held symbol.
 - Crypto-specific derivatives/on-chain attribution is not yet wired generically.
   Direct crypto assets and crypto-related equities can still be monitored through
   price, volume, market news, and theme/event attribution.

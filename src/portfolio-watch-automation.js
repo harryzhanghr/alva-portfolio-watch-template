@@ -25,14 +25,15 @@ const CONFIG = {
   latestPriceLookbackHours: 36,
   latestPriceLimit: 2400,
   breakingNewsEnabled: true,
-  maxBreakingNewsRecords: 8,
+  maxBreakingNewsRecords: 30,
   maxBreakingNewsBraveCalls: 2,
   indexedXLookbackMinutes: 90,
   maxIndexedXTweetsFetch: 200,
   maxIndexedXTweetFetchPages: 5,
-  maxIndexedXTweetsForPi: 25,
-  maxTopicNewsToolCalls: 16,
-  maxTopicNewsRowsPerTopic: 50,
+  maxIndexedXTweetsForPi: 50,
+  maxTopicNewsToolCalls: 24,
+  maxTopicNewsRowsPerTopic: 100,
+  maxTopicNewsToolResultChars: 80000,
   maxThemeNewsRowsPerQuery: 5,
   maxThemeNewsSearchAttemptsPerTheme: 2,
   portfolioSnapshotStaleWarningHours: 12,
@@ -1933,7 +1934,7 @@ async function fetchHourlyBars(symbol, warnings) {
   return (body.data || []).slice().sort((a, b) => barTimeSec(a) - barTimeSec(b));
 }
 
-async function fetchNews(symbol, startSec, endSec, warnings) {
+async function fetchNews(symbol, startSec, endSec, warnings, holdingSymbol) {
   const body = await optionalArrays("/api/v1/stocks/market-news", {
     symbol,
     start_time: startSec,
@@ -1942,25 +1943,30 @@ async function fetchNews(symbol, startSec, endSec, warnings) {
     sort_by: "DESC",
     limit: CONFIG.eventSourceLimits.marketNewsFetch,
   }, warnings, "market-news:" + symbol);
-  return (body.data || []).map((item) => ({
-    sourceType: "news",
-    symbol,
-    sourceRecordId: item.id ? String(item.id) : "",
-    title: item.title || "",
-    summary: item.summary || "",
-    source: item.source || item.source_domain || "",
-    url: item.url || "",
-    publishedAtMs: item.publish_time ? item.publish_time * 1000 : Date.parse(item.time_published || "") || null,
-    metadata: {
-      sourceOrigin: "per_ticker_search",
-      sourceLane: "per_ticker_market_news",
-      sourceSearchMode: "arrays_market_news_by_symbol",
-      querySymbol: symbol,
-      sentiment: item.overall_sentiment_label || "",
-      topics: item.topics || [],
-      tickers: item.tickers || [],
-    },
-  }));
+  return (body.data || []).map((item) => {
+    const mapping = perTickerSourceMapping(symbol, holdingSymbol, "market-news");
+    return {
+      sourceType: "news",
+      symbol,
+      sourceRecordId: item.id ? String(item.id) : "",
+      title: item.title || "",
+      summary: item.summary || "",
+      source: item.source || item.source_domain || "",
+      url: item.url || "",
+      publishedAtMs: item.publish_time ? item.publish_time * 1000 : Date.parse(item.time_published || "") || null,
+      metadata: {
+        sourceOrigin: "per_ticker_search",
+        sourceLane: "per_ticker_market_news",
+        sourceSearchMode: "arrays_market_news_by_symbol",
+        querySymbol: symbol,
+        sourceRelatedTickers: mergeSourceTickers(mapping.sourceRelatedTickers, item.tickers || []),
+        relatedHoldings: mapping.relatedHoldings,
+        sentiment: item.overall_sentiment_label || "",
+        topics: item.topics || [],
+        tickers: item.tickers || [],
+      },
+    };
+  });
 }
 
 function normalizeMarketNewsTopic(value) {
@@ -1973,6 +1979,35 @@ function normalizeTickerRows(tickers) {
     if (typeof row === "string") return row;
     return row && (row.ticker || row.symbol || row.name || "");
   }));
+}
+
+function perTickerSourceMapping(querySymbol, holdingSymbol, relationLabel) {
+  const query = String(querySymbol || "").toUpperCase();
+  const holding = String(holdingSymbol || query || "").toUpperCase();
+  if (!holding) {
+    return {
+      relatedHoldings: [],
+      sourceRelatedTickers: normalizeTickerRows(query ? [query] : []),
+    };
+  }
+  const relation = holding === query ? "direct" : "option_underlying";
+  const rationale = holding === query
+    ? "Fetched by per-ticker " + relationLabel + " query for current holding " + holding + "."
+    : "Fetched by per-ticker " + relationLabel + " query for market-data symbol " + query + ", mapped to current holding " + holding + ".";
+  return {
+    relatedHoldings: [{
+      symbol: holding,
+      relation,
+      confidence: "medium",
+      rationale,
+      mappingSource: "per_ticker_query_symbol",
+    }],
+    sourceRelatedTickers: normalizeTickerRows(query ? [query] : []),
+  };
+}
+
+function mergeSourceTickers(base, extra) {
+  return normalizeTickerRows([].concat(base || []).concat(extra || []));
 }
 
 function normalizeThemeTopicMappings(parsed, themeContexts) {
@@ -2008,47 +2043,55 @@ function normalizeThemeTopicMappings(parsed, themeContexts) {
   }).filter((row) => row.theme);
 }
 
-async function fetchPriceTargetNews(symbol, startSec, endSec, warnings) {
+async function fetchPriceTargetNews(symbol, startSec, endSec, warnings, holdingSymbol) {
   const body = await optionalArrays("/api/v1/stocks/company/price-target-news", {
     symbol,
     start_time: startSec,
     end_time: endSec,
     limit: CONFIG.eventSourceLimits.priceTargetFetch,
   }, warnings, "price-target-news:" + symbol);
-  return (body.data || []).map((item) => ({
-    sourceType: "analyst",
-    symbol: item.symbol || symbol,
-    sourceRecordId: item.news_url || item.news_title || "",
-    title: item.news_title || "Price target news",
-    summary: [
-      item.analyst_company || "",
-      Number.isFinite(item.price_target) ? "target " + item.price_target : "",
-      Number.isFinite(item.price_when_posted) ? "price_when_posted " + item.price_when_posted : "",
-    ].filter(Boolean).join(" · "),
-    source: item.news_publisher || item.analyst_company || "",
-    url: item.news_url || "",
-    publishedAtMs: item.observed_at ? item.observed_at * 1000 : Date.parse(item.publish_time || "") || null,
-    metadata: {
-      ...item,
-      sourceOrigin: "per_ticker_search",
-      sourceLane: "per_ticker_price_target",
-      sourceSearchMode: "arrays_price_target_news_by_symbol",
-      querySymbol: symbol,
-    },
-  }));
+  return (body.data || []).map((item) => {
+    const itemSymbol = item.symbol || symbol;
+    const mapping = perTickerSourceMapping(symbol, holdingSymbol, "price-target");
+    return {
+      sourceType: "analyst",
+      symbol: itemSymbol,
+      sourceRecordId: item.news_url || item.news_title || "",
+      title: item.news_title || "Price target news",
+      summary: [
+        item.analyst_company || "",
+        Number.isFinite(item.price_target) ? "target " + item.price_target : "",
+        Number.isFinite(item.price_when_posted) ? "price_when_posted " + item.price_when_posted : "",
+      ].filter(Boolean).join(" · "),
+      source: item.news_publisher || item.analyst_company || "",
+      url: item.news_url || "",
+      publishedAtMs: item.observed_at ? item.observed_at * 1000 : Date.parse(item.publish_time || "") || null,
+      metadata: {
+        ...item,
+        sourceOrigin: "per_ticker_search",
+        sourceLane: "per_ticker_price_target",
+        sourceSearchMode: "arrays_price_target_news_by_symbol",
+        querySymbol: symbol,
+        sourceRelatedTickers: mergeSourceTickers(mapping.sourceRelatedTickers, itemSymbol ? [itemSymbol] : []),
+        relatedHoldings: mapping.relatedHoldings,
+      },
+    };
+  });
 }
 
-async function fetchEarnings(symbol, nowSec, warnings) {
+async function fetchEarnings(symbol, nowSec, warnings, holdingSymbol) {
   const body = await optionalArrays("/api/v1/stocks/earnings-calendar", {
     symbol,
     start_time: nowSec - 7 * 86400,
     end_time: nowSec + 45 * 86400,
   }, warnings, "earnings-calendar:" + symbol);
   return (body.data || []).map((item) => {
+    const itemSymbol = item.symbol || symbol;
     const eventAtMs = Date.parse((item.date || "") + "T12:00:00Z") || null;
+    const mapping = perTickerSourceMapping(symbol, holdingSymbol, "earnings-calendar");
     return {
       sourceType: "corporate_event",
-      symbol: item.symbol || symbol,
+      symbol: itemSymbol,
       sourceRecordId: item.id ? String(item.id) : [symbol, item.date, item.time].join(":"),
       title: symbol + " earnings " + (item.date || ""),
       summary: "Earnings calendar: " + (item.date || "unknown date") + " " + (item.time || ""),
@@ -2062,6 +2105,8 @@ async function fetchEarnings(symbol, nowSec, warnings) {
         sourceLane: "per_ticker_earnings_calendar",
         sourceSearchMode: "arrays_earnings_calendar_by_symbol",
         querySymbol: symbol,
+        sourceRelatedTickers: mergeSourceTickers(mapping.sourceRelatedTickers, itemSymbol ? [itemSymbol] : []),
+        relatedHoldings: mapping.relatedHoldings,
       },
     };
   });
@@ -2648,7 +2693,7 @@ async function fetchBreakingNews(snapshot, currentThemes, fetchStartMs, runAtMs,
 	            endHkt: hkt(runAtMs),
 	            limit: CONFIG.maxTopicNewsRowsPerTopic,
 	          });
-	          return { content: [{ type: "text", text: compactJson(compact, 16000) }], details: compact };
+	          return { content: [{ type: "text", text: compactJson(compact, CONFIG.maxTopicNewsToolResultChars) }], details: compact };
 	        },
 	      },
 	      {
@@ -4379,9 +4424,9 @@ function buildRunAudit(input) {
       const priceSignal = analyzePrice(holding.symbol, holding, dailyBars, hourlyBars, minuteBars, hourlyBars, marketDataSymbol);
       if (!priceSignal.available) priceFailures += 1;
       priceSignals.push(priceSignal);
-      rawEvents.push.apply(rawEvents, await fetchNews(marketDataSymbol, fetchStartSec, fetchEndSec, warnings));
-      rawEvents.push.apply(rawEvents, await fetchPriceTargetNews(marketDataSymbol, fetchStartSec - 5 * 86400, fetchEndSec, warnings));
-      rawEvents.push.apply(rawEvents, await fetchEarnings(marketDataSymbol, fetchEndSec, warnings));
+      rawEvents.push.apply(rawEvents, await fetchNews(marketDataSymbol, fetchStartSec, fetchEndSec, warnings, holding.symbol));
+      rawEvents.push.apply(rawEvents, await fetchPriceTargetNews(marketDataSymbol, fetchStartSec - 5 * 86400, fetchEndSec, warnings, holding.symbol));
+      rawEvents.push.apply(rawEvents, await fetchEarnings(marketDataSymbol, fetchEndSec, warnings, holding.symbol));
     }
     if (priceFailures / snapshot.holdings.length > 0.2) {
       throw new Error("Price coverage blocker: " + priceFailures + " of " + snapshot.holdings.length + " holdings lacked usable daily bars");
