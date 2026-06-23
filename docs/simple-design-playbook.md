@@ -84,11 +84,12 @@ Current production price / portfolio basis:
   tools, indexed X discovery context, and budgets. Pi maps each theme to supported topics or
   `no_supported_topic`, calls `searchArraysMarketNewsTopic` inside the agent
   loop when useful, and returns `related_holdings[]` only for holding-level
-  relations or portfolio-level macro/policy/risk/theme events with
-  `risk_factors` and `portfolio_relevance_basis`. Source-returned tickers,
-  shared-theme read-through, and generic AI-infrastructure sympathy are context
-  only, not automatic mappings. Pi may still run supplemental Brave theme_news
-  searches when useful.
+  relations, including high-confidence source-grounded second-order/value-chain
+  links, or portfolio-level macro/policy/risk/theme events with `risk_factors`
+  and `portfolio_relevance_basis`. Source-returned tickers, shared-theme
+  read-through, and generic AI-infrastructure sympathy are context only, not
+  automatic mappings. Pi may still run supplemental Brave theme_news searches
+  when useful.
 - Mark-to-market movement is explicitly not treated as a user trade and is
   context only unless the asset also has a current anomaly trigger.
 - `cashChangeUsd` is tracked separately from cash percentage drift, so
@@ -130,9 +131,10 @@ This is the first production version. Current blind spots:
 - Broad macro/theme/topic events are represented once with `affectedSymbols[]`,
   `affectedThemes[]`, and optional `riskFactors`. For Pi events, affected
   symbols come only from Pi-returned `related_holdings[]` that code classifies
-  as holding-level (`direct`, peer, supplier/customer, option-underlying, or
-  another first-order source-grounded relation), not code-side ticker/theme
-  matching and not context-only `theme_readthrough`. An event is no longer
+  as holding-level (`direct`, peer, supplier/customer, option-underlying, or a
+  high-confidence second-order/value-chain relation with concrete transmission),
+  not code-side ticker/theme matching and not context-only `theme_readthrough`.
+  An event is no longer
   dropped merely because `related_holdings[]` is empty when it has a credible
   portfolio-level macro/policy/risk/theme relevance basis. Deterministic
   per-ticker source rows carry code-populated `sourceRelatedTickers` and
