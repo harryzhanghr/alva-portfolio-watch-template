@@ -61,4 +61,4 @@ Enable user-visible notifications only after confirming:
   analyst and references Skill Hub why-the-move methodology when available;
 - no deterministic post-analyst repeat override is present;
 - selected findings are required before push;
-- notification copy does not contain buy/sell advice.
+- notification copy does not contain direct trade orders, exact sizing, or unconditional buy/sell instructions.

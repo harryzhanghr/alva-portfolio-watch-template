@@ -6,6 +6,9 @@ const { Feed, feedPath, makeDoc, str, num } = require("@alva/feed");
 const env = require("env");
 
 const ARGS = (env && env.args) || {};
+const TECHNICAL_EVENT_ARGS = ARGS.technicalEvents && typeof ARGS.technicalEvents === "object" ? ARGS.technicalEvents : {};
+const DEFAULT_TECHNICAL_EVENT_DETECTORS = ["breakout", "support_resistance", "rsi", "ma_cross", "volume_price"];
+const TECHNICAL_SEVERITY_RANK = { low: 1, medium: 2, high: 3 };
 const FEED_NAME = ARGS.feedName || "portfolio-watch-automation";
 const ACCOUNT_ID = ARGS.accountId || ARGS.connectedAccountId || "";
 const OWNER_USERNAME = ARGS.ownerUsername || ARGS.username || "";
@@ -52,6 +55,30 @@ const CONFIG = {
   eventSourceLimits: {
     marketNewsFetch: 50,
     priceTargetFetch: 50,
+  },
+  technicalEvents: {
+    enabled: parseBoolArg(ARGS.technicalEventsEnabled !== undefined ? ARGS.technicalEventsEnabled : TECHNICAL_EVENT_ARGS.enabled, true),
+    minSeverity: String((ARGS.technicalEventMinSeverity !== undefined ? ARGS.technicalEventMinSeverity : TECHNICAL_EVENT_ARGS.minSeverity) || "medium").toLowerCase(),
+    detectors: parseTechnicalDetectors(ARGS.technicalEventDetectors !== undefined ? ARGS.technicalEventDetectors : TECHNICAL_EVENT_ARGS.detectors),
+    lookbackDailyBars: numericArg(ARGS.technicalEventLookbackDailyBars !== undefined ? ARGS.technicalEventLookbackDailyBars : TECHNICAL_EVENT_ARGS.lookbackDailyBars, 260),
+    breakoutLookbackDays: numericArg(TECHNICAL_EVENT_ARGS.breakoutLookbackDays, 20),
+    longBreakoutLookbackDays: numericArg(TECHNICAL_EVENT_ARGS.longBreakoutLookbackDays, 55),
+    supportResistanceLookbackDays: numericArg(TECHNICAL_EVENT_ARGS.supportResistanceLookbackDays, 60),
+    supportResistanceTouches: numericArg(TECHNICAL_EVENT_ARGS.supportResistanceTouches, 2),
+    levelBufferPct: numericArg(TECHNICAL_EVENT_ARGS.levelBufferPct, 0.005),
+    atrPeriod: numericArg(TECHNICAL_EVENT_ARGS.atrPeriod, 14),
+    atrBufferMultiple: numericArg(TECHNICAL_EVENT_ARGS.atrBufferMultiple, 0.25),
+    rsiPeriod: numericArg(TECHNICAL_EVENT_ARGS.rsiPeriod, 14),
+    rsiOverbought: numericArg(TECHNICAL_EVENT_ARGS.rsiOverbought, 70),
+    rsiOversold: numericArg(TECHNICAL_EVENT_ARGS.rsiOversold, 30),
+    maFastPeriod: numericArg(TECHNICAL_EVENT_ARGS.maFastPeriod, 50),
+    maSlowPeriod: numericArg(TECHNICAL_EVENT_ARGS.maSlowPeriod, 200),
+    shortMaFastPeriod: numericArg(TECHNICAL_EVENT_ARGS.shortMaFastPeriod, 20),
+    shortMaSlowPeriod: numericArg(TECHNICAL_EVENT_ARGS.shortMaSlowPeriod, 50),
+    volumeLookbackDays: numericArg(TECHNICAL_EVENT_ARGS.volumeLookbackDays, 20),
+    volumeMultiple: numericArg(TECHNICAL_EVENT_ARGS.volumeMultiple, 1.5),
+    volumePriceMovePct: numericArg(TECHNICAL_EVENT_ARGS.volumePriceMovePct, 3),
+    maxEventsPerHolding: numericArg(TECHNICAL_EVENT_ARGS.maxEventsPerHolding, 6),
   },
   materiality: {
     quantityEpsilon: 0.00001,
@@ -264,6 +291,39 @@ function clean(value, maxLen) {
   return text.slice(0, maxLen - 1).trim() + "...";
 }
 
+function parseBoolArg(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const text = String(value).toLowerCase().trim();
+  if (text === "false" || text === "0" || text === "no" || text === "off") return false;
+  if (text === "true" || text === "1" || text === "yes" || text === "on") return true;
+  return fallback;
+}
+
+function numericArg(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function parseTechnicalDetectors(value) {
+  const raw = Array.isArray(value)
+    ? value
+    : (value ? String(value).split(",") : DEFAULT_TECHNICAL_EVENT_DETECTORS);
+  const allowed = {
+    breakout: true,
+    support_resistance: true,
+    rsi: true,
+    ma_cross: true,
+    volume_price: true,
+  };
+  const out = [];
+  raw.forEach((item) => {
+    const key = String(item || "").trim().toLowerCase();
+    if (allowed[key] && out.indexOf(key) < 0) out.push(key);
+  });
+  return out.length ? out : DEFAULT_TECHNICAL_EVENT_DETECTORS.slice();
+}
+
 function round(value, digits) {
   if (!Number.isFinite(value)) return null;
   const m = Math.pow(10, digits);
@@ -466,6 +526,7 @@ function sourceOriginForType(sourceType) {
   if (type === "theme_news") return "pi_theme_search";
   if (type === "topic_news") return "arrays_topic_news";
   if (type === "asset_anomaly") return "asset_anomaly_signal";
+  if (type === "technical_event") return "computed_technical_analysis";
   return "unknown";
 }
 
@@ -476,6 +537,7 @@ function sourceOriginLabel(sourceOrigin) {
   if (origin === "pi_theme_search") return "Pi theme search";
   if (origin === "arrays_topic_news") return "Arrays topic news";
   if (origin === "asset_anomaly_signal") return "Asset anomaly signal";
+  if (origin === "computed_technical_analysis") return "Technical analysis";
   return "Unknown source";
 }
 
@@ -1404,6 +1466,29 @@ function barClose(bar) {
   return Number.isFinite(n) ? n : null;
 }
 
+function barOpen(bar) {
+  const n = Number(bar && (bar.price_open !== undefined ? bar.price_open : bar.open));
+  return Number.isFinite(n) ? n : barClose(bar);
+}
+
+function barHigh(bar) {
+  const n = Number(bar && (bar.price_high !== undefined ? bar.price_high : bar.high));
+  if (Number.isFinite(n)) return n;
+  const open = barOpen(bar);
+  const close = barClose(bar);
+  const values = [open, close].filter(Number.isFinite);
+  return values.length ? Math.max.apply(null, values) : null;
+}
+
+function barLow(bar) {
+  const n = Number(bar && (bar.price_low !== undefined ? bar.price_low : bar.low));
+  if (Number.isFinite(n)) return n;
+  const open = barOpen(bar);
+  const close = barClose(bar);
+  const values = [open, close].filter(Number.isFinite);
+  return values.length ? Math.min.apply(null, values) : null;
+}
+
 function barVolume(bar) {
   const n = Number(bar && (bar.volume_traded !== undefined ? bar.volume_traded : bar.volume));
   return Number.isFinite(n) ? n : 0;
@@ -1895,13 +1980,14 @@ async function fetchIndexedXTopTweets(fetchStartMs, runAtMs, warnings) {
 
 async function fetchDailyBars(symbol, warnings) {
   const end = Math.floor(Date.now() / 1000) + 2 * 86400;
-  const start = end - 100 * 86400;
+  const limit = technicalEventsEnabled() ? Math.max(90, Math.floor(CONFIG.technicalEvents.lookbackDailyBars || 260)) : 90;
+  const start = end - Math.max(100, Math.ceil(limit * 1.6)) * 86400;
   const body = await optionalArrays("/api/v1/stocks/kline", {
     symbol,
     interval: "1d",
     start_time: start,
     end_time: end,
-    limit: 90,
+    limit,
   }, warnings, "stocks/kline:" + symbol);
   return (body.data || []).slice().sort((a, b) => barTimeSec(a) - barTimeSec(b));
 }
@@ -2008,6 +2094,331 @@ function perTickerSourceMapping(querySymbol, holdingSymbol, relationLabel) {
 
 function mergeSourceTickers(base, extra) {
   return normalizeTickerRows([].concat(base || []).concat(extra || []));
+}
+
+function technicalEventsEnabled() {
+  return !!(CONFIG.technicalEvents && CONFIG.technicalEvents.enabled && (CONFIG.technicalEvents.detectors || []).length);
+}
+
+function technicalDetectorEnabled(detector) {
+  return technicalEventsEnabled() && (CONFIG.technicalEvents.detectors || []).indexOf(detector) >= 0;
+}
+
+function technicalSeverityAllowed(severity) {
+  const min = TECHNICAL_SEVERITY_RANK[CONFIG.technicalEvents.minSeverity] || TECHNICAL_SEVERITY_RANK.medium;
+  return (TECHNICAL_SEVERITY_RANK[severity] || TECHNICAL_SEVERITY_RANK.medium) >= min;
+}
+
+function fmtLevel(value) {
+  if (!Number.isFinite(value)) return "n/a";
+  const abs = Math.abs(value);
+  return "$" + (abs >= 100 ? value.toFixed(2) : value.toFixed(3));
+}
+
+function simpleMovingAverage(values, period) {
+  const cleanValues = (values || []).filter(Number.isFinite);
+  if (cleanValues.length < period) return null;
+  return mean(cleanValues.slice(cleanValues.length - period));
+}
+
+function rsiValue(closes, period) {
+  const values = (closes || []).filter(Number.isFinite);
+  if (values.length <= period) return null;
+  let gain = 0;
+  let loss = 0;
+  for (let i = values.length - period; i < values.length; i += 1) {
+    const diff = values[i] - values[i - 1];
+    if (diff >= 0) gain += diff;
+    else loss += Math.abs(diff);
+  }
+  if (loss === 0) return gain === 0 ? 50 : 100;
+  const rs = gain / loss;
+  return 100 - (100 / (1 + rs));
+}
+
+function averageTrueRange(bars, period) {
+  const rows = (bars || []).filter((bar) =>
+    Number.isFinite(barHigh(bar)) && Number.isFinite(barLow(bar)) && Number.isFinite(barClose(bar)));
+  if (rows.length < 2) return null;
+  const start = Math.max(1, rows.length - period);
+  const ranges = [];
+  for (let i = start; i < rows.length; i += 1) {
+    const high = barHigh(rows[i]);
+    const low = barLow(rows[i]);
+    const prevClose = barClose(rows[i - 1]);
+    ranges.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
+  }
+  return ranges.length ? mean(ranges) : null;
+}
+
+function technicalContext(holding, marketDataSymbol, dailyBars, priceSignal, runAtMs) {
+  const completed = (Array.isArray(dailyBars) ? dailyBars : [])
+    .slice()
+    .sort((a, b) => barTimeSec(a) - barTimeSec(b))
+    .filter((bar) => Number.isFinite(barClose(bar)));
+  if (!completed.length || !priceSignal || !priceSignal.available) return null;
+  const latestCompleted = completed[completed.length - 1];
+  const latestCompletedSec = barTimeSec(latestCompleted);
+  const latestPrice = Number(priceSignal.latestPrice || priceSignal.close);
+  const latestPriceAsOfMs = Number(priceSignal.latestPriceAsOfMs || latestCompletedSec * 1000 || runAtMs);
+  const liveIsNewer = Number.isFinite(latestPrice) && latestPriceAsOfMs / 1000 > latestCompletedSec;
+  const currentPrice = Number.isFinite(latestPrice) ? latestPrice : barClose(latestCompleted);
+  const priorBars = liveIsNewer ? completed : completed.slice(0, -1);
+  const closesCompleted = completed.map(barClose).filter(Number.isFinite);
+  const closesWithCurrent = liveIsNewer && Number.isFinite(currentPrice)
+    ? closesCompleted.concat([currentPrice])
+    : closesCompleted;
+  return {
+    holding,
+    holdingSymbol: String(holding && holding.symbol || marketDataSymbol || "").toUpperCase(),
+    marketDataSymbol: String(marketDataSymbol || holding && holding.symbol || "").toUpperCase(),
+    completed,
+    priorBars,
+    latestCompleted,
+    currentPrice,
+    previousClose: liveIsNewer ? barClose(latestCompleted) : (priorBars.length ? barClose(priorBars[priorBars.length - 1]) : null),
+    eventAtMs: Number.isFinite(latestPriceAsOfMs) ? latestPriceAsOfMs : runAtMs,
+    runAtMs,
+    closesCompleted,
+    closesWithCurrent,
+    oneDayPct: priceSignal.oneDayPct,
+    volumeMultiple: Number.isFinite(priceSignal.cumulativeVolumeMultiple)
+      ? priceSignal.cumulativeVolumeMultiple
+      : priceSignal.dailyVolumeMultiple,
+    rsi14: rsiValue(closesWithCurrent, CONFIG.technicalEvents.rsiPeriod),
+    atr: averageTrueRange(completed, CONFIG.technicalEvents.atrPeriod),
+  };
+}
+
+function makeTechnicalEvent(ctx, type, detectorId, timeframe, title, summary, severity, indicators) {
+  if (!technicalSeverityAllowed(severity)) return null;
+  const mapping = perTickerSourceMapping(ctx.marketDataSymbol, ctx.holdingSymbol, "technical-analysis");
+  const dateKey = new Date(ctx.eventAtMs).toISOString().slice(0, 10);
+  return {
+    sourceType: "technical_event",
+    symbol: ctx.marketDataSymbol,
+    sourceRecordId: ["technical", ctx.marketDataSymbol, type, detectorId, timeframe, dateKey].join(":"),
+    title,
+    summary,
+    source: "Computed technical analysis",
+    url: "",
+    publishedAtMs: ctx.eventAtMs,
+    metadata: {
+      sourceOrigin: "computed_technical_analysis",
+      sourceLane: "technical_analysis",
+      sourceSearchMode: "computed_from_ohlcv",
+      querySymbol: ctx.marketDataSymbol,
+      technicalEventType: type,
+      detectorId,
+      timeframe,
+      severity,
+      confidence: severity === "high" ? "high" : "medium",
+      indicators: indicators || {},
+      sourceText: summary,
+      sourceRelatedTickers: mergeSourceTickers(mapping.sourceRelatedTickers, [ctx.marketDataSymbol]),
+      relatedHoldings: mapping.relatedHoldings,
+    },
+  };
+}
+
+function detectBreakoutTechnicalEvents(ctx) {
+  if (!technicalDetectorEnabled("breakout")) return [];
+  const out = [];
+  const lookbacks = [CONFIG.technicalEvents.longBreakoutLookbackDays, CONFIG.technicalEvents.breakoutLookbackDays];
+  for (let i = 0; i < lookbacks.length; i += 1) {
+    const lookback = lookbacks[i];
+    if (ctx.priorBars.length < lookback) continue;
+    const rows = ctx.priorBars.slice(ctx.priorBars.length - lookback);
+    const resistance = Math.max.apply(null, rows.map(barHigh).filter(Number.isFinite));
+    const support = Math.min.apply(null, rows.map(barLow).filter(Number.isFinite));
+    const resistanceBuffer = Math.max(resistance * CONFIG.technicalEvents.levelBufferPct, (ctx.atr || 0) * CONFIG.technicalEvents.atrBufferMultiple);
+    const supportBuffer = Math.max(support * CONFIG.technicalEvents.levelBufferPct, (ctx.atr || 0) * CONFIG.technicalEvents.atrBufferMultiple);
+    const volumeText = Number.isFinite(ctx.volumeMultiple) && ctx.volumeMultiple >= CONFIG.technicalEvents.volumeMultiple
+      ? " on elevated volume (" + round(ctx.volumeMultiple, 2) + "x)"
+      : "";
+    if (Number.isFinite(resistance) && ctx.currentPrice > resistance + resistanceBuffer && (!Number.isFinite(ctx.previousClose) || ctx.previousClose <= resistance + resistanceBuffer)) {
+      out.push(makeTechnicalEvent(
+        ctx,
+        "breakout",
+        "daily_breakout_v1",
+        "1d",
+        ctx.marketDataSymbol + " breaks above " + lookback + "D resistance" + volumeText,
+        ctx.marketDataSymbol + " technical breakout: latest price " + fmtLevel(ctx.currentPrice) + " cleared " + lookback + "D resistance near " + fmtLevel(resistance) + "; 1D move " + fmtMove(ctx.oneDayPct) + ", volume " + (Number.isFinite(ctx.volumeMultiple) ? round(ctx.volumeMultiple, 2) + "x" : "n/a") + ", RSI" + CONFIG.technicalEvents.rsiPeriod + " " + round(ctx.rsi14, 1) + ".",
+        lookback >= 55 ? "high" : "medium",
+        { currentPrice: round(ctx.currentPrice, 4), resistance: round(resistance, 4), lookbackDays: lookback, volumeMultiple: round(ctx.volumeMultiple, 2), rsi: round(ctx.rsi14, 1), atr: round(ctx.atr, 4) }
+      ));
+      break;
+    }
+    if (Number.isFinite(support) && ctx.currentPrice < support - supportBuffer && (!Number.isFinite(ctx.previousClose) || ctx.previousClose >= support - supportBuffer)) {
+      out.push(makeTechnicalEvent(
+        ctx,
+        "breakdown",
+        "daily_breakout_v1",
+        "1d",
+        ctx.marketDataSymbol + " breaks below " + lookback + "D support" + volumeText,
+        ctx.marketDataSymbol + " technical breakdown: latest price " + fmtLevel(ctx.currentPrice) + " fell below " + lookback + "D support near " + fmtLevel(support) + "; 1D move " + fmtMove(ctx.oneDayPct) + ", volume " + (Number.isFinite(ctx.volumeMultiple) ? round(ctx.volumeMultiple, 2) + "x" : "n/a") + ", RSI" + CONFIG.technicalEvents.rsiPeriod + " " + round(ctx.rsi14, 1) + ".",
+        lookback >= 55 ? "high" : "medium",
+        { currentPrice: round(ctx.currentPrice, 4), support: round(support, 4), lookbackDays: lookback, volumeMultiple: round(ctx.volumeMultiple, 2), rsi: round(ctx.rsi14, 1), atr: round(ctx.atr, 4) }
+      ));
+      break;
+    }
+  }
+  return out.filter(Boolean);
+}
+
+function detectSupportResistanceTechnicalEvents(ctx) {
+  if (!technicalDetectorEnabled("support_resistance")) return [];
+  const lookback = CONFIG.technicalEvents.supportResistanceLookbackDays;
+  if (ctx.priorBars.length < Math.min(20, lookback)) return [];
+  const rows = ctx.priorBars.slice(Math.max(0, ctx.priorBars.length - lookback));
+  const support = Math.min.apply(null, rows.map(barLow).filter(Number.isFinite));
+  const resistance = Math.max.apply(null, rows.map(barHigh).filter(Number.isFinite));
+  const latestLow = barLow(ctx.latestCompleted);
+  const latestHigh = barHigh(ctx.latestCompleted);
+  const supportBuffer = Math.max(support * CONFIG.technicalEvents.levelBufferPct, (ctx.atr || 0) * CONFIG.technicalEvents.atrBufferMultiple);
+  const resistanceBuffer = Math.max(resistance * CONFIG.technicalEvents.levelBufferPct, (ctx.atr || 0) * CONFIG.technicalEvents.atrBufferMultiple);
+  const out = [];
+  if (Number.isFinite(support) && Number.isFinite(latestLow) && latestLow <= support + supportBuffer && ctx.currentPrice > support + supportBuffer && (ctx.oneDayPct || 0) > 0) {
+    out.push(makeTechnicalEvent(
+      ctx,
+      "support_bounce",
+      "support_resistance_v1",
+      "1d",
+      ctx.marketDataSymbol + " bounces from support near " + fmtLevel(support),
+      ctx.marketDataSymbol + " tested support near " + fmtLevel(support) + " and reclaimed it; latest price " + fmtLevel(ctx.currentPrice) + ", 1D move " + fmtMove(ctx.oneDayPct) + ", volume " + (Number.isFinite(ctx.volumeMultiple) ? round(ctx.volumeMultiple, 2) + "x" : "n/a") + ".",
+      "medium",
+      { currentPrice: round(ctx.currentPrice, 4), support: round(support, 4), lookbackDays: lookback, volumeMultiple: round(ctx.volumeMultiple, 2), atr: round(ctx.atr, 4) }
+    ));
+  }
+  if (Number.isFinite(resistance) && Number.isFinite(latestHigh) && latestHigh >= resistance - resistanceBuffer && ctx.currentPrice < resistance - resistanceBuffer && (ctx.oneDayPct || 0) < 0) {
+    out.push(makeTechnicalEvent(
+      ctx,
+      "resistance_rejection",
+      "support_resistance_v1",
+      "1d",
+      ctx.marketDataSymbol + " rejects resistance near " + fmtLevel(resistance),
+      ctx.marketDataSymbol + " tested resistance near " + fmtLevel(resistance) + " and faded; latest price " + fmtLevel(ctx.currentPrice) + ", 1D move " + fmtMove(ctx.oneDayPct) + ", volume " + (Number.isFinite(ctx.volumeMultiple) ? round(ctx.volumeMultiple, 2) + "x" : "n/a") + ".",
+      "medium",
+      { currentPrice: round(ctx.currentPrice, 4), resistance: round(resistance, 4), lookbackDays: lookback, volumeMultiple: round(ctx.volumeMultiple, 2), atr: round(ctx.atr, 4) }
+    ));
+  }
+  return out.filter(Boolean);
+}
+
+function detectRsiTechnicalEvents(ctx) {
+  if (!technicalDetectorEnabled("rsi")) return [];
+  const period = CONFIG.technicalEvents.rsiPeriod;
+  const prev = rsiValue(ctx.closesWithCurrent.slice(0, -1), period);
+  const curr = rsiValue(ctx.closesWithCurrent, period);
+  if (!Number.isFinite(prev) || !Number.isFinite(curr)) return [];
+  const overbought = CONFIG.technicalEvents.rsiOverbought;
+  const oversold = CONFIG.technicalEvents.rsiOversold;
+  const rows = [];
+  if (prev <= overbought && curr > overbought) {
+    rows.push(["rsi_overbought_break", ctx.marketDataSymbol + " RSI crosses above " + overbought, "RSI" + period + " rose from " + round(prev, 1) + " to " + round(curr, 1) + ", putting " + ctx.marketDataSymbol + " into momentum/overbought territory.", "medium"]);
+  } else if (prev >= overbought && curr < overbought) {
+    rows.push(["rsi_overbought_exit", ctx.marketDataSymbol + " RSI falls back below " + overbought, "RSI" + period + " fell from " + round(prev, 1) + " to " + round(curr, 1) + ", weakening the overbought momentum setup.", "medium"]);
+  }
+  if (prev >= oversold && curr < oversold) {
+    rows.push(["rsi_oversold_break", ctx.marketDataSymbol + " RSI crosses below " + oversold, "RSI" + period + " fell from " + round(prev, 1) + " to " + round(curr, 1) + ", putting " + ctx.marketDataSymbol + " into oversold territory.", "medium"]);
+  } else if (prev <= oversold && curr > oversold) {
+    rows.push(["rsi_oversold_reclaim", ctx.marketDataSymbol + " RSI reclaims " + oversold + " from oversold", "RSI" + period + " rose from " + round(prev, 1) + " to " + round(curr, 1) + ", a possible momentum repair from oversold conditions.", "medium"]);
+  }
+  return rows.map((row) => makeTechnicalEvent(
+    ctx,
+    row[0],
+    "rsi_v1",
+    "1d",
+    row[1],
+    row[2] + " Latest price " + fmtLevel(ctx.currentPrice) + ", 1D move " + fmtMove(ctx.oneDayPct) + ".",
+    row[3],
+    { currentPrice: round(ctx.currentPrice, 4), rsiPrevious: round(prev, 1), rsiCurrent: round(curr, 1), period }
+  )).filter(Boolean);
+}
+
+function detectMovingAverageTechnicalEvents(ctx) {
+  if (!technicalDetectorEnabled("ma_cross")) return [];
+  const pairs = [
+    { fast: CONFIG.technicalEvents.maFastPeriod, slow: CONFIG.technicalEvents.maSlowPeriod, label: "golden/death", severity: "high" },
+    { fast: CONFIG.technicalEvents.shortMaFastPeriod, slow: CONFIG.technicalEvents.shortMaSlowPeriod, label: "short-term", severity: "medium" },
+  ];
+  const out = [];
+  pairs.forEach((pair) => {
+    const closes = ctx.closesWithCurrent;
+    if (closes.length < pair.slow + 1) return;
+    const prevCloses = closes.slice(0, -1);
+    const prevFast = simpleMovingAverage(prevCloses, pair.fast);
+    const prevSlow = simpleMovingAverage(prevCloses, pair.slow);
+    const currFast = simpleMovingAverage(closes, pair.fast);
+    const currSlow = simpleMovingAverage(closes, pair.slow);
+    if (!Number.isFinite(prevFast) || !Number.isFinite(prevSlow) || !Number.isFinite(currFast) || !Number.isFinite(currSlow)) return;
+    if (prevFast <= prevSlow && currFast > currSlow) {
+      out.push(makeTechnicalEvent(
+        ctx,
+        pair.slow >= 200 ? "golden_cross" : "ma_bull_cross",
+        "ma_cross_v1",
+        "1d",
+        ctx.marketDataSymbol + " " + pair.fast + "D MA crosses above " + pair.slow + "D MA",
+        ctx.marketDataSymbol + " bullish moving-average cross: " + pair.fast + "D MA " + fmtLevel(currFast) + " moved above " + pair.slow + "D MA " + fmtLevel(currSlow) + "; latest price " + fmtLevel(ctx.currentPrice) + ".",
+        pair.severity,
+        { currentPrice: round(ctx.currentPrice, 4), fastPeriod: pair.fast, slowPeriod: pair.slow, fastMa: round(currFast, 4), slowMa: round(currSlow, 4) }
+      ));
+    } else if (prevFast >= prevSlow && currFast < currSlow) {
+      out.push(makeTechnicalEvent(
+        ctx,
+        pair.slow >= 200 ? "death_cross" : "ma_bear_cross",
+        "ma_cross_v1",
+        "1d",
+        ctx.marketDataSymbol + " " + pair.fast + "D MA crosses below " + pair.slow + "D MA",
+        ctx.marketDataSymbol + " bearish moving-average cross: " + pair.fast + "D MA " + fmtLevel(currFast) + " moved below " + pair.slow + "D MA " + fmtLevel(currSlow) + "; latest price " + fmtLevel(ctx.currentPrice) + ".",
+        pair.severity,
+        { currentPrice: round(ctx.currentPrice, 4), fastPeriod: pair.fast, slowPeriod: pair.slow, fastMa: round(currFast, 4), slowMa: round(currSlow, 4) }
+      ));
+    }
+  });
+  return out.filter(Boolean);
+}
+
+function detectVolumePriceTechnicalEvents(ctx) {
+  if (!technicalDetectorEnabled("volume_price")) return [];
+  const volumeMultiple = ctx.volumeMultiple;
+  const move = ctx.oneDayPct;
+  if (!Number.isFinite(volumeMultiple) || !Number.isFinite(move)) return [];
+  if (volumeMultiple < CONFIG.technicalEvents.volumeMultiple || Math.abs(move) < CONFIG.technicalEvents.volumePriceMovePct) return [];
+  const bullish = move > 0;
+  return [makeTechnicalEvent(
+    ctx,
+    bullish ? "volume_price_bullish" : "volume_price_bearish",
+    "volume_price_v1",
+    "1d",
+    ctx.marketDataSymbol + " " + (bullish ? "advances" : "declines") + " on elevated volume",
+    ctx.marketDataSymbol + " " + (bullish ? "advanced" : "declined") + " " + fmtMove(move) + " with cumulative volume at " + round(volumeMultiple, 2) + "x the same-time baseline. This is computed market-structure evidence, not a fundamental catalyst.",
+    Math.abs(move) >= CONFIG.materiality.priceOneDayPct || volumeMultiple >= CONFIG.materiality.cumulativeVolumeMultiple ? "high" : "medium",
+    { currentPrice: round(ctx.currentPrice, 4), oneDayPct: round(move, 2), volumeMultiple: round(volumeMultiple, 2), rsi: round(ctx.rsi14, 1) }
+  )].filter(Boolean);
+}
+
+function buildTechnicalEvents(holding, marketDataSymbol, dailyBars, hourlyBars, minuteBars, priceSignal, runAtMs) {
+  if (!technicalEventsEnabled()) return [];
+  const ctx = technicalContext(holding, marketDataSymbol, dailyBars, priceSignal, runAtMs);
+  if (!ctx) return [];
+  const detectors = [
+    detectBreakoutTechnicalEvents,
+    detectSupportResistanceTechnicalEvents,
+    detectRsiTechnicalEvents,
+    detectMovingAverageTechnicalEvents,
+    detectVolumePriceTechnicalEvents,
+  ];
+  const seen = {};
+  const events = [];
+  detectors.forEach((detector) => {
+    detector(ctx).forEach((event) => {
+      if (!event || seen[event.sourceRecordId]) return;
+      seen[event.sourceRecordId] = true;
+      events.push(event);
+    });
+  });
+  return events.slice(0, CONFIG.technicalEvents.maxEventsPerHolding);
 }
 
 function normalizeThemeTopicMappings(parsed, themeContexts) {
@@ -3590,7 +4001,7 @@ function buildAnalystPrompt(input) {
     "- The message should answer what changed, why it matters for this portfolio, and what is uncertain or worth watching next.",
     "- Mention exposure, tickers, and key move metrics only when they help the user understand importance.",
     "- Sound like a sharp human analyst, not a news digest, template, or system log.",
-    "- No buy/sell advice. Do not treat price targets as your recommendation.",
+    "- Do not give direct trade orders, exact sizing, or unconditional buy/sell instructions. When a selected finding is genuinely actionable, you may include concise, position-aware next-step framing: what would confirm or invalidate the read, what level/event to watch, or what exposure/risk the user may want to reassess. Do not force this when the finding is not actionable. Do not treat price targets as your recommendation.",
     "",
     "Return JSON only. It MUST begin with { and end with }.",
     "Schema:",
@@ -4310,7 +4721,7 @@ function buildRunAudit(input) {
       node: "Per-holding market data and source fetch",
       environment: "Code",
       input: { holdings: (snapshot.holdings || []).map((h) => h.symbol), windowStartHkt: hkt(input.fetchStartMs), windowEndHkt: hkt(input.runAtMs) },
-      action: "For each current holding, resolve marketDataSymbol, then fetch daily bars, latest 1min extended-hours bars, hourly bars, market news, price-target news, and earnings calendar. For option holdings, market data and per-ticker source lookup use the underlying equity, while the option contract remains the held symbol.",
+      action: "For each current holding, resolve marketDataSymbol, then fetch daily bars, latest 1min extended-hours bars, hourly bars, market news, price-target news, earnings calendar, and optional computed technical_event rows. For option holdings, market data and per-ticker source lookup use the underlying equity, while the option contract remains the held symbol.",
       output: {
         marketDataCoverage: dataFetchSummary.marketDataCoverage || [],
         perTickerSourceCounts: dataFetchSummary.rawEventSourceCounts || {},
@@ -4520,6 +4931,7 @@ function buildRunAudit(input) {
       const priceSignal = analyzePrice(holding.symbol, holding, dailyBars, hourlyBars, minuteBars, hourlyBars, marketDataSymbol);
       if (!priceSignal.available) priceFailures += 1;
       priceSignals.push(priceSignal);
+      rawEvents.push.apply(rawEvents, buildTechnicalEvents(holding, marketDataSymbol, dailyBars, hourlyBars, minuteBars, priceSignal, runAtMs));
       rawEvents.push.apply(rawEvents, await fetchNews(marketDataSymbol, fetchStartSec, fetchEndSec, warnings, holding.symbol));
       rawEvents.push.apply(rawEvents, await fetchPriceTargetNews(marketDataSymbol, fetchStartSec - 5 * 86400, fetchEndSec, warnings, holding.symbol));
       rawEvents.push.apply(rawEvents, await fetchEarnings(marketDataSymbol, fetchEndSec, warnings, holding.symbol));

@@ -66,6 +66,10 @@ Current production price / portfolio basis:
   regular-session cumulative volume up to the latest regular-session hourly
   bar, capped at the 16:00 ET market close after hours. Direct crypto assets
   use UTC-day cumulative volume.
+- Technical events are optional Event Lane source records generated from each
+  holding's OHLCV packet. When enabled, breakout/breakdown, support/resistance,
+  RSI, moving-average cross, and volume-confirmed price move signals enter
+  `rawEvents[]` as `technical_event`; when disabled, they are omitted.
 - Portfolio valuation uses connected-account quantity and cash, then computes
   current value from Arrays latest 1min price when available. Broker current price,
   market value, cost basis, realized P&L, and unrealized P&L are not used or
