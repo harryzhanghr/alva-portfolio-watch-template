@@ -3677,7 +3677,6 @@ async function fetchBreakingNews(snapshot, currentThemes, fetchStartMs, runAtMs,
         tools,
         thinkingLevel: "off",
       },
-      getApiKey: () => secret.loadPlaintext("openai"),
     });
     const prompt = [
       "Objective-centric market and theme discovery context:",
