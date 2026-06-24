@@ -1,0 +1,4 @@
+{
+  "positionCompleteness": "ticker_only",
+  "tickers": ["TICKER_A", "TICKER_B"]
+}

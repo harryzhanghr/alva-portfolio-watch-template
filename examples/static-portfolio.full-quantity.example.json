@@ -1,0 +1,12 @@
+{
+  "positionCompleteness": "full_quantity",
+  "cash": 0,
+  "holdings": [
+    {
+      "symbol": "TICKER_A",
+      "quantity": 0,
+      "side": "LONG",
+      "currency": "USD"
+    }
+  ]
+}

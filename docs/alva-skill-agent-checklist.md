@@ -4,8 +4,12 @@ Use this checklist when adapting the template for a new user's Alva account.
 
 ## Required Before Creation
 
-- Confirm the user has a connected portfolio account in Alva.
-- Obtain the connected account id.
+- Choose portfolio mode:
+  - `dynamic`: confirm the user has a connected portfolio account in Alva and
+    obtain the connected account id.
+  - `static`: create or confirm an ALFS static portfolio JSON file.
+- Choose position completeness: `full_quantity` or `ticker_only`.
+  Dynamic portfolios are `full_quantity`; static portfolios can be either.
 - Choose a feed name, usually `portfolio-watch-automation`.
 - Choose or confirm the Alva owner username for audit data paths.
 - Decide whether notification delivery should be enabled immediately or only
@@ -14,7 +18,10 @@ Use this checklist when adapting the template for a new user's Alva account.
 ## Runtime Args To Set
 
 - `feedName`
+- `portfolioMode`
+- `positionCompleteness`
 - `accountId` or `connectedAccountId`
+- `staticPortfolioPath` when `portfolioMode=static`
 - `ownerUsername`
 - `runSource`
 - optional `aliases`
@@ -43,7 +50,12 @@ After the first run, inspect:
 The run is healthy if:
 
 - portfolio ingest returns holdings;
-- positions use connected quantity and Arrays current price when available;
+- dynamic mode pulls the connected snapshot, or static mode reads the configured
+  ALFS portfolio file;
+- `full_quantity` positions use source quantity and Arrays current price when
+  available;
+- `ticker_only` runs keep quantity, market value, weight, NAV, and exposure
+  percentages unavailable rather than estimating them;
 - raw events and event candidates are persisted;
 - computed anomalies create per-asset anomaly attribution packets when anomaly
   triggers exist;

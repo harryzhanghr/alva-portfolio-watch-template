@@ -2,19 +2,20 @@
 
 Open-source template for creating a low-noise portfolio watch automation on Alva.
 
-The automation is not a daily news digest. It monitors a user's connected
+The automation is not a daily news digest. It monitors a user's configured
 portfolio, looks for material events or unusual held-asset moves, attributes
 those moves when possible, and only pushes when the user is likely to be glad
-they were interrupted.
+they were interrupted. The portfolio can be a dynamic connected snapshot or a
+static portfolio file maintained during setup.
 
 ## What Is Included
 
 - `src/portfolio-watch-automation.js`  
-  Production-style Alva automation source. It reads a connected portfolio,
-  fetches market/event data, computes price and volume anomalies, runs Pi event
-  search, runs one Alva Ask anomaly-attribution agent per computed anomalous
-  asset, runs final Alva Ask analyst review, persists audit artifacts, and
-  writes a notification sidecar.
+  Production-style Alva automation source. It reads either a dynamic connected
+  portfolio or a static portfolio file, fetches market/event data, computes
+  price and volume anomalies, runs Pi event search, runs one Alva Ask
+  anomaly-attribution agent per computed anomalous asset, runs final Alva Ask
+  analyst review, persists audit artifacts, and writes a notification sidecar.
 - `playbooks/audit-log/index.html`  
   A reusable audit playbook UI for inspecting official cron runs, raw events,
   event candidates, qualified event assessments, computed anomalies,
@@ -40,16 +41,22 @@ Portfolio Watch on Alva.
 
 ### Goal
 
-Create one private Alva automation and one audit playbook for a user who already
-has a connected portfolio account in Alva. The result should be user-specific,
-but this repo must remain generic: do not hardcode the template author's
-username, account id, holdings, feed id, cron id, aliases, themes, or run logs.
+Create one private Alva automation and one audit playbook for a user's own
+portfolio setup. The result should be user-specific, but this repo must remain
+generic: do not hardcode the template author's username, account id, holdings,
+feed id, cron id, aliases, themes, or run logs.
 
 ### Required User Inputs
 
 Ask for or infer these from Alva workspace state:
 
-- `accountId` or `connectedAccountId`: the user's connected portfolio account id.
+- `portfolioMode`: `dynamic` or `static`.
+- For `dynamic`: `accountId` or `connectedAccountId`, the user's connected
+  portfolio account id.
+- For `static`: `staticPortfolioPath`, an ALFS JSON file that contains
+  `holdings[]` or `tickers[]`.
+- `positionCompleteness`: `full_quantity` or `ticker_only`. Dynamic portfolios
+  are always `full_quantity`. Static portfolios can be either.
 - `ownerUsername`: the Alva username that owns the feed.
 - `feedName`: desired feed name. Default recommendation:
   `portfolio-watch-automation`.
@@ -65,6 +72,8 @@ Pass these through `env.args` when creating the automation:
 ```json
 {
   "feedName": "portfolio-watch-automation",
+  "portfolioMode": "dynamic",
+  "positionCompleteness": "full_quantity",
   "accountId": "<CONNECTED_ACCOUNT_ID>",
   "ownerUsername": "<ALVA_USERNAME>",
   "runSource": "cron_push_pipeline",
@@ -77,13 +86,30 @@ Pass these through `env.args` when creating the automation:
 }
 ```
 
-The source intentionally fails fast if `accountId` / `connectedAccountId` is
-missing.
+Static ticker-only example:
+
+```json
+{
+  "feedName": "portfolio-watch-automation",
+  "portfolioMode": "static",
+  "positionCompleteness": "ticker_only",
+  "staticPortfolioPath": "~/portfolio-watch/static-portfolio.json",
+  "ownerUsername": "<ALVA_USERNAME>",
+  "runSource": "cron_push_pipeline"
+}
+```
+
+The source intentionally fails fast if the configured source is missing:
+dynamic mode requires `accountId` / `connectedAccountId`; static mode requires
+`staticPortfolioPath`.
 
 ### Creation Steps
 
 1. Copy `src/portfolio-watch-automation.js` into an Alva automation.
-2. Set `env.args.feedName`, `env.args.accountId`, and `env.args.ownerUsername`.
+2. Set `env.args.feedName`, `env.args.portfolioMode`,
+   `env.args.positionCompleteness`, and the matching source field
+   (`accountId` / `connectedAccountId` for dynamic, `staticPortfolioPath` for
+   static).
 3. Schedule the automation hourly, for example `0 * * * *`.
 4. Create or update an audit playbook from `playbooks/audit-log/index.html`.
 5. Configure the audit playbook by editing constants or opening with query
@@ -102,10 +128,18 @@ missing.
 ### Non-Negotiable Implementation Rules
 
 - Portfolio ingest is deterministic code, not an Alva Ask call.
+- Dynamic mode pulls the connected portfolio snapshot each run.
+- Static mode reads the configured static portfolio file each run; holdings
+  stay unchanged until setup/update writes a new file.
+- `full_quantity` portfolios can compute market value, weights, NAV deltas, and
+  exposure percentages when market data coverage exists.
+- `ticker_only` portfolios can monitor held tickers, themes, price/volume
+  anomalies, event mapping, and related-holding logic, but must not invent
+  position weights, market value, NAV, or exposure percentages.
 - Broker current price, broker market value, cost basis, realized P&L, and
   unrealized P&L must not be used as portfolio context in this version.
-- Portfolio valuation uses connected-account quantity and cash plus Arrays
-  latest 1min price when available.
+- Portfolio valuation uses source quantity and cash plus Arrays latest 1min
+  price when `full_quantity` is available.
 - Price anomaly uses latest 1min extended-hours price vs previous regular close
   when 1min coverage exists.
 - Volume anomaly uses hourly cumulative volume versus historical same-time
@@ -163,8 +197,10 @@ a meaningful anomaly attribution.
 
 ## High-Level Workflow
 
-1. Read connected portfolio positions and cash.
-2. Drop broker prices, broker market values, cost basis, and P&L.
+1. Read the configured portfolio source: dynamic connected snapshot or static
+   ALFS portfolio file.
+2. Normalize tickers and, when available, quantity/cash. Drop source prices,
+   market values, cost basis, and P&L.
 3. Fetch Arrays latest 1min, hourly, and daily bars for current holdings or
    option underlyings.
 4. Mark holdings to Arrays latest price where coverage exists.
