@@ -7,6 +7,7 @@ const env = require("env");
 
 const ARGS = (env && env.args) || {};
 const TECHNICAL_EVENT_ARGS = ARGS.technicalEvents && typeof ARGS.technicalEvents === "object" ? ARGS.technicalEvents : {};
+const RATE_REPRICING_EVENT_ARGS = ARGS.rateRepricingEvents && typeof ARGS.rateRepricingEvents === "object" ? ARGS.rateRepricingEvents : {};
 const DEFAULT_TECHNICAL_EVENT_DETECTORS = ["breakout", "support_resistance", "rsi", "ma_cross", "volume_price"];
 const TECHNICAL_SEVERITY_RANK = { low: 1, medium: 2, high: 3 };
 const FEED_NAME = ARGS.feedName || "portfolio-watch-automation";
@@ -80,6 +81,10 @@ const CONFIG = {
     volumePriceMovePct: numericArg(TECHNICAL_EVENT_ARGS.volumePriceMovePct, 3),
     maxEventsPerHolding: numericArg(TECHNICAL_EVENT_ARGS.maxEventsPerHolding, 6),
   },
+  rateRepricingEvents: {
+    enabled: parseBoolArg(ARGS.rateRepricingEventsEnabled !== undefined ? ARGS.rateRepricingEventsEnabled : RATE_REPRICING_EVENT_ARGS.enabled, true),
+    probabilityChangeThresholdPct: numericArg(ARGS.rateRepricingProbabilityChangeThresholdPct !== undefined ? ARGS.rateRepricingProbabilityChangeThresholdPct : RATE_REPRICING_EVENT_ARGS.probabilityChangeThresholdPct, 10),
+  },
   materiality: {
     quantityEpsilon: 0.00001,
     positionMvMovePct: 0.03,
@@ -103,6 +108,12 @@ const CONFIG = {
   fallbackThemeMap: ARGS.fallbackThemeMap || {},
   aliases: ARGS.aliases || {},
 };
+
+const RATE_REPRICING_LOOKBACK_HOURS = 24;
+const RATE_REPRICING_NEWS_LIMIT = 3;
+const RATE_REPRICING_DECISION_COUNT = 3;
+const POLYMARKET_GAMMA_BASE = "https://gamma-api.polymarket.com";
+const POLYMARKET_CLOB_BASE = "https://clob.polymarket.com";
 
 const SUPPORTED_MARKET_NEWS_TOPICS = [
   "BLOCKCHAIN",
@@ -466,6 +477,20 @@ function compactJson(value, maxLen) {
   return text;
 }
 
+function queryString(params) {
+  return Object.keys(params || {})
+    .filter((key) => params[key] !== undefined && params[key] !== null && params[key] !== "")
+    .reduce((pairs, key) => {
+      const value = params[key];
+      const values = Array.isArray(value) ? value : [value];
+      values
+        .filter((item) => item !== undefined && item !== null && item !== "")
+        .forEach((item) => pairs.push(encodeURIComponent(key) + "=" + encodeURIComponent(String(item))));
+      return pairs;
+    }, [])
+    .join("&");
+}
+
 function safeParseJson(text) {
   const raw = String(text || "").trim();
   if (!raw) return null;
@@ -527,6 +552,7 @@ function sourceOriginForType(sourceType) {
   if (type === "topic_news") return "arrays_topic_news";
   if (type === "asset_anomaly") return "asset_anomaly_signal";
   if (type === "technical_event") return "computed_technical_analysis";
+  if (type === "rate_repricing_event" || type === "rate_repricing_news") return "rate_repricing_lane";
   return "unknown";
 }
 
@@ -538,6 +564,7 @@ function sourceOriginLabel(sourceOrigin) {
   if (origin === "arrays_topic_news") return "Arrays topic news";
   if (origin === "asset_anomaly_signal") return "Asset anomaly signal";
   if (origin === "computed_technical_analysis") return "Technical analysis";
+  if (origin === "rate_repricing_lane") return "Rate repricing lane";
   return "Unknown source";
 }
 
@@ -870,6 +897,94 @@ function normalizeKey(text) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 120);
+}
+
+function isNewsLikeEvent(item) {
+  const type = String(item && item.sourceType || "").toLowerCase();
+  return {
+    news: true,
+    x_post: true,
+    breaking_news: true,
+    theme_news: true,
+    topic_news: true,
+    rate_repricing_news: true,
+  }[type] === true;
+}
+
+function canonicalEventUrl(item) {
+  const metadata = item && item.metadata ? item.metadata : {};
+  const links = []
+    .concat(item && item.url ? [item.url] : [])
+    .concat(Array.isArray(item && item.sourceLinks) ? item.sourceLinks : [])
+    .concat(Array.isArray(metadata.sourceLinks) ? metadata.sourceLinks : []);
+  for (const link of links) {
+    const text = String(link || "").trim();
+    if (!text) continue;
+    const cleaned = text
+      .replace(/#.*$/, "")
+      .replace(/\?.*$/, "")
+      .replace(/\/+$/, "");
+    const key = normalizeKey(cleaned);
+    if (key) return key;
+  }
+  return "";
+}
+
+function eventDayBucket(item, runAtMs) {
+  const metadata = item && item.metadata ? item.metadata : {};
+  const ms = Number.isFinite(item && item.publishedAtMs)
+    ? item.publishedAtMs
+    : parseSourceMs(metadata.sourceEventTime || metadata.sourceDate || metadata.publishedAt || "");
+  return String(Math.floor((Number.isFinite(ms) ? ms : (runAtMs || Date.now())) / 86400000));
+}
+
+function mergeUniqueStrings(a, b, maxLen) {
+  return uniqueCompactStrings([].concat(a || []).concat(b || []), maxLen || 240);
+}
+
+function mergeEventMetadata(existing, raw) {
+  const metadata = { ...((existing && existing.metadata) || {}) };
+  const incoming = (raw && raw.metadata) || {};
+  const rawOrigin = incoming.sourceOrigin || sourceOriginForType(raw && raw.sourceType);
+  metadata.sourceOrigins = mergeUniqueStrings(
+    []
+      .concat(metadata.sourceOrigins || [])
+      .concat(metadata.sourceOrigin ? [metadata.sourceOrigin] : []),
+    []
+      .concat(incoming.sourceOrigins || [])
+      .concat(rawOrigin ? [rawOrigin] : []),
+    120
+  );
+  metadata.sourceLanes = mergeUniqueStrings(
+    []
+      .concat(metadata.sourceLanes || [])
+      .concat(metadata.sourceLane ? [metadata.sourceLane] : []),
+    []
+      .concat(incoming.sourceLanes || [])
+      .concat(incoming.sourceLane ? [incoming.sourceLane] : []),
+    120
+  );
+  metadata.riskFactors = mergeUniqueStrings(metadata.riskFactors || [], incoming.riskFactors || [], 80);
+  metadata.themes = mergeUniqueStrings(metadata.themes || [], incoming.themes || [], 80);
+  metadata.affectedThemes = mergeUniqueStrings(metadata.affectedThemes || [], incoming.affectedThemes || [], 80);
+  metadata.sourceLinks = mergeUniqueStrings(
+    []
+      .concat(metadata.sourceLinks || [])
+      .concat(existing && existing.url ? [existing.url] : []),
+    []
+      .concat(incoming.sourceLinks || [])
+      .concat(raw && raw.sourceLinks ? raw.sourceLinks : [])
+      .concat(raw && raw.url ? [raw.url] : []),
+    500
+  );
+  if (incoming.rateRepricingSupport || String(raw && raw.sourceType || "").toLowerCase() === "rate_repricing_news") {
+    metadata.rateRepricingSupport = true;
+  }
+  if (incoming.supportingRateMoveEventIds || metadata.supportingRateMoveEventIds) {
+    metadata.supportingRateMoveEventIds = mergeUniqueStrings(metadata.supportingRateMoveEventIds || [], incoming.supportingRateMoveEventIds || [], 140);
+  }
+  if (!metadata.sourceOrigin && metadata.sourceOrigins.length) metadata.sourceOrigin = metadata.sourceOrigins[0];
+  return metadata;
 }
 
 function eventTerminologyText(value) {
@@ -1837,6 +1952,27 @@ async function optionalArrays(path, params, warnings, label) {
   }
 }
 
+async function externalJson(baseUrl, path, params, warnings, label) {
+  const query = queryString(params);
+  const url = baseUrl + path + (query ? "?" + query : "");
+  try {
+    const resp = await http.fetch(url, {
+      headers: {
+        "User-Agent": "AlvaPortfolioWatch/1.0",
+        Accept: "application/json",
+      },
+    });
+    const body = await resp.json();
+    if (!resp.ok) {
+      throw new Error("HTTP " + resp.status + " " + JSON.stringify(body).slice(0, 180));
+    }
+    return body;
+  } catch (err) {
+    warnings.push({ source: label || url, error: String(err && err.message ? err.message : err).slice(0, 260) });
+    return null;
+  }
+}
+
 function parseJsonObjectField(value) {
   if (!value) return {};
   if (typeof value === "object") return value;
@@ -1845,6 +1981,17 @@ function parseJsonObjectField(value) {
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch (_) {
     return {};
+  }
+}
+
+function parseJsonArrayField(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(String(value));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
   }
 }
 
@@ -2590,6 +2737,293 @@ async function fetchMacro(warnings) {
   out.rates = macroPoint("treasury_rates", "UST", (rates.data || [])[0] || null, fetchedAtMs);
   out._meta.items = macroFreshnessSummary(out);
   return out;
+}
+
+function polymarketEventUrl(item) {
+  const slug = item && (item.slug || item.eventSlug);
+  return slug ? "https://polymarket.com/event/" + slug : "https://polymarket.com";
+}
+
+function polymarketMarketUrl(item) {
+  const slug = item && item.slug;
+  return slug ? "https://polymarket.com/market/" + slug : polymarketEventUrl(item);
+}
+
+function yesOutcomeSnapshot(market) {
+  const outcomes = parseJsonArrayField(market && market.outcomes);
+  const prices = parseJsonArrayField(market && market.outcomePrices);
+  const tokenIds = parseJsonArrayField(market && market.clobTokenIds);
+  const yesIdx = outcomes.map((row) => String(row || "").toLowerCase()).indexOf("yes");
+  const idx = yesIdx >= 0 ? yesIdx : 0;
+  const probability = amount(prices[idx]);
+  const tokenId = tokenIds[idx] ? String(tokenIds[idx]) : "";
+  return {
+    outcome: outcomes[idx] || "Yes",
+    probability,
+    tokenId,
+  };
+}
+
+function closestHistoryPoint(history, targetSec) {
+  let best = null;
+  let bestDistance = Infinity;
+  (history || []).forEach((point) => {
+    const t = Number(point && point.t);
+    const p = amount(point && point.p);
+    if (!Number.isFinite(t) || !Number.isFinite(p)) return;
+    const distance = Math.abs(t - targetSec);
+    if (distance < bestDistance) {
+      best = { t, p };
+      bestDistance = distance;
+    }
+  });
+  return best;
+}
+
+function rateDecisionEndMs(event) {
+  const direct = parseSourceMs(event && event.endDate);
+  if (Number.isFinite(direct)) return direct;
+  const markets = Array.isArray(event && event.markets) ? event.markets : [];
+  const times = markets.map((market) => parseSourceMs(market && market.endDate)).filter(Number.isFinite);
+  return times.length ? Math.min.apply(null, times) : null;
+}
+
+function isFedDecisionEvent(event) {
+  const title = String((event && (event.title || event.question)) || "");
+  return /fed decision/i.test(title);
+}
+
+function isFedDecisionMarket(market) {
+  const q = String((market && market.question) || "").toLowerCase();
+  return q.indexOf("fed") >= 0 && (
+    q.indexOf("interest rates") >= 0 ||
+    q.indexOf("increase") >= 0 ||
+    q.indexOf("decrease") >= 0 ||
+    q.indexOf("no change") >= 0
+  );
+}
+
+function rateMoveLabel(question) {
+  const text = String(question || "");
+  const lower = text.toLowerCase();
+  const bpsMatch = text.match(/([0-9]+)\s*\+?\s*bps/i);
+  const bps = bpsMatch ? bpsMatch[1] + " bps " : "";
+  if (lower.indexOf("no change") >= 0) return "no-change";
+  if (lower.indexOf("increase") >= 0 || lower.indexOf("hike") >= 0) return bps + "hike";
+  if (lower.indexOf("decrease") >= 0 || lower.indexOf("cut") >= 0) return bps + "cut";
+  return clean(text.replace(/^will\s+/i, "").replace(/\?$/, ""), 80);
+}
+
+function fmtProbabilityPct(value) {
+  return Number.isFinite(value) ? (value * 100).toFixed(1) + "%" : "n/a";
+}
+
+function fmtPp(value) {
+  if (!Number.isFinite(value)) return "n/a";
+  return (value >= 0 ? "+" : "") + value.toFixed(1) + "pp";
+}
+
+function compactRateMarket(event, market, current, previousPoint) {
+  const currentProbability = current.probability;
+  const previousProbability = previousPoint && Number.isFinite(previousPoint.p) ? previousPoint.p : null;
+  const deltaPct = Number.isFinite(currentProbability) && Number.isFinite(previousProbability)
+    ? round((currentProbability - previousProbability) * 100, 2)
+    : null;
+  return {
+    eventTitle: clean(event && event.title || "", 140),
+    eventSlug: event && event.slug || "",
+    marketId: String(market && market.id || ""),
+    conditionId: String(market && market.conditionId || ""),
+    question: clean(market && market.question || "", 180),
+    label: rateMoveLabel(market && market.question),
+    outcome: current.outcome,
+    currentProbability,
+    currentProbabilityPct: Number.isFinite(currentProbability) ? round(currentProbability * 100, 2) : null,
+    previousProbability,
+    previousProbabilityPct: Number.isFinite(previousProbability) ? round(previousProbability * 100, 2) : null,
+    probabilityChangePct: deltaPct,
+    previousPointHkt: previousPoint && previousPoint.t ? hkt(previousPoint.t * 1000) : "",
+    volume: amount((market && (market.volumeNum !== undefined ? market.volumeNum : market.volume)) || null),
+    volume24hr: amount(market && market.volume24hr),
+    volume1wk: amount(market && market.volume1wk),
+    liquidity: amount((market && (market.liquidityNum !== undefined ? market.liquidityNum : market.liquidity)) || null),
+    openInterest: amount((market && market.openInterest) || (event && event.openInterest)),
+    url: polymarketMarketUrl(market),
+  };
+}
+
+async function fetchPolymarketRateDecisionEvents(runAtMs, warnings) {
+  const searchQueries = ["Fed Decision interest rates", "Fed interest rates 2026"];
+  const eventByKey = {};
+  for (const q of searchQueries) {
+    const body = await externalJson(POLYMARKET_GAMMA_BASE, "/public-search", {
+      q,
+      limit_per_type: 12,
+      events_status: "active",
+      keep_closed_markets: 0,
+    }, warnings, "rate-repricing-polymarket-search:" + q);
+    ((body && body.events) || []).forEach((event) => {
+      const key = event && (event.id || event.slug || event.ticker || event.title);
+      if (key) eventByKey[key] = event;
+    });
+  }
+  const events = Object.keys(eventByKey).map((key) => eventByKey[key])
+    .filter(isFedDecisionEvent)
+    .map((event) => ({ event, endMs: rateDecisionEndMs(event) }))
+    .filter((row) => Number.isFinite(row.endMs) && row.endMs > runAtMs - 3600000)
+    .sort((a, b) => a.endMs - b.endMs)
+    .slice(0, RATE_REPRICING_DECISION_COUNT)
+    .map((row) => row.event);
+  const targetSec = Math.floor((runAtMs - RATE_REPRICING_LOOKBACK_HOURS * 3600000) / 1000);
+  const marketRows = [];
+  for (const event of events) {
+    const markets = (Array.isArray(event.markets) ? event.markets : [])
+      .filter(isFedDecisionMarket);
+    for (const market of markets) {
+      const current = yesOutcomeSnapshot(market);
+      if (!current.tokenId || !Number.isFinite(current.probability)) continue;
+      const historyBody = await externalJson(POLYMARKET_CLOB_BASE, "/prices-history", {
+        market: current.tokenId,
+        interval: "1d",
+        fidelity: 60,
+      }, warnings, "rate-repricing-polymarket-history:" + (market.id || current.tokenId));
+      const previousPoint = closestHistoryPoint((historyBody && historyBody.history) || [], targetSec);
+      marketRows.push(compactRateMarket(event, market, current, previousPoint));
+    }
+  }
+  return { events, marketRows };
+}
+
+function buildRateRepricingComputedEvents(rateData, runAtMs) {
+  const threshold = CONFIG.rateRepricingEvents.probabilityChangeThresholdPct;
+  const grouped = {};
+  (rateData.marketRows || []).forEach((row) => {
+    if (!Number.isFinite(row.probabilityChangePct) || Math.abs(row.probabilityChangePct) < threshold) return;
+    const key = row.eventSlug || row.eventTitle || "fed-decision";
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(row);
+  });
+  return Object.keys(grouped).map((key) => {
+    const rows = grouped[key].slice().sort((a, b) => Math.abs(b.probabilityChangePct || 0) - Math.abs(a.probabilityChangePct || 0));
+    const top = rows[0] || {};
+    const eventTitle = top.eventTitle || "Fed decision";
+    const moveText = rows.slice(0, 4).map((row) => (
+      row.label + " " + fmtPp(row.probabilityChangePct) + " to " + fmtProbabilityPct(row.currentProbability)
+    )).join("; ");
+    const volumeText = rows.slice(0, 3).map((row) => (
+      row.label + " volume $" + Math.round(row.volume || 0).toLocaleString("en-US") +
+      ", 24h $" + Math.round(row.volume24hr || 0).toLocaleString("en-US") +
+      ", liquidity $" + Math.round(row.liquidity || 0).toLocaleString("en-US")
+    )).join("; ");
+    return {
+      sourceType: "rate_repricing_event",
+      sourceRecordId: "polymarket-rate-repricing-" + normalizeKey(key),
+      symbol: "PORTFOLIO",
+      title: eventTitle.replace(/\?$/, "") + " odds repriced: " + top.label + " " + fmtPp(top.probabilityChangePct),
+      summary: "Polymarket-implied Fed decision probabilities changed over the last " + RATE_REPRICING_LOOKBACK_HOURS + " hours: " + moveText + ". Market depth context: " + volumeText + ".",
+      source: "Polymarket",
+      url: polymarketEventUrl({ slug: top.eventSlug }),
+      sourceLinks: [polymarketEventUrl({ slug: top.eventSlug })],
+      affectedThemes: ["rates", "policy-path", "liquidity", "risk-appetite"],
+      publishedAtMs: runAtMs,
+      metadata: {
+        sourceOrigin: "rate_repricing_lane",
+        sourceLane: "rate_repricing",
+        sourceSearchMode: "polymarket_next_three_fed_decisions_24h_delta",
+        riskFactors: ["rates", "policy-path", "liquidity", "risk-appetite", "valuation-multiple"],
+        portfolioRelevanceBasis: "Market-implied Fed path repricing can affect a long-duration, AI/tech, crypto, and broad risk-asset portfolio through discount rates, liquidity, risk appetite, and valuation multiples.",
+        rateRepricingSupport: true,
+        lookbackHours: RATE_REPRICING_LOOKBACK_HOURS,
+        probabilityChangeThresholdPct: threshold,
+        decisionMarketCount: RATE_REPRICING_DECISION_COUNT,
+        materialMoves: rows,
+        allDecisionMarkets: (rateData.marketRows || []).filter((row) => row.eventSlug === top.eventSlug),
+      },
+    };
+  });
+}
+
+async function fetchRateRepricingNews(rateEvents, runAtMs, warnings) {
+  if (!rateEvents.length) return [];
+  try {
+    const { searchBrave } = require("@arrays/data/search/search-brave:v1.0.0");
+    const top = rateEvents[0];
+    const query = [
+      "Fed rate expectations prediction markets",
+      "rate hike odds",
+      "market pricing",
+      "why changed today",
+      clean(top.title || "", 80),
+    ].filter(Boolean).join(" ");
+    const result = await searchBrave({
+      query,
+      result_filter: "news",
+      freshness: "pd",
+      count: RATE_REPRICING_NEWS_LIMIT,
+    });
+    return ((((result || {}).response || {}).data || []).slice(0, RATE_REPRICING_NEWS_LIMIT).map((row, idx) => {
+      const publishedAtMs = parseSourceMs(row.date || row.published_at || row.age || "") || runAtMs;
+      return {
+        sourceType: "rate_repricing_news",
+        sourceRecordId: row.url || row.title || ("rate-repricing-news-" + idx),
+        symbol: "PORTFOLIO",
+        title: clean(row.title || "", 240),
+        summary: clean(row.description || row.title || "", 700),
+        source: row.source || row.source_domain || "Brave News",
+        url: row.url || "",
+        sourceLinks: row.url ? [row.url] : [],
+        affectedThemes: ["rates", "policy-path", "liquidity", "risk-appetite"],
+        publishedAtMs,
+        metadata: {
+          sourceOrigin: "rate_repricing_lane",
+          sourceLane: "rate_repricing_news",
+          sourceSearchMode: "brave_news_after_prediction_market_delta",
+          sourceLinks: row.url ? [row.url] : [],
+          riskFactors: ["rates", "policy-path", "liquidity", "risk-appetite", "valuation-multiple"],
+          portfolioRelevanceBasis: "Market commentary explaining a material prediction-market Fed path repricing.",
+          rateRepricingSupport: true,
+          supportingRateMoveEventIds: rateEvents.map((event) => event.sourceRecordId || event.title).filter(Boolean),
+          searchQuery: query,
+          sourceDate: row.date || row.age || "",
+        },
+      };
+    })).filter((row) => row.title || row.url);
+  } catch (err) {
+    warnings.push({ source: "rate-repricing-news-search", error: String(err && err.message ? err.message : err).slice(0, 260) });
+    return [];
+  }
+}
+
+async function fetchRateRepricingEvents(runAtMs, warnings) {
+  const summary = {
+    enabled: CONFIG.rateRepricingEvents.enabled,
+    source: "Polymarket",
+    lookbackHours: RATE_REPRICING_LOOKBACK_HOURS,
+    decisionMarketCount: RATE_REPRICING_DECISION_COUNT,
+    probabilityChangeThresholdPct: CONFIG.rateRepricingEvents.probabilityChangeThresholdPct,
+    checkedMarkets: 0,
+    materialMoveCount: 0,
+    computedEventCount: 0,
+    newsEventCount: 0,
+    marketRows: [],
+    error: "",
+  };
+  if (!CONFIG.rateRepricingEvents.enabled) return { records: [], summary };
+  try {
+    const rateData = await fetchPolymarketRateDecisionEvents(runAtMs, warnings);
+    summary.marketRows = (rateData.marketRows || []).slice(0, 24);
+    summary.checkedMarkets = (rateData.marketRows || []).length;
+    const computedEvents = buildRateRepricingComputedEvents(rateData, runAtMs);
+    const newsEvents = await fetchRateRepricingNews(computedEvents, runAtMs, warnings);
+    summary.materialMoveCount = computedEvents.reduce((acc, event) => acc + (((event.metadata || {}).materialMoves || []).length), 0);
+    summary.computedEventCount = computedEvents.length;
+    summary.newsEventCount = newsEvents.length;
+    return { records: computedEvents.concat(newsEvents), summary };
+  } catch (err) {
+    summary.error = String(err && err.message ? err.message : err).slice(0, 260);
+    warnings.push({ source: "rate-repricing-lane", error: summary.error });
+    return { records: [], summary };
+  }
 }
 
 function isoDateOnly(ms) {
@@ -3359,7 +3793,7 @@ function holdingsForTheme(snapshot, theme) {
     .sort((a, b) => (b.allocation || 0) - (a.allocation || 0));
 }
 
-function eventKey(item, runAtMs) {
+function legacyEventKey(item, runAtMs) {
   const symbols = rawAffectedSymbols(item);
   const subject = symbols.length > 1 || String(item.symbol || "").toUpperCase() === "PORTFOLIO"
     ? "multi"
@@ -3369,22 +3803,41 @@ function eventKey(item, runAtMs) {
   return [item.sourceType, subject, normalizeKey(item.title), String(Math.floor((item.publishedAtMs || runAtMs || Date.now()) / 86400000))].join(":");
 }
 
+function eventKey(item, runAtMs) {
+  if (isNewsLikeEvent(item)) {
+    const urlKey = canonicalEventUrl(item);
+    if (urlKey) return ["news-url", urlKey].join(":");
+    const titleKey = normalizeKey(item && item.title);
+    if (titleKey) return ["news-title", titleKey, eventDayBucket(item, runAtMs)].join(":");
+  }
+  return legacyEventKey(item, runAtMs);
+}
+
 function normalizeEvent(rawItems, previousIndex, runAtMs) {
   const seenThisRun = {};
   const index = previousIndex && typeof previousIndex === "object" ? previousIndex : {};
   const records = [];
   rawItems.forEach((raw) => {
     const key = eventKey(raw, runAtMs);
-    const prior = index[key];
+    const legacyKey = legacyEventKey(raw, runAtMs);
+    const prior = index[key] || index[legacyKey];
     const rawPublishedAtMs = Number.isFinite(raw.publishedAtMs) ? raw.publishedAtMs : null;
     let status = "new";
-    if (seenThisRun[key]) status = "duplicate";
-    else if (prior) {
+    if (seenThisRun[key] !== undefined) {
+      const existing = records[seenThisRun[key]];
+      if (existing) {
+        existing.metadata = mergeEventMetadata(existing, raw);
+        existing.sourceLinks = mergeUniqueStrings(existing.sourceLinks || [], raw.sourceLinks || (raw.url ? [raw.url] : []), 500);
+        existing.affectedThemes = uniqueCompactStrings((existing.affectedThemes || []).concat(rawAffectedThemes(raw)), 80).map(normalizeThemeName).filter(Boolean);
+        existing.mappingReason = existing.mappingReason || raw.mappingReason || (raw.metadata && raw.metadata.mappingReason) || "";
+      }
+      return;
+    } else if (prior) {
       const oldHash = prior.textHash || "";
       const nextHash = normalizeKey((raw.title || "") + " " + (raw.summary || ""));
       status = oldHash && oldHash !== nextHash ? "updated" : "seen_before";
     }
-    seenThisRun[key] = true;
+    seenThisRun[key] = records.length;
     const firstSeenAtMs = prior && prior.firstSeenAtMs ? prior.firstSeenAtMs : runAtMs;
     const textHash = normalizeKey((raw.title || "") + " " + (raw.summary || ""));
     index[key] = {
@@ -3400,7 +3853,7 @@ function normalizeEvent(rawItems, previousIndex, runAtMs) {
       lastSeenAtMs: runAtMs,
       seenCount: (prior && prior.seenCount ? prior.seenCount : 0) + 1,
     };
-    records.push({
+    const record = {
       eventKey: key,
       sourceType: raw.sourceType || "",
       symbol: raw.symbol || "",
@@ -3418,7 +3871,9 @@ function normalizeEvent(rawItems, previousIndex, runAtMs) {
       firstSeenAtMs,
       lastSeenAtMs: runAtMs,
       runAtMs,
-    });
+    };
+    record.metadata = mergeEventMetadata(record, raw);
+    records.push(record);
   });
   const keys = Object.keys(index).sort((a, b) => (index[b].lastSeenAtMs || 0) - (index[a].lastSeenAtMs || 0));
   const capped = {};
@@ -3975,6 +4430,7 @@ function buildAnalystPrompt(input) {
     "- Novelty includes the user-facing message, not just the event/source. If prior alerts already explained the same exposure map, risk bucket, affected holdings, or generic framing, treat that as already-known context and only surface the new delta.",
     "- A repeated narrative is pushable only if there is genuinely new information, higher urgency, changed uncertainty, or stronger attribution.",
     "- A major macro, geopolitical, regulatory, war/peace, FOMC, CPI, jobs, sanctions, export-control, credit/liquidity, market-structure, or very large company event can be selected even without a clear surprise versus expectations, if it materially changes portfolio risk context.",
+    "- Treat major rate-change or rate-expectation repricing as highly important portfolio-level information. If a rate hike, rate cut, Fed path, or market-implied probability change is material and relevant to current holdings, avoid suppressing it merely because it is broad macro or not tied to one company.",
     "- Source records may be new, updated, or seen_before; seen_before is context, not an automatic decision.",
     "- For known upcoming catalysts, avoid hourly repeats. One setup alert is enough unless timing is now closer, expectations changed, positioning/price/volume changed, or new evidence changes what the investor should watch.",
     "- For indexed-X breaking_news records, publishedAtMs/sourceTimeLabel should reflect the X post freshness when Pi returned it, while metadata.sourceEventTime/sourceEventAtMs is the original/official or earliest credible source time. Compare them; if the X post is fresh but sourceEventTime is old, treat it as resurfaced/newly discussed unless there is clear new information or new market reaction.",
@@ -4539,6 +4995,7 @@ function buildRunAudit(input) {
     marketDataCoverage: input.marketDataCoverage || [],
     themeExtractionSummary: input.themeExtractionSummary || {},
     breakingNewsSummary: input.breakingNewsSummary || {},
+    rateRepricingSummary: input.rateRepricingSummary || {},
     themeNewsSummary: input.themeNewsSummary || {},
     rawEventCount: rawEvents.length,
     rawEventSourceCounts: sourceCounts,
@@ -4617,6 +5074,24 @@ function buildRunAudit(input) {
       parsedEventCount: input.breakingNewsSummary ? input.breakingNewsSummary.parsedEventCount : 0,
       rawEventRecords: input.breakingNewsSummary ? input.breakingNewsSummary.rawEventRecords : 0,
       error: input.breakingNewsSummary ? input.breakingNewsSummary.error : "",
+    },
+    rateRepricing: {
+      environment: input.rateRepricingSummary && input.rateRepricingSummary.enabled ? "Code + Polymarket + Brave" : "disabled",
+      call: input.rateRepricingSummary && input.rateRepricingSummary.enabled
+        ? "fetchRateRepricingEvents(runAtMs)"
+        : "skipped",
+      toolLoop: false,
+      browsing: true,
+      source: input.rateRepricingSummary ? input.rateRepricingSummary.source : "",
+      lookbackHours: input.rateRepricingSummary ? input.rateRepricingSummary.lookbackHours : RATE_REPRICING_LOOKBACK_HOURS,
+      decisionMarketCount: input.rateRepricingSummary ? input.rateRepricingSummary.decisionMarketCount : RATE_REPRICING_DECISION_COUNT,
+      probabilityChangeThresholdPct: input.rateRepricingSummary ? input.rateRepricingSummary.probabilityChangeThresholdPct : CONFIG.rateRepricingEvents.probabilityChangeThresholdPct,
+      checkedMarkets: input.rateRepricingSummary ? input.rateRepricingSummary.checkedMarkets : 0,
+      materialMoveCount: input.rateRepricingSummary ? input.rateRepricingSummary.materialMoveCount : 0,
+      computedEventCount: input.rateRepricingSummary ? input.rateRepricingSummary.computedEventCount : 0,
+      newsEventCount: input.rateRepricingSummary ? input.rateRepricingSummary.newsEventCount : 0,
+      marketRows: input.rateRepricingSummary ? input.rateRepricingSummary.marketRows : [],
+      error: input.rateRepricingSummary ? input.rateRepricingSummary.error : "",
     },
     themeNews: {
 	      environment: input.themeNewsSummary && input.themeNewsSummary.agentCalled ? "Pi Agent" : "not_called_or_failed",
@@ -4753,10 +5228,11 @@ function buildRunAudit(input) {
         windowEndHkt: hkt(input.runAtMs),
         themeCount: (input.currentThemes || []).length,
       },
-      action: "Fetch timestamped macro context and recent Arrays indexed X top-engagement tweets in code, then run one objective-centric Pi event-search agent. Pi judges supplied hot tweets for investment-related breaking-news eligibility, uses Brave source expansion only for qualifying indexed-X anchors, maps current themes to supported Arrays market-news topics, calls searchArraysMarketNewsTopic inside the Pi loop, and returns holding-linked events or portfolio-level risk-factor events. Code then normalizes all raw event records and applies event dedupe status.",
+      action: "Fetch timestamped macro context, check Polymarket-implied Fed decision probability changes for the next three meetings, and fetch recent Arrays indexed X top-engagement tweets in code. Then run one objective-centric Pi event-search agent. Pi judges supplied hot tweets for investment-related breaking-news eligibility, uses Brave source expansion only for qualifying indexed-X anchors, maps current themes to supported Arrays market-news topics, calls searchArraysMarketNewsTopic inside the Pi loop, and returns holding-linked events or portfolio-level risk-factor events. Code then normalizes all raw event records and applies event dedupe status.",
       output: {
         macroFreshness: dataFetchSummary.macroFreshness || [],
         breakingNewsSummary: dataFetchSummary.breakingNewsSummary || {},
+        rateRepricingSummary: dataFetchSummary.rateRepricingSummary || {},
         themeNewsSummary: dataFetchSummary.themeNewsSummary || {},
         normalizedEventCount: dataFetchSummary.normalizedEventCount || rawEvents.length,
         eventDedupeCounts: eventStatusCounts,
@@ -4768,7 +5244,7 @@ function buildRunAudit(input) {
       node: "Event-candidate build",
       environment: "Code",
       input: { previousSnapshot: !!input.previous, rawEventCount: rawEvents.length },
-      action: "Compute portfolio delta and dynamic theme exposure for analyst context, dedupe event records, and build event_candidates from all non-duplicate source records, including portfolio-level macro/policy/risk events that do not name a specific holding. Broad market/theme/topic events remain one event object with affectedSymbols[] and affectedThemes[] instead of being duplicated per holding.",
+      action: "Compute portfolio delta and dynamic theme exposure for analyst context, dedupe event records, and build event_candidates from all non-duplicate source records, including portfolio-level macro/policy/risk/rate-repricing events that do not name a specific holding. Broad market/theme/topic events remain one event object with affectedSymbols[] and affectedThemes[] instead of being duplicated per holding.",
       output: {
         portfolioDelta: delta,
         themeExposure: input.currentThemes || [],
@@ -4947,6 +5423,8 @@ function buildRunAudit(input) {
     const previousThemes = previous ? themeExposure(previous) : [];
 
     const macro = await fetchMacro(warnings);
+    const rateRepricing = await fetchRateRepricingEvents(runAtMs, warnings);
+    rawEvents.push.apply(rawEvents, rateRepricing.records);
     const breakingNews = await fetchBreakingNews(snapshot, currentThemes, fetchStartMs, runAtMs, warnings);
     rawEvents.push.apply(rawEvents, breakingNews.records);
     if (previous && !priceSignalSchemaCompatible(previousPriceSignals)) {
@@ -5034,6 +5512,8 @@ function buildRunAudit(input) {
           totalReviewItems: reviewItemCount,
           eventRecords: analystInput.event_records.length,
           priorAlertHistoryRows: analystInput.prior_alert_history.length,
+          rateRepricingComputedEvents: (rateRepricing.summary && rateRepricing.summary.computedEventCount) || 0,
+          rateRepricingNewsEvents: (rateRepricing.summary && rateRepricing.summary.newsEventCount) || 0,
         },
         caps: {
           eventRecords: CONFIG.maxPromptEvents,
@@ -5240,6 +5720,7 @@ function buildRunAudit(input) {
       marketDataCoverage,
       themeExtractionSummary: snapshot.themeExtractionSummary || {},
       breakingNewsSummary: breakingNews.summary,
+      rateRepricingSummary: rateRepricing.summary,
       themeNewsSummary: breakingNews.summary.themeNewsSummary,
       rawEvents,
       normalizedEvent,

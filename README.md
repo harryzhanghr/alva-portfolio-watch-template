@@ -114,6 +114,8 @@ missing.
   code, not from per-holding X queries.
 - Pi may use Brave source expansion only after an indexed-X anchor qualifies.
 - Theme/topic event search happens inside the Pi event-search agent.
+- Rate repricing discovery checks prediction-market odds for the next three
+  Fed decisions and adds only material probability changes to the event lane.
 - Event lane and anomaly lane are separate.
 - Event candidates are a review long list, not pre-approved findings.
 - Anomalies are computed facts, not event candidates.
@@ -167,19 +169,20 @@ a meaningful anomaly attribution.
 6. Fetch per-holding market news, analyst/price-target news, and earnings
    calendar rows.
 7. Fetch macro context.
-8. Fetch recent indexed X rows in code, rank by engagement, and send top rows
+8. Check prediction-market rate repricing for the next three Fed decisions.
+9. Fetch recent indexed X rows in code, rank by engagement, and send top rows
    to Pi for market-breaking review.
-9. Let Pi handle theme/topic news search and event-to-holding mapping.
-10. Normalize and dedupe raw event records.
-11. Build event candidates from all non-duplicate event records.
-12. Build computed asset anomalies from price/volume triggers.
-13. Run one Alva Ask anomaly-attribution agent per computed anomalous asset.
-14. Send event candidates, computed anomalies, and attribution packets to the
+10. Let Pi handle theme/topic news search and event-to-holding mapping.
+11. Normalize and dedupe raw event records.
+12. Build event candidates from all non-duplicate event records.
+13. Build computed asset anomalies from price/volume triggers.
+14. Run one Alva Ask anomaly-attribution agent per computed anomalous asset.
+15. Send event candidates, computed anomalies, and attribution packets to the
    final Alva Ask analyst.
-15. Persist raw events, event candidates, qualified event assessments, computed
+16. Persist raw events, event candidates, qualified event assessments, computed
    anomalies, attribution packets, final anomaly attributions, final status
    reasons, and notification output.
-16. Push only if the analyst selected at least one finding and wrote a message.
+17. Push only if the analyst selected at least one finding and wrote a message.
 
 ## Playbooks
 

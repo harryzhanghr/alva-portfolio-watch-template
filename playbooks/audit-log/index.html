@@ -1074,6 +1074,7 @@
       if (type === "breaking_news") return "pi_market_breaking_search";
       if (type === "theme_news") return "pi_theme_search";
       if (type === "topic_news") return "arrays_topic_news";
+      if (type === "rate_repricing_event" || type === "rate_repricing_news") return "rate_repricing_lane";
       if (type === "asset_anomaly") return "asset_anomaly_signal";
       return "unknown";
     }
@@ -1084,6 +1085,7 @@
       if (key === "pi_market_breaking_search") return "Pi breaking";
       if (key === "pi_theme_search") return "Pi theme";
       if (key === "arrays_topic_news") return "Arrays topic";
+      if (key === "rate_repricing_lane") return "Rate repricing";
       if (key === "asset_anomaly_signal") return "Anomaly";
       return "Unknown";
     }
@@ -1094,6 +1096,7 @@
       if (key === "pi_market_breaking_search") return "violet";
       if (key === "pi_theme_search") return "green";
       if (key === "arrays_topic_news") return "green";
+      if (key === "rate_repricing_lane") return "amber";
       if (key === "asset_anomaly_signal") return "amber";
       return "muted";
     }
