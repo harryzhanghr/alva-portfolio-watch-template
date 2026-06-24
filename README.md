@@ -123,8 +123,9 @@ missing.
   final analyst pass.
 - Alva Ask analyst decides event qualification, final anomaly wording,
   selected/suppressed status, decision-lens PM framing, and final push/no-push.
-- Pushed notifications should read like short PM notes: multi-line bullets,
-  short link anchors, notable context, thesis/risk, key levels, and watch-next.
+- Pushed notifications should read like short PM notes: single selected findings
+  use 2-3 compact sentences, while multiple selected findings use one bullet per
+  finding with short link anchors, thesis/risk, key levels, and watch-next.
 - Code should not run a deterministic post-analyst repeat-suppression override.
 - Every no-push path should still persist audit artifacts.
 

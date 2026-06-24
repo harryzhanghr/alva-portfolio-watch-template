@@ -108,9 +108,10 @@ Current production price / portfolio basis:
   scenarios, watch-next items, and optional compliant action framing. This is
   downstream PM-note framing; sector/cohort anomaly attribution remains owned
   by the upstream why-the-move layer.
-- Pushed notifications are written as chat-readable PM notes: one-line overall
-  read, multi-line bullets, short specific link anchors, notable context, and
-  explicit thesis/risk/key-level/watch-next framing.
+- Pushed notifications are written as chat-readable PM notes: single selected
+  findings use 2-3 compact sentences; multiple selected findings use one bullet
+  per finding. Both forms keep short specific link anchors and explicit
+  thesis/risk/key-level/watch-next framing.
 - `prior_alert_history` sent to the analyst is a past-7-day user-visible run
   timeline. Empty runs only show the run time and `userReceivedPush=false`;
   pushed runs carry the user-facing notification message and selected IDs.
