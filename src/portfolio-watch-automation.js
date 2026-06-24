@@ -85,6 +85,10 @@ const CONFIG = {
     enabled: parseBoolArg(ARGS.rateRepricingEventsEnabled !== undefined ? ARGS.rateRepricingEventsEnabled : RATE_REPRICING_EVENT_ARGS.enabled, true),
     probabilityChangeThresholdPct: numericArg(ARGS.rateRepricingProbabilityChangeThresholdPct !== undefined ? ARGS.rateRepricingProbabilityChangeThresholdPct : RATE_REPRICING_EVENT_ARGS.probabilityChangeThresholdPct, 10),
   },
+  decisionLens: {
+    enabled: parseBoolArg(ARGS.decisionLensEnabled !== undefined ? ARGS.decisionLensEnabled : true, true),
+    mode: String(ARGS.decisionLensMode || "framed_insight").toLowerCase(),
+  },
   materiality: {
     quantityEpsilon: 0.00001,
     positionMvMovePct: 0.03,
@@ -302,6 +306,18 @@ function clean(value, maxLen) {
   return text.slice(0, maxLen - 1).trim() + "...";
 }
 
+function cleanMultiline(value, maxLen) {
+  const text = String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!maxLen || text.length <= maxLen) return text;
+  return text.slice(0, maxLen - 3).trim() + "...";
+}
+
 function parseBoolArg(value, fallback) {
   if (value === undefined || value === null || value === "") return fallback;
   if (typeof value === "boolean") return value;
@@ -378,7 +394,7 @@ function sanitizeAlertTimelineRow(row) {
   const runAtMs = Number(row.runAtMs || row.date || row.timestamp || 0);
   if (!Number.isFinite(runAtMs) || runAtMs <= 0) return null;
   const explicitPush = row.userReceivedPush === true || row.user_received_push === true || row.alertDecision === "push";
-  const rawMessage = clean(row.notificationMessage || row.notification_message || row.messagePreview || row.message || "", 900);
+  const rawMessage = cleanMultiline(row.notificationMessage || row.notification_message || row.messagePreview || row.message || "", 900);
   const userReceivedPush = !!(explicitPush && rawMessage);
   return {
     runAtMs,
@@ -4386,6 +4402,8 @@ function findingDedupeKey(finding, fallback) {
 }
 
 function buildAnalystPrompt(input) {
+  const lens = CONFIG.decisionLens || { enabled: true, mode: "framed_insight" };
+  const explicitCalls = lens.enabled && lens.mode === "explicit_calls";
   return [
     "You are the analyst for a low-noise portfolio watch automation.",
     "Your job is to decide whether this run is worth interrupting a discretionary investor now, prepare accurate data analysis for any selected event or anomaly attribution, and write the user-ready message. Default to no_push unless the user would likely be glad they saw it.",
@@ -4412,6 +4430,7 @@ function buildAnalystPrompt(input) {
 	    "- Ask: what changed, which current holdings/themes/risk buckets may be affected, and how large is the likely direct or related exposure?",
 	    "- Estimate exposure from current holdings, weights, themes, and theme_exposure. Show the calculation briefly in exposure_impact.",
 	    "- Direct/affected exposure comes only from affectedSymbols or a source-grounded holding-level relation, including high-confidence second-order value-chain transmission when concrete. Context-only theme/risk read-through can be discussed as a bucket, but do not add unrelated holdings into an affected exposure calculation.",
+	    "- If relatedHoldings includes peer/competitor, supplier/customer, option-underlying, or second_order/value_chain relations, use those source-grounded relations as the allowed transmission chain. Do not invent extra second-order links inside analyst.",
 	    "- Do not suppress a directly relevant event just because no anomaly was supplied. First judge whether the event is material on its own, then use current price/volume context or tools if needed. If suppressed, explain the real reason.",
     "- Treat portfolio delta and theme exposure as context only, not standalone findings.",
     "",
@@ -4450,14 +4469,29 @@ function buildAnalystPrompt(input) {
 	    "- Write like a real portfolio analyst sending a concise note after checking the book. Vary the opening based on the situation: sometimes direct, sometimes cautious, sometimes slightly conversational, but it should not feel like a fixed template.",
 	    "- Avoid causal verbs such as behind, drove, explains, or because of unless the selected attribution is supported by first- or high-confidence second-order evidence. For broad thematic read-throughs, use context language and keep the event separate from the price-move attribution.",
 	    "- Avoid internal workflow words such as push, selected, candidate, qualified, cleanest item, clears the bar, interruption bar.",
-    "- Use short paragraphs or bullets when there is more than one distinct point.",
+    "- Format for chat readability in Telegram/Slack: never return one dense block. Lead with a one-line overall read, then use real newlines and '- ' bullet lines for distinct material names, notable context, thesis/risk changes, key levels, and what to watch next.",
     "- If both event impact and anomaly attribution are selected, make both visible as separate thoughts, without forcing rigid section headers.",
-    "- Include source links for selected event findings when available. Prefer inline Markdown links like [source name](url), attached to the phrase that states the sourced fact, for example [fresh macro reporting](url). Use 1-2 links max and avoid a separate Sources line unless inline links would make the sentence awkward.",
+    "- Include source links for selected event findings when available. Prefer inline Markdown links like [source name](url), attached to the phrase that states the sourced fact. Use 1-2 links max; anchor text must be short and specific, aiming for 60 characters or less. Never use generic anchor text such as source, link, article, here, click, or more.",
+    "- Surface notable news as context even when it is not the confirmed price driver: if it changes thesis, risk, or watchpoints but attribution is uncertain, add one brief 'Notable:' bullet and label uncertainty.",
+    "- Give an opinionated but compliant PM read: whether thesis impact is strengthening, weakening, mixed, or unchanged; whether risk direction is rising, falling, mixed, or unchanged; the most relevant key level or invalidation point when available; and the next datapoint to watch.",
     "- Aim for 600-900 characters; use up to 1100 only when both event and anomaly need to be covered.",
     "- The message should answer what changed, why it matters for this portfolio, and what is uncertain or worth watching next.",
     "- Mention exposure, tickers, and key move metrics only when they help the user understand importance.",
     "- Sound like a sharp human analyst, not a news digest, template, or system log.",
     "- Do not give direct trade orders, exact sizing, or unconditional buy/sell instructions. When a selected finding is genuinely actionable, you may include concise, position-aware next-step framing: what would confirm or invalidate the read, what level/event to watch, or what exposure/risk the user may want to reassess. Do not force this when the finding is not actionable. Do not treat price targets as your recommendation.",
+    "",
+    "7. Decision lens object",
+    lens.enabled
+      ? "- For every selected event_impact and anomaly_attribution finding, add a decision_lens object. Use null/empty arrays when a field is not applicable, but do not omit the object."
+      : "- decision_lens is disabled; omit it.",
+    "- decision_lens.thesis_impact must be one of positive, negative, mixed, neutral, unchanged, or unclear, with a short rationale.",
+    "- decision_lens.risk_direction must be one of rising, falling, mixed, unchanged, or unclear, with the main risk bucket.",
+    "- decision_lens.key_levels should include price/technical/catalyst levels only if supplied or confidently derivable from the packet; do not invent precise levels.",
+    "- decision_lens.scenarios should be 2-4 concise if/then cases that frame upside, downside, and invalidation paths.",
+    "- decision_lens.watch_next should list the next sources, catalysts, levels, or confirmations that would change the read.",
+    explicitCalls
+      ? "- decision_lens.action_read may contain a soft, compliant next-step framing for review, reassessment, hedge/risk-check, add-to-watch, or no_clear_action. Do not give direct orders or sizing."
+      : "- decision_lens.action_read is optional. If included, default to no_clear_action unless the evidence clearly supports a compliant review/reassess/watch framing. Do not give direct orders or sizing.",
     "",
     "Return JSON only. It MUST begin with { and end with }.",
     "Schema:",
@@ -4466,10 +4500,10 @@ function buildAnalystPrompt(input) {
     '    {"candidate_id":"", "status":"selected|suppressed|not_qualified", "reason":"", "linked_event_finding_id":""}',
     "  ],",
     '  "eventImpactFindings": [',
-    '    {"finding_id":"", "finding_type":"event_impact", "primary_asset":"", "summary":"", "dedupe_key":"", "affected_holdings":[], "affected_buckets":[], "exposure_impact":{"direct_exposure_pct":null,"related_bucket_exposure_pct":null,"total_exposure_pct":null,"calculation":"","confidence":"low|medium|high"}, "position_impacts":[], "repetition_context":{"is_repeated_exposure":false,"new_information":"","matched_prior_alert":""}, "event_refs":[], "data_quality_notes":[], "confidence":"low|medium|high"}',
+    '    {"finding_id":"", "finding_type":"event_impact", "primary_asset":"", "summary":"", "dedupe_key":"", "affected_holdings":[], "affected_buckets":[], "exposure_impact":{"direct_exposure_pct":null,"related_bucket_exposure_pct":null,"total_exposure_pct":null,"calculation":"","confidence":"low|medium|high"}, "position_impacts":[], "repetition_context":{"is_repeated_exposure":false,"new_information":"","matched_prior_alert":""}, "event_refs":[], "decision_lens":{"thesis_impact":{"direction":"positive|negative|mixed|neutral|unchanged|unclear","rationale":""},"risk_direction":{"direction":"rising|falling|mixed|unchanged|unclear","risk_bucket":"","rationale":""},"key_levels":[],"scenarios":[],"watch_next":[],"action_read":"no_clear_action|review_exposure|reassess_risk|watch_level|watch_catalyst|monitor_only"}, "data_quality_notes":[], "confidence":"low|medium|high"}',
     "  ],",
     '  "anomalyAttributionFindings": [',
-    '    {"finding_id":"", "finding_type":"anomaly_attribution", "primary_asset":"", "summary":"", "dedupe_key":"", "attribution_packet_id":"", "anomaly_metrics":{}, "attribution_status":"confirmed|plausible|weak_correlation|unexplained", "supporting_events":[], "data_quality_notes":[], "confidence":"low|medium|high"}',
+    '    {"finding_id":"", "finding_type":"anomaly_attribution", "primary_asset":"", "summary":"", "dedupe_key":"", "attribution_packet_id":"", "anomaly_metrics":{}, "attribution_status":"confirmed|plausible|weak_correlation|unexplained", "supporting_events":[], "decision_lens":{"thesis_impact":{"direction":"positive|negative|mixed|neutral|unchanged|unclear","rationale":""},"risk_direction":{"direction":"rising|falling|mixed|unchanged|unclear","risk_bucket":"","rationale":""},"key_levels":[],"scenarios":[],"watch_next":[],"action_read":"no_clear_action|review_exposure|reassess_risk|watch_level|watch_catalyst|monitor_only"}, "data_quality_notes":[], "confidence":"low|medium|high"}',
     "  ],",
     '  "decision": {',
     '    "alert_decision":"push|no_push",',
@@ -4561,7 +4595,7 @@ function normalizeAnalyst(parsed, candidates, runAtMs) {
       selectedFindingIds: selectedIds,
       suppressedFindingIds: (decision.suppressed_finding_ids || []).map(String),
       messageSections: decision.message_sections || {},
-      notificationMessage: clean(decision.notification_message || "", 1800),
+      notificationMessage: cleanMultiline(decision.notification_message || "", 1800),
       skipReason: decision.skip_reason || "",
       nextContextHints: Array.isArray(decision.next_context_hints) ? decision.next_context_hints : [],
     },
@@ -4619,6 +4653,7 @@ function compactAssessmentForAudit(finding, decision) {
     attributionStatus: payload.attribution_status || payload.attributionStatus || "",
     eventRefs: payload.event_refs || payload.eventRefs || [],
     supportingEvents: payload.supporting_events || payload.supportingEvents || [],
+    decisionLens: payload.decision_lens || payload.decisionLens || null,
     dataQualityNotes: payload.data_quality_notes || payload.dataQualityNotes || [],
     payload,
   };
@@ -5523,7 +5558,7 @@ function buildRunAudit(input) {
           priorAlertTimelineDays: CONFIG.priorAlertTimelineDays,
           priorAlertTimelineRows: CONFIG.maxPriorAlertTimelineRows,
         },
-        outputSchema: ["eventCandidateStatuses[]", "eventImpactFindings[] with exposure_impact", "anomalyAttributionFindings[]", "decision.message_sections.event_exposure_impacts/anomaly_attributions"],
+        outputSchema: ["eventCandidateStatuses[]", "eventImpactFindings[] with exposure_impact and decision_lens", "anomalyAttributionFindings[] with decision_lens", "decision.message_sections.event_exposure_impacts/anomaly_attributions", "decision.notification_message as chat-readable PM note"],
       };
       const analystText = String(ask(buildAnalystPrompt(analystInput)).text || "");
       const parsedAnalyst = safeParseJson(analystText);
@@ -5536,8 +5571,24 @@ function buildRunAudit(input) {
     const selectedFindings = analyst.findings.filter((f) => analyst.decision.selectedFindingIds.indexOf(f.findingId) >= 0);
     const laneArtifacts = buildLaneArtifacts(eventCandidates, anomalies, analyst, anomalyAttributionPackets);
 
+    function enforceChatReadableBullets(text) {
+      return String(text || "")
+        .replace(/[ \t]+/g, " ")
+        .replace(/\s+-\s+(?=[A-Za-z0-9$][^\n:]{0,42}:\s)/g, "\n- ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+    }
+    function capMarkdownLinkAnchors(text, maxLen) {
+      return String(text || "").replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_match, label, url) => {
+        const cleanLabel = String(label || "").replace(/\s+/g, " ").trim();
+        if (!cleanLabel) return "[link](" + url + ")";
+        const capped = cleanLabel.length > maxLen ? cleanLabel.slice(0, Math.max(1, maxLen - 3)).trim() + "..." : cleanLabel;
+        return "[" + capped + "](" + url + ")";
+      });
+    }
     const shouldPush = analyst.decision.alertDecision === "push" && analyst.decision.notificationMessage && selectedFindings.length > 0;
-    const notifyBody = shouldPush ? analyst.decision.notificationMessage : SKIP;
+    const pmNotificationMessage = shouldPush ? capMarkdownLinkAnchors(enforceChatReadableBullets(analyst.decision.notificationMessage), 60) : "";
+    const notifyBody = shouldPush ? pmNotificationMessage : SKIP;
     const notifyTitle = shouldPush ? "Portfolio Watch" : "Portfolio Watch Quiet";
 
     await ctx.self.ts("portfolio", "snapshot").append([{
@@ -5619,7 +5670,7 @@ function buildRunAudit(input) {
       urgency: shouldPush ? analyst.decision.urgency : "none",
       reason: analyst.decision.reason || analyst.decision.skipReason || "",
       skipReason: shouldPush ? "" : (analyst.decision.skipReason || analyst.decision.reason || "quiet_run"),
-      notificationMessage: shouldPush ? analyst.decision.notificationMessage : "",
+      notificationMessage: shouldPush ? pmNotificationMessage : "",
       selectedFindingIdsJson: compactJson(analyst.decision.selectedFindingIds || []),
       suppressedFindingIdsJson: compactJson(analyst.decision.suppressedFindingIds || []),
       messageSectionsJson: compactJson(analyst.decision.messageSections || {}, 6000),
@@ -5654,7 +5705,7 @@ function buildRunAudit(input) {
       alertDecision: shouldPush ? "push" : "no_push",
       userReceivedPush: !!shouldPush,
       summary: shouldPush ? (analyst.decision.reason || "") : "",
-      notificationMessage: shouldPush ? analyst.decision.notificationMessage : "",
+      notificationMessage: shouldPush ? pmNotificationMessage : "",
       selectedFindingIds: analyst.decision.selectedFindingIds || [],
       selectedDedupeKeys: selectedFindings.map((f) => f.dedupeKey),
       tickers: selectedFindings.map((f) => f.primaryAsset).filter((symbol) => symbol && symbol !== "PORTFOLIO"),

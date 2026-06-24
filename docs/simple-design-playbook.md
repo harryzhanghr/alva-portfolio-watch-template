@@ -103,6 +103,14 @@ Current production price / portfolio basis:
 - Theme exposure is supplied as context to the analyst. Theme allocation
   changes do not create standalone candidates; event exposure impact is
   estimated inside the Alva Ask analyst finding.
+- The final analyst now outputs a `decision_lens` for selected event-impact and
+  anomaly-attribution findings: thesis impact, risk direction, key levels,
+  scenarios, watch-next items, and optional compliant action framing. This is
+  downstream PM-note framing; sector/cohort anomaly attribution remains owned
+  by the upstream why-the-move layer.
+- Pushed notifications are written as chat-readable PM notes: one-line overall
+  read, multi-line bullets, short specific link anchors, notable context, and
+  explicit thesis/risk/key-level/watch-next framing.
 - `prior_alert_history` sent to the analyst is a past-7-day user-visible run
   timeline. Empty runs only show the run time and `userReceivedPush=false`;
   pushed runs carry the user-facing notification message and selected IDs.

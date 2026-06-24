@@ -1397,6 +1397,7 @@
           confidence: row.confidence || "",
           exposureImpact: row.exposure_impact || row.exposureImpact || null,
           eventRefs: row.event_refs || row.eventRefs || [],
+          decisionLens: row.decision_lens || row.decisionLens || null,
           dataQualityNotes: row.data_quality_notes || row.dataQualityNotes || [],
           payload: row,
         };
@@ -1754,6 +1755,21 @@
         '<div class="table-wrap"><table><thead><tr><th>Final status</th><th>Origin</th><th>Asset</th><th>Title / summary</th><th>Why reviewed</th><th>Event refs</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
     }
 
+    function decisionLensText(lens) {
+      if (!lens) return "";
+      const thesis = lens.thesis_impact || lens.thesisImpact || {};
+      const risk = lens.risk_direction || lens.riskDirection || {};
+      const levels = Array.isArray(lens.key_levels || lens.keyLevels) ? (lens.key_levels || lens.keyLevels) : [];
+      const watch = Array.isArray(lens.watch_next || lens.watchNext) ? (lens.watch_next || lens.watchNext) : [];
+      const bits = [];
+      if (thesis.direction || thesis.rationale) bits.push("Thesis: " + [thesis.direction, thesis.rationale].filter(Boolean).join(" - "));
+      if (risk.direction || risk.rationale || risk.risk_bucket) bits.push("Risk: " + [risk.direction, risk.risk_bucket, risk.rationale].filter(Boolean).join(" - "));
+      if (levels.length) bits.push("Levels: " + levels.map((x) => typeof x === "string" ? x : (x.label || x.level || JSON.stringify(x))).slice(0, 3).join("; "));
+      if (watch.length) bits.push("Watch: " + watch.map((x) => typeof x === "string" ? x : (x.label || x.item || JSON.stringify(x))).slice(0, 3).join("; "));
+      if (lens.action_read || lens.actionRead) bits.push("Action: " + (lens.action_read || lens.actionRead));
+      return bits.join("\n");
+    }
+
     function renderQualifiedEvents(run) {
       const rows = qualifiedEventsForRun(run);
       if (!rows.length) {
@@ -1766,11 +1782,12 @@
           '<td><strong>' + esc(row.primaryAsset || "") + '</strong><div class="subtle">' + esc(row.confidence || "") + '</div></td>' +
           '<td>' + esc(clean(row.summary || "", 320)) + '</td>' +
           '<td>' + esc(exposure.total_exposure_pct == null ? "--" : exposure.total_exposure_pct + "%") + '<div class="subtle">' + esc(clean(exposure.calculation || "", 240)) + '</div></td>' +
+          '<td><pre>' + esc(decisionLensText(row.decisionLens || (row.payload && (row.payload.decision_lens || row.payload.decisionLens))) || "--") + '</pre></td>' +
           '<td>' + esc((row.eventRefs || []).join(", ")) + '</td>' +
           '<td><details><summary class="subtle">assessment JSON</summary>' + jsonBlock(row) + '</details></td>' +
           '</tr>';
       }).join("");
-      return '<div class="table-wrap"><table><thead><tr><th>Status / reason</th><th>Asset</th><th>Assessment</th><th>Exposure impact</th><th>Event refs</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
+      return '<div class="table-wrap"><table><thead><tr><th>Status / reason</th><th>Asset</th><th>Assessment</th><th>Exposure impact</th><th>Decision lens</th><th>Event refs</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
     }
 
     function renderAnomalyAttributions(run) {
@@ -1795,6 +1812,7 @@
             ].filter(Boolean).join(" / ")) + '</div>' +
             (packet.summary ? '<div class="subtle">' + esc(clean(packet.summary, 220)) + '</div>' : '')
           : '<div class="subtle">No per-asset attribution packet found.</div>';
+        const lens = attribution.decisionLens || (attribution.payload && (attribution.payload.decision_lens || attribution.payload.decisionLens)) || row.decisionLens || null;
         return '<tr>' +
           '<td>' + badge(status.status || "unknown", statusTone(status.status)) + '<div class="subtle">' + esc(clean(status.reason || "", 240)) + '</div></td>' +
           '<td><strong>' + esc(row.symbol || attribution.primaryAsset || "") + '</strong><div class="subtle">' + esc((metrics.triggerKinds || []).join(", ")) + (marketLine ? " / " + esc(marketLine) : "") + '</div></td>' +
@@ -1802,11 +1820,12 @@
           '<td>' + esc(fmtNum(metrics.fiveDayPct, 2)) + '%</td>' +
           '<td>' + esc(fmtNum(metrics.cumulativeVolumeMultiple || metrics.sessionCumulativeRvol || metrics.volumeMultiple, 2)) + 'x</td>' +
           '<td>' + badge(attribution.attributionStatus || "no attribution", attribution.attributionStatus === "plausible" || attribution.attributionStatus === "confirmed" ? "green" : "amber") + '<div class="subtle">' + esc(clean(attribution.summary || row.summary || "", 260)) + '</div>' + packetLine + '</td>' +
+          '<td><pre>' + esc(decisionLensText(lens) || "--") + '</pre></td>' +
           '<td><details><summary class="subtle">anomaly + attribution JSON</summary>' + jsonBlock(row) + '</details></td>' +
           '</tr>';
       }).join("");
       return '<div class="notice">Anomalies are computed facts, not candidates. Each computed anomalous asset first gets a per-asset attribution-agent packet, then the final analyst turns that packet into final selected/suppressed wording.</div>' +
-        '<div class="table-wrap"><table><thead><tr><th>Final status</th><th>Asset</th><th>1D</th><th>5D</th><th>Volume</th><th>Attribution</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
+        '<div class="table-wrap"><table><thead><tr><th>Final status</th><th>Asset</th><th>1D</th><th>5D</th><th>Volume</th><th>Attribution</th><th>Decision lens</th><th>Raw</th></tr></thead><tbody>' + html + '</tbody></table></div>';
     }
 
     function renderFinalStatusLedger(run) {

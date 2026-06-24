@@ -122,7 +122,9 @@ missing.
 - Each computed anomaly gets a per-asset Alva Ask attribution packet before the
   final analyst pass.
 - Alva Ask analyst decides event qualification, final anomaly wording,
-  selected/suppressed status, and final push/no-push.
+  selected/suppressed status, decision-lens PM framing, and final push/no-push.
+- Pushed notifications should read like short PM notes: multi-line bullets,
+  short link anchors, notable context, thesis/risk, key levels, and watch-next.
 - Code should not run a deterministic post-analyst repeat-suppression override.
 - Every no-push path should still persist audit artifacts.
 
@@ -178,7 +180,7 @@ a meaningful anomaly attribution.
 13. Build computed asset anomalies from price/volume triggers.
 14. Run one Alva Ask anomaly-attribution agent per computed anomalous asset.
 15. Send event candidates, computed anomalies, and attribution packets to the
-   final Alva Ask analyst.
+   final Alva Ask analyst for selection, decision lens, and PM-note wording.
 16. Persist raw events, event candidates, qualified event assessments, computed
    anomalies, attribution packets, final anomaly attributions, final status
    reasons, and notification output.
