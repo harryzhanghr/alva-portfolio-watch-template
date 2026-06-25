@@ -1962,7 +1962,7 @@
           warningCount: fetch.warningCount,
         }) + '</div>' +
         '<div class="kv-box"><b>Macro freshness</b>' + jsonBlock(fetch.macroFreshness || []) + '</div>' +
-        '<div class="kv-box"><b>Alva Ask theme extraction</b>' + jsonBlock(themeExtraction) + '</div>' +
+        '<div class="kv-box"><b>Pi Agent theme extraction</b>' + jsonBlock(themeExtraction) + '</div>' +
         '<div class="kv-box"><b>Breaking News feed + mapping summary</b>' + jsonBlock(breaking) + '</div>' +
         '<div class="kv-box"><b>Theme-news lane summary (legacy/internal mode)</b>' + jsonBlock(themeNews) + '</div>' +
         '<div class="kv-box"><b>Market data coverage</b><table><thead><tr><th>Asset</th><th>1d bars</th><th>1min bars</th><th>1h bars</th><th>Latest 1d</th><th>Latest 1min</th><th>Latest 1h</th></tr></thead><tbody>' + (rows || '<tr><td colspan="7">No coverage rows.</td></tr>') + '</tbody></table></div>' +
@@ -1997,7 +1997,7 @@
       if (!llm || (!llm.portfolioReader && !llm.analyst && !llm.breakingNews && !llm.themeNews && !llm.themeExtractor && !llm.anomalyAttributionAgents)) return '<div class="empty">No runtime call detail available for this legacy run.</div>';
       return '<div class="kv-grid">' +
         '<div class="kv-box"><b>Portfolio ingest / API read</b>' + jsonBlock(llm.portfolioReader || {}) + '</div>' +
-        '<div class="kv-box"><b>Alva Ask theme extraction</b>' + jsonBlock(llm.themeExtractor || {}) + '</div>' +
+        '<div class="kv-box"><b>Pi Agent theme extraction</b>' + jsonBlock(llm.themeExtractor || {}) + '</div>' +
         '<div class="kv-box"><b>Breaking-news feed / mapping review</b>' + jsonBlock(llm.breakingNews || {}) + '</div>' +
         '<div class="kv-box"><b>Theme-news lane (legacy/internal mode)</b>' + jsonBlock(llm.themeNews || {}) + '</div>' +
         '<div class="kv-box"><b>Alva Ask anomaly attribution agents</b>' + jsonBlock(llm.anomalyAttributionAgents || {}) + '</div>' +

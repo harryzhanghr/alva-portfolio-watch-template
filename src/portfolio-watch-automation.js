@@ -30,7 +30,7 @@ const CONFIG = {
   priceSignalVersion: "asset_anomaly_v5_latest_1min_z2_no_5d_trigger",
   volumeSignalVersion: "hourly_cumulative_volume_v3_us_equity_rth",
   anomalyAttributionVersion: "per_asset_alva_ask_why_the_move_v1",
-  themeExtractionVersion: "portfolio_theme_extraction_v1_alva_ask",
+  themeExtractionVersion: "portfolio_theme_extraction_v2_pi",
   latestPriceInterval: "1min",
   latestPriceLookbackHours: 36,
   latestPriceLimit: 2400,
@@ -1547,7 +1547,8 @@ function buildThemeExtractionPrompt(snapshot, previous) {
   ].join("\n");
 }
 
-function normalizeThemeExtraction(parsed, snapshot, previous, runAtMs, rawText, errorText) {
+function normalizeThemeExtraction(parsed, snapshot, previous, runAtMs, rawText, errorText, meta) {
+  meta = meta || {};
   const byHolding = {};
   const themeSearchPhrases = {};
   if (parsed && Array.isArray(parsed.theme_universe)) {
@@ -1598,8 +1599,8 @@ function normalizeThemeExtraction(parsed, snapshot, previous, runAtMs, rawText, 
     themeMap,
     themeSearchPhrases,
     themeExtractionSummary: {
-      environment: "Alva Ask (LLM)",
-      call: "ask(buildThemeExtractionPrompt(snapshot))",
+      environment: "Pi Agent",
+      call: "agent.ask(buildThemeExtractionPrompt(snapshot, previous))",
       version: CONFIG.themeExtractionVersion,
       toolLoop: false,
       browsing: false,
@@ -1608,18 +1609,34 @@ function normalizeThemeExtraction(parsed, snapshot, previous, runAtMs, rawText, 
       fallbackUsed: !!errorText || Object.keys(byHolding).length < (snapshot.holdings || []).length,
       holdingCount: (snapshot.holdings || []).length,
       themeCount: Object.keys(themeCount).length,
+      model: meta.model || "",
+      stopReason: meta.stopReason || "",
       rawTextPreview: clean(rawText || "", 900),
       error: errorText || "",
     },
   };
 }
 
-function extractPortfolioThemes(snapshot, previous, warnings, runAtMs) {
+async function extractPortfolioThemes(snapshot, previous, warnings, runAtMs) {
   try {
-    const text = String(ask(buildThemeExtractionPrompt(snapshot, previous)).text || "");
+    const { Agent, getModel } = require("@alva/pi");
+    const agent = new Agent({
+      initialState: {
+        systemPrompt: "You classify supplied portfolio holdings into stable investable exposure themes. Use only supplied JSON and return JSON only.",
+        model: getModel("openai", "gpt-5.5"),
+        tools: [],
+        thinkingLevel: "off",
+      },
+    });
+    const { message } = await agent.ask(buildThemeExtractionPrompt(snapshot, previous));
+    if (message && message.errorMessage) throw new Error("Theme extraction Pi agent error: " + message.errorMessage);
+    const text = piMessageText(message);
     const parsed = safeParseJson(text);
-    if (!parsed) throw new Error("Theme extraction prompt did not return parseable JSON");
-    return normalizeThemeExtraction(parsed, snapshot, previous, runAtMs, text, "");
+    if (!parsed) throw new Error("Theme extraction Pi agent did not return parseable JSON");
+    return normalizeThemeExtraction(parsed, snapshot, previous, runAtMs, text, "", {
+      model: message && message.model ? String(message.model) : "gpt-5.5",
+      stopReason: message && message.stopReason ? String(message.stopReason) : "",
+    });
   } catch (err) {
     const error = String(err && err.message ? err.message : err).slice(0, 260);
     warnings.push({ source: "theme-extraction", error });
@@ -5985,7 +6002,7 @@ function buildRunAudit(input) {
 	      },
 	    },
     themeExtractor: {
-      environment: input.themeExtractionSummary ? "Alva Ask (LLM)" : "not_called",
+      environment: input.themeExtractionSummary ? (input.themeExtractionSummary.environment || "Pi Agent") : "not_called",
       call: input.themeExtractionSummary && input.themeExtractionSummary.call ? input.themeExtractionSummary.call : "skipped",
       toolLoop: false,
       browsing: false,
@@ -5994,6 +6011,8 @@ function buildRunAudit(input) {
       holdingCount: input.themeExtractionSummary ? input.themeExtractionSummary.holdingCount : 0,
       themeCount: input.themeExtractionSummary ? input.themeExtractionSummary.themeCount : 0,
       fallbackUsed: input.themeExtractionSummary ? !!input.themeExtractionSummary.fallbackUsed : false,
+      model: input.themeExtractionSummary ? input.themeExtractionSummary.model || "" : "",
+      stopReason: input.themeExtractionSummary ? input.themeExtractionSummary.stopReason || "" : "",
       error: input.themeExtractionSummary ? input.themeExtractionSummary.error : "",
       rawTextPreview: input.themeExtractionSummary ? input.themeExtractionSummary.rawTextPreview : "",
     },
@@ -6379,7 +6398,7 @@ function buildRunAudit(input) {
     }
     snapshot = markSnapshotToLatest(snapshot, priceSignals, warnings);
     priceSignals = refreshSignalContributions(priceSignals, snapshot);
-    snapshot = extractPortfolioThemes(snapshot, previous, warnings, runAtMs);
+    snapshot = await extractPortfolioThemes(snapshot, previous, warnings, runAtMs);
     const delta = computePortfolioDelta(snapshot, previous);
     const currentThemes = themeExposure(snapshot);
     const previousThemes = previous ? themeExposure(previous) : [];
