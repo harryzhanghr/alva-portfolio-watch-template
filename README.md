@@ -13,7 +13,8 @@ static portfolio file maintained during setup.
 - `src/portfolio-watch-automation.js`  
   Production-style Alva automation source. It reads either a dynamic connected
   portfolio or a static portfolio file, fetches market/event data, computes
-  price and volume anomalies, runs Pi event search, runs one Alva Ask
+  price and volume anomalies, reads an external Breaking News event feed,
+  reviews portfolio-specific event mappings, runs one Alva Ask
   anomaly-attribution agent per computed anomalous asset, runs final Alva Ask
   analyst review, persists audit artifacts, and writes a notification sidecar.
 - `playbooks/audit-log/index.html`  
@@ -28,7 +29,8 @@ static portfolio file maintained during setup.
 - `docs/pseudo-code-playbook.md`  
   The detailed plain-language pseudo-code runbook.
 - `docs/breaking-news-origin-source-requirement.md`  
-  Source-origin requirement for indexed-X breaking-news events.
+  Source-origin requirement for the upstream Breaking News feed that Portfolio
+  Watch reads by default.
 - `docs/alva-skill-agent-checklist.md`  
   Short deployment and verification checklist for Alva Skill Agents.
 - `examples/env.args.example.json`  
@@ -61,6 +63,9 @@ Ask for or infer these from Alva workspace state:
 - `feedName`: desired feed name. Default recommendation:
   `portfolio-watch-automation`.
 - Push target / notification wiring, if the user's Alva environment requires it.
+- Optional `externalBreakingNewsFeedPath`. By default the template reads the
+  public market-wide Breaking News source at
+  `/alva/home/harryzz/feeds/breaking-news/v1/data/events/current`.
 - Optional `aliases`: ticker/company aliases for better event matching.
 - Optional `fallbackThemeMap`: continuity fallback only. The automation extracts
   current themes every run with Alva Ask, so do not overfit this map.
@@ -77,6 +82,8 @@ Pass these through `env.args` when creating the automation:
   "accountId": "<CONNECTED_ACCOUNT_ID>",
   "ownerUsername": "<ALVA_USERNAME>",
   "runSource": "cron_push_pipeline",
+  "breakingNewsSourceMode": "external_feed",
+  "externalBreakingNewsFeedPath": "/alva/home/harryzz/feeds/breaking-news/v1/data/events/current",
   "aliases": {
     "TICKER": ["TICKER", "Company Name", "$TICKER"]
   },
@@ -144,10 +151,14 @@ dynamic mode requires `accountId` / `connectedAccountId`; static mode requires
   when 1min coverage exists.
 - Volume anomaly uses hourly cumulative volume versus historical same-time
   cumulative volume.
-- Market-breaking discovery starts from recent Arrays indexed X rows ranked by
-  code, not from per-holding X queries.
-- Pi may use Brave source expansion only after an indexed-X anchor qualifies.
-- Theme/topic event search happens inside the Pi event-search agent.
+- Market-breaking source events come from the configured external Breaking News
+  feed by default. That upstream feed handles market-wide discovery, source
+  expansion, event clustering, and source confidence.
+- Portfolio Watch code first pre-maps external events by direct ticker,
+  option-underlying, theme, and macro/risk bucket.
+- A Pi portfolio mapping agent then reviews those pre-maps and cross-checks
+  remaining external events for source-grounded related holdings. It does not
+  search for news, expand sources, or decide push/no-push.
 - Rate repricing discovery checks prediction-market odds for the next three
   Fed decisions and adds only material probability changes to the event lane.
 - Event lane and anomaly lane are separate.
@@ -209,9 +220,11 @@ a meaningful anomaly attribution.
    calendar rows.
 7. Fetch macro context.
 8. Check prediction-market rate repricing for the next three Fed decisions.
-9. Fetch recent indexed X rows in code, rank by engagement, and send top rows
-   to Pi for market-breaking review.
-10. Let Pi handle theme/topic news search and event-to-holding mapping.
+9. Read the configured external Breaking News event feed for market-wide events
+   over the lookback window.
+10. Pre-map external events by direct ticker, option-underlying, theme, and
+   macro/risk bucket, then let Pi review the mapping against the current
+   portfolio.
 11. Normalize and dedupe raw event records.
 12. Build event candidates from all non-duplicate event records.
 13. Build computed asset anomalies from price/volume triggers.

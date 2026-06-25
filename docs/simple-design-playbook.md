@@ -85,23 +85,16 @@ Current production price / portfolio basis:
 - Macro context is fetched once per run with `sourceDate`, `sourceAgeHours`,
   and `fetchedAtHkt`; date-level macro endpoints are used as attribution
   context, not as proof of intraday freshness.
-- Pi event search has two lanes. Market-breaking discovery starts from code-ranked
-  Arrays indexed X top-engagement tweets over the latest 90-minute window, not
-  portfolio-holdings queries and not Grok text search. Pi judges whether supplied
-  hot tweets are investment-related breaking-news anchors; Brave expands/confirms
-  source links only for qualifying X anchors. Theme / industry source coverage
-  now also starts inside the Pi agent: Alva Ask first extracts current holding
-  themes from the latest portfolio each run, code supplies current holdings,
-  current theme context, supported Arrays market-news topics, source-text-aware
-  tools, indexed X discovery context, and budgets. Pi maps each theme to supported topics or
-  `no_supported_topic`, calls `searchArraysMarketNewsTopic` inside the agent
-  loop when useful, and returns `related_holdings[]` only for holding-level
-  relations, including high-confidence source-grounded second-order/value-chain
-  links, or portfolio-level macro/policy/risk/theme events with `risk_factors`
-  and `portfolio_relevance_basis`. Source-returned tickers, shared-theme
-  read-through, and generic AI-infrastructure sympathy are context only, not
-  automatic mappings. Pi may still run supplemental Brave theme_news searches
-  when useful.
+- Breaking-news source events come from the external Breaking News feed by
+  default. That upstream feed handles market-wide discovery, source expansion,
+  event clustering, source confidence, and `tickersMentioned` / `marketTags` /
+  `assetClasses`. Portfolio Watch code then pre-maps direct ticker,
+  option-underlying, theme, and macro/risk-bucket relevance against the current
+  portfolio. A Pi portfolio mapping agent reviews those deterministic mappings
+  and cross-checks remaining external events for source-grounded related
+  holdings, including peer, supplier/customer, and high-confidence
+  second-order/value-chain links. This mapper does not search for news, expand
+  sources, or decide push/no-push.
 - Mark-to-market movement is explicitly not treated as a user trade and is
   context only unless the asset also has a current anomaly trigger.
 - `cashChangeUsd` is tracked separately from cash percentage drift, so
@@ -150,7 +143,12 @@ This is the first production version. Current blind spots:
 - ETF look-through exposure is not yet wired.
 - `ticker_only` portfolios do not produce true exposure percentages, portfolio
   weights, market value, NAV deltas, or portfolio-move contribution metrics.
-- Per-asset X search is no longer part of the deterministic source loop. Market-wide X discovery happens through code calling `/api/v1/social-feeds/x/search` without `q`, paging backward through the latest 90-minute indexed window up to 5 pages of 200 original/quote posts, ranking unique rows by engagement, and passing up to 50 top rows into the Pi event-search loop. Pi does not plan/refine Grok or text-search queries. For indexed-X breaking-news rows, Pi should first try to attach `source_event_time` from the original / official source; if that is unavailable, it can use the earliest credible media/source link. Source-expansion Brave lookup uses `result_filter="web"` and is not constrained to the recent event window.
+- Per-asset X search is no longer part of the deterministic source loop.
+  Market-wide breaking-news discovery is delegated to the external Breaking
+  News feed; Portfolio Watch reads `events/current` with a millisecond
+  `@range/<from>..<to>` lookback and falls back to `@last/N` filtering if range
+  read fails. Portfolio Watch's Pi step reviews only portfolio mapping, not
+  source discovery or Brave expansion.
 - Broad macro/theme/topic events are represented once with `affectedSymbols[]`,
   `affectedThemes[]`, and optional `riskFactors`. For Pi events, affected
   symbols come only from Pi-returned `related_holdings[]` that code classifies

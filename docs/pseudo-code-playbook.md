@@ -2,7 +2,7 @@
 
 ## Overview
 
-This playbook documents a configurable portfolio watch automation as a plain-language runbook. It explains the hourly pipeline step by step for a reader who does not want to read source code: how the automation reads a dynamic connected portfolio or static portfolio file, marks positions with latest available market data where sizing exists, computes asset anomalies, runs fresh event search, runs one per-asset anomaly attribution agent for every computed anomalous asset, runs a low-noise final analyst decision gate, and persists both push and no-push decisions for audit.
+This playbook documents a configurable portfolio watch automation as a plain-language runbook. It explains the hourly pipeline step by step for a reader who does not want to read source code: how the automation reads a dynamic connected portfolio or static portfolio file, marks positions with latest available market data where sizing exists, computes asset anomalies, reads the external Breaking News feed, reviews those events against the current portfolio, runs one per-asset anomaly attribution agent for every computed anomalous asset, runs a low-noise final analyst decision gate, and persists both push and no-push decisions for audit.
 
 ## Data Sources & Freshness
 
@@ -18,7 +18,19 @@ This playbook documents a configurable portfolio watch automation as a plain-lan
 - Technical events: deterministic OHLCV detectors can append `technical_event` rows for breakout/breakdown, support/resistance bounce or rejection, RSI threshold crosses, moving-average crosses, and volume-confirmed price moves. They are configurable through `technicalEvents.enabled`, `technicalEventDetectors`, and `technicalEventMinSeverity`; when disabled, they do not enter the event lane.
 - Rate repricing lane: Polymarket public market data checks the next three Fed decision markets, compares current probability with 24 hours earlier, and appends `rate_repricing_event` rows when the probability move crosses `rateRepricingEvents.probabilityChangeThresholdPct`. If material repricing is found, the lane adds up to three `rate_repricing_news` rows from recent market commentary. Market volume, liquidity, and open-interest fields are passed through for analyst judgment. The only lane config is `rateRepricingEvents.enabled` and `rateRepricingEvents.probabilityChangeThresholdPct`.
 - Dynamic theme extraction: Alva Ask receives the current marked portfolio snapshot every run and returns current holding themes used for theme exposure context, analyst exposure-impact reasoning, and theme-news search. `priorThemes` are only weak continuity hints; the current run's extracted themes are supplied to Pi before event search.
-- Indexed X + Pi event-search loop: code calls Arrays `/api/v1/social-feeds/x/search` without a text query over the latest 90-minute indexed window, pages backward up to 5 pages of 200 original/quote tweets, ranks the unique window rows by engagement, and supplies up to 50 top tweets to one bounded `@alva/pi` loop. Pi reviews only those supplied hot tweets for market-breaking eligibility; qualifying indexed-X anchors may trigger Brave source expansion to find the original/official or earliest credible source. The same Pi loop handles theme-news: it receives current portfolio theme context, current holding context, and supported Arrays market-news topics; maps each theme to `topic` values or `no_supported_topic`; calls `searchArraysMarketNewsTopic` when useful; and may run supplemental Brave theme/news searches. For Pi-returned `breaking_news`, `theme_news`, and `topic_news`, source-returned tickers are context only; Pi should return `related_holdings[]` with exact current holding symbols and rationale only when a holding-level relation exists, including high-confidence source-grounded second-order/value-chain effects. Shared-theme / broad AI-infrastructure read-through is context-only. Truly market-moving macro/policy/risk/theme events may return `related_holdings: []` plus `risk_factors` and `portfolio_relevance_basis`.
+- External Breaking News feed: code reads the configured full event stream
+  (`/alva/home/harryzz/feeds/breaking-news/v1/data/events/current` by
+  default) over the configured lookback using `@range/<fromMs>..<toMs>`.
+  The upstream feed already handles market-wide discovery, source expansion,
+  event clustering, source confidence, and event fields such as
+  `tickersMentionedJson`, `marketTagsJson`, and `assetClassesJson`. Portfolio
+  Watch code first pre-maps direct ticker, option-underlying, theme, and
+  macro/risk-bucket relevance. A bounded `@alva/pi` portfolio mapping review
+  then checks whether those code mappings are wrong and cross-checks remaining
+  external events against current holdings for source-grounded direct, peer,
+  supplier/customer, option-underlying, or high-confidence second-order /
+  value-chain relations. This Pi mapper does not search for news, use Brave, or
+  decide push/no-push.
 - Macro context: Arrays macro endpoints for SPX, Nasdaq, VIX, oil, and treasury rates. Each row includes `sourceDate`, `sourceAgeHours`, and `fetchedAtHkt` so analyst can judge relevance/freshness before using it as attribution context.
 - Schedule: the automation runs hourly. A run does not imply a notification. Quiet runs persist the skip sentinel `<|SKIP_NOTIFICATION|>`.
 - Freshness rule: price anomaly uses latest 1min extended-hours price when it is newer than the last completed daily close. `oneDayPct` then means latest 1min price vs previous regular-session close. `lastClosedOneDayPct` is kept only as completed-close context.
@@ -36,9 +48,21 @@ For every current holding, Node 3 first resolves `marketDataSymbol`: ordinary US
 - Each mapped source row is appended to `rawEvents[]`. This does not mean it is push-worthy or even candidate-approved; it only means the source was fetched and normalized for downstream gates.
 - Macro context is fetched once per run after holdings are marked and current themes are extracted. Macro rows are stored with source/fetch timestamps.
 - Rate repricing is fetched once per run after macro context: prediction-market rows become `rate_repricing_event`, and explanatory market commentary becomes `rate_repricing_news`. Both enter the same global normalization and dedupe path as other raw events.
-- Pi event search runs after the per-holding source loop, latest-price marking, and current dynamic theme extraction. Code passes the HKT window, search budgets, supported Arrays market-news topics, every current extracted portfolio theme with linked holdings/weights, every current holding with themes/aliases/weights, and the code-ranked indexed X top-engagement list. Pi reviews the supplied hot tweets rather than planning X text queries. If one is fresh, investment-related, and plausibly market-moving, Pi can use Brave up to twice for source expansion, looking for the original/official source first, then the earliest credible media/source link if official is unavailable. Source-expansion calls must use `result_filter="web"` rather than `news`; runtime also forces source expansion to web. Pi must not use Brave source expansion to create an unanchored market-breaking event. The final Pi JSON can return at most 30 events total. Code does not separately fetch topic-news rows or map theme events to tickers after Pi.
+- External breaking-news mapping runs after the per-holding source loop,
+  latest-price marking, and current dynamic theme extraction. Code reads the
+  configured Breaking News feed over the breaking-news lookback, parses source
+  tickers/tags/classes/sources, and pre-maps direct ticker, option-underlying,
+  theme, and macro/risk-bucket relevance. Pi then reviews those deterministic
+  mappings and cross-checks remaining external events for source-grounded
+  related holdings. This Pi step has no search tools and does not create new
+  news events.
 
-The Pi prompt asks for fresh events within the supplied window. For indexed-X market-breaking rows, tweet `published_at` / source time label represents the fresh discovery/post timestamp, while `sourceEventTime` / `sourceEventAtMs` can represent an older official or primary source found through Brave expansion. Downstream gates still require source timestamps where freshness matters. A candidate no longer needs an exact holding symbol when it is a portfolio-level macro/policy/risk event with `risk_factors` and `portfolio_relevance_basis`.
+For external breaking-news rows, `reportedAt` / `sourceEventTime` is the
+upstream feed's event time, `observedAt` is when that feed first created the
+event, and `updatedAt` is when it last merged evidence. Downstream gates still
+judge portfolio materiality, freshness versus prior user alerts, and whether a
+portfolio-level macro/policy/risk event is useful without an exact holding
+symbol.
 
 ## How This Playbook Works
 
@@ -49,7 +73,11 @@ The page is organized as nodes that mirror the production automation:
 - Node 2 loads prior KV state: last snapshot, last run time, event index, user-visible alert timeline, finding history for persistence/audit updates, and prior anomaly signals. The analyst packet receives the past-7-day user-visible run timeline, not prior findings or no-push suppression reasoning.
 - Node 3 loops through each current holding, resolves `marketDataSymbol`, and fetches daily bars, latest 1min bars, hourly bars, and per-holding event sources from that symbol. For options, this means the underlying equity. This node does not run X search.
 - Node 4 computes price and volume anomaly metrics, marks holdings to Arrays latest price, recomputes market value/weights only when `full_quantity` sizing exists, and calls Alva Ask once to extract current holding themes from the latest marked portfolio. US-listed holdings and US equity options use hourly regular-session cumulative volume up to the latest regular-session bar, capped at the 16:00 ET market close after hours, compared with historical median cumulative volume at the same point of the trading day. Direct crypto assets use UTC-day cumulative volume.
-- Node 5 fetches timestamped macro context, checks rate repricing for the next three Fed decisions, and runs one Pi event-search loop covering market-wide breaking news plus theme/topic news. Arrays topic-news rows, when used, are fetched by the Pi tool loop through `searchArraysMarketNewsTopic`; Pi then returns holding-linked events or portfolio-level risk-factor events. The node also normalizes event records with dedupe status.
+- Node 5 fetches timestamped macro context, checks rate repricing for the next
+  three Fed decisions, reads the external Breaking News feed, pre-maps direct
+  ticker/theme/macro relevance, and runs a Pi portfolio mapping review for
+  source-grounded related holdings. The node also normalizes event records with
+  dedupe status.
 - Node 6 builds two separate lane inputs: event-impact candidates from all non-duplicate event records, including portfolio-level macro/policy/risk/rate-repricing events with no exact holding symbol, and computed `asset_anomalies` from current price/volume anomaly triggers. Portfolio delta and theme-exposure change are context only, not candidates.
 - Node 7 loops through every computed asset anomaly and calls one Alva Ask Anomaly Attribution Agent for that asset. The agent receives the computed anomaly, holding context, related event records, related event candidates, macro context, top portfolio context, and prior user-visible alert history. It should use the Skill Hub why-the-move methodology when available and return an attribution packet with status, driver split, supporting events, confidence, and data-quality notes. This node does not decide push/no-push.
 - Node 8 builds the final analyst packet and prompt, calls Alva Ask only when event candidates or anomalies exist, validates the JSON response, and decides push vs no-push. Alva Ask keeps event exposure impact and anomaly attribution as separate flows and final message sections. It qualifies event candidates, estimates event exposure impact itself from the supplied portfolio snapshot and theme context, converts anomaly attribution packets into final anomaly-attribution findings, records the final status/reason for every item, and adds a `decision_lens` to selected findings with thesis impact, risk direction, key levels, scenarios, watch-next items, and optional compliant action framing.
@@ -58,17 +86,35 @@ The page is organized as nodes that mirror the production automation:
 ## Execution Environments
 
 - Most nodes are deterministic runtime code: config load, Arrays/Polymarket API calls, price and volume calculations, event normalization, dedupe, candidate construction, table appends, and KV writes.
-- The production implementation has one Pi Agent loop through `@alva/pi`:
-  - Market-breaking lane: code calls `agent.ask(buildBreakingNewsPrompt(...))` after fetching and engagement-ranking recent Arrays indexed X tweets. Pi reviews only the supplied top tweets for investment-related breaking-news eligibility and can use `searchBrave` up to twice for source expansion after a tweet qualifies. Source-expansion Brave calls use `result_filter="web"` and are not restricted to the recent event window, so Pi can find an older official / primary source for a fresh indexed-X post. Pi is instructed to look for the original/official source first, then the earliest credible media/source link. Code parses `event_scope=market_breaking` JSON into `breaking_news` records and records indexedXDiscovery plus actual tool calls in audit.
-  - Theme-news lane: the same Pi agent receives current theme context, linked holdings, current holding context, and supported Arrays market-news topics. It returns `themeTopicMappings[]` for every current theme, may call `searchArraysMarketNewsTopic(topic, theme)` to inspect Arrays topic rows inside the agent loop, and may run `searchBrave(..., purpose="theme_news")` as supplemental discovery. Pi-returned topic rows become `topic_news`; Pi-returned Brave theme rows remain `theme_news`. Code validates exact `related_holdings[].holding_symbol` values and relation strength when present, allows concrete high-confidence second-order/value-chain relations, stores context-only read-through for audit, and no longer drops portfolio-level macro/policy/risk/theme events solely because no exact holding-level symbol was returned.
+- The production implementation has one Pi Agent loop through `@alva/pi` for
+  external breaking-news portfolio mapping:
+  - Code reads already source-expanded external events and pre-maps obvious
+    direct ticker, option-underlying, theme, and macro/risk-bucket relevance.
+  - Pi reviews code's deterministic mapping, removes wrong links, and adds
+    source-grounded direct, peer, supplier/customer, option-underlying, or
+    high-confidence second-order/value-chain related holdings when supported.
+  - Pi does not search for news, call Brave, expand sources, or decide
+    push/no-push.
 - The production implementation has three Alva Ask (LLM) call types through `@alva/alvaask`:
   - Theme extraction: code calls `ask(buildThemeExtractionPrompt(snapshot))` every run after latest-price marking. It receives supplied portfolio JSON only and returns themes for current holdings.
   - Per-asset anomaly attribution: code loops over computed `asset_anomalies` and calls `ask(buildAnomalyAttributionPrompt(anomalyInput), { effort: "high" })` once per anomalous asset. The prompt asks the agent to use the Skill Hub why-the-move methodology when available, verify stale or thin facts with available tools when useful, and return attribution JSON only. These packets are analysis inputs, not final findings.
   - Final analyst gate: code calls `ask(buildAnalystPrompt(analystInput))` whenever event-impact candidates or computed asset anomalies exist. First run is context in `portfolio_context.current_portfolio_delta.firstRun`, not an automatic skip. The final analyst now acts as a low-noise PM note generator: selected findings include `decision_lens`, and `notification_message` chooses a compact single-finding note or one bullet per finding for multiple selected findings, with short-link anchors and explicit thesis/risk, key levels, and watch-next.
 - Portfolio reading is deterministic code, not an LLM call: dynamic mode calls the connected-account portfolio API with `X-Alva-Api-Key` auth; static mode reads the configured ALFS JSON file. The run requires usable `holdings[]` or `tickers[]`.
 - The final analyst gate does not use Pi or ADK and does not run a separate reflection/self-retry loop. It is still an Alva Ask call; if Alva Ask has managed tools available, the prompt permits it to verify suspicious or stale facts before returning JSON.
-- Market data, per-holding event source fetch, anomaly trigger calculations, candidate construction, and persistence are owned by code. Pi owns market/theme discovery and Pi-event-to-holding mapping for `breaking_news`, `theme_news`, and `topic_news`. The per-asset Anomaly Attribution Agent owns first-pass why-the-move analysis for computed anomalies. Event exposure impact sizing, novelty judgment, final anomaly wording, and final selected/suppressed decisions are owned by the final Alva Ask analyst.
-- The analyst packet is intentionally bounded: recent event records are capped at 100 records, review candidates are capped at 50 items, recent alert history is included, persisted finding history is not sent to the analyst, and the compact prompt JSON is capped at 1,000,000 characters. The Pi event-search context JSON is also capped at 1,000,000 characters so current holdings, themes, and source text are visible for mapping.
+- Market data, per-holding event source fetch, anomaly trigger calculations,
+  external breaking-news feed reads, deterministic pre-mapping, candidate
+  construction, and persistence are owned by code. Pi owns only the
+  external-breaking event-to-portfolio mapping review. The per-asset Anomaly
+  Attribution Agent owns first-pass why-the-move analysis for computed
+  anomalies. Event exposure impact sizing, novelty judgment, final anomaly
+  wording, and final selected/suppressed decisions are owned by the final Alva
+  Ask analyst.
+- The analyst packet is intentionally bounded: recent event records are capped
+  at 100 records, review candidates are capped at 50 items, recent alert
+  history is included, persisted finding history is not sent to the analyst,
+  and the compact prompt JSON is capped at 1,000,000 characters. The Pi
+  external-breaking mapping context JSON is also capped at 1,000,000 characters
+  so current holdings, themes, and source text are visible for mapping.
 - Completion is checked by code: portfolio JSON must parse and include holdings; analyst JSON must parse and is normalized into stable finding/decision objects. Code no longer applies a separate deterministic repeat override after the analyst decision.
 
 ## Alva Ask Prompt
@@ -145,7 +191,7 @@ The final analyst prompt is intentionally shorter than a full debug spec. It ask
 
 The automation has three separate stages that are easy to confuse:
 
-1. `rawEvents[]`: source records fetched from per-holding event sources, technical analysis, rate repricing, and Pi event search, including `technical_event`, `rate_repricing_event`, `rate_repricing_news`, `breaking_news`, `theme_news`, and Pi-mapped `topic_news`.
+1. `rawEvents[]`: source records fetched from per-holding event sources, technical analysis, rate repricing, and the external Breaking News feed, including `technical_event`, `rate_repricing_event`, `rate_repricing_news`, and Pi-reviewed external `breaking_news` rows.
 2. `event.items`: normalized/deduped source records. These rows can be `new`, `updated`, `seen_before`, or `duplicate`.
 3. Event-impact candidates: non-duplicate normalized source records. They can be `new`, `updated`, or `seen_before`. Per-holding source rows use deterministic code-populated `relatedHoldings` from the query/holding symbol; Pi rows use Pi-returned `related_holdings[]` for `affectedSymbols[]` only when code classifies the relation as holding-level, including high-confidence second-order/value-chain transmission. Context-only `theme_readthrough` stays audit-only. Broad macro/policy/risk/theme rows may become one portfolio-level candidate with `affectedSymbols: []`, `affectedThemes[]`, `risk_factors`, and `portfolio_relevance_basis` instead of being dropped for lacking a symbol.
 4. Computed asset anomalies: current price or volume anomaly triggers on held assets. These are anomaly facts, not event candidates.
@@ -166,7 +212,10 @@ The analyst prompt receives only event records that are referenced by event cand
 - Dynamic connected snapshots can lag recent trades, and static portfolio files remain unchanged until setup/update writes a new file. The automation records stale snapshot warnings when `asOfMs` is old.
 - If Arrays latest-price coverage is missing for a holding, that holding is marked unpriced and excluded from marked total value rather than falling back to broker market value. This can understate total value until coverage is added.
 - Intraday volume baselines can be thin for assets with limited history, unusual holidays, halted trading, ticker changes, or vendor gaps.
-- Market-wide X discovery is handled by code-ranked Arrays indexed X top-engagement rows plus the bounded Pi event-search loop, not as a per-holding ticker query and not via Grok text queries. If Pi returns noisy broad-market rows, the analyst gate should suppress them or mark weak_correlation.
+- Market-wide breaking-news discovery quality depends on the configured
+  external Breaking News feed. If that feed misses an event, Portfolio Watch
+  will not rediscover it internally; it only maps and analyzes rows it receives
+  from the external feed plus its other per-holding/rate/macro lanes.
 - Theme exposure depends on the per-run Alva Ask theme extraction. If that LLM output is missing or malformed, the automation records a warning and falls back to the prior snapshot or fallback config for continuity.
 - The analyst decision is constrained by supplied JSON. If a catalyst is not in fetched event or macro context, it should not be invented.
 
