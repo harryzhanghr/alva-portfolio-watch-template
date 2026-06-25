@@ -1265,7 +1265,7 @@
 
     function searchExpansionTraceForRun(run) {
       const direct = artifactJsonForRun(run, "searchExpansionTraceJson", null);
-      if (direct && typeof direct === "object" && (Array.isArray(direct.allToolCalls) || Array.isArray(direct.sourceExpansionCalls))) return direct;
+      if (direct && typeof direct === "object" && (Array.isArray(direct.allToolCalls) || Array.isArray(direct.sourceExpansionCalls) || direct.sourceMode || direct.externalFeedPath)) return direct;
       const fetch = parseJson(run && run.dataFetchSummaryJson, {});
       if (fetch.searchExpansionTrace && typeof fetch.searchExpansionTrace === "object") return fetch.searchExpansionTrace;
       const llm = parseJson(run && run.llmDecisionJson, {});
@@ -1293,6 +1293,12 @@
         queryPlanning: summary.queryPlanning || "",
         sourceExpansionPolicy: summary.sourceExpansionPolicy || "Recovered from legacy llmDecisionJson/dataFetchSummaryJson.",
         toolCallCount: toolCalls.length,
+        sourceMode: summary.sourceMode || "",
+        externalFeedPath: summary.externalFeedPath || summary.feedReadPath || "",
+        externalReadPath: summary.feedReadPath || "",
+        externalRowsRead: summary.externalRowsRead || summary.rowsRead || 0,
+        deterministicMappedEventCount: summary.deterministicMappedEventCount || 0,
+        piReviewedEventCount: summary.piReviewedEventCount || 0,
         indexedXDiscovery: summary.indexedXDiscovery || null,
         indexedXDiscoveryCalls: toolCalls.filter((call) => call.tool === "searchArraysIndexedX"),
         xDiscoveryCalls: toolCalls.filter((call) => call.tool === "searchArraysIndexedX" || call.tool === "searchGrokX"),
@@ -1586,9 +1592,11 @@
 
     function renderSearchExpansionTrace(run) {
       const trace = searchExpansionTraceForRun(run);
-      if (!trace || (!trace.toolCallCount && !(trace.searchAudit || []).length)) {
-        return '<div class="empty">No Pi search expansion trace is available for this run.</div>';
+      if (!trace || (!trace.toolCallCount && !(trace.searchAudit || []).length && !trace.externalFeedPath && !trace.sourceMode)) {
+        return '<div class="empty">No breaking-news source trace is available for this run.</div>';
       }
+      const sourceMode = String(trace.sourceMode || "").toLowerCase();
+      const isExternal = sourceMode === "external_feed" || !!trace.externalFeedPath || Number(trace.externalRowsRead || 0) > 0;
       const calls = Array.isArray(trace.allToolCalls) ? trace.allToolCalls : [];
       const indexed = trace.indexedXDiscovery || {};
       const indexedTopTweets = Array.isArray(indexed.topTweets) ? indexed.topTweets : [];
@@ -1628,9 +1636,21 @@
         '<td>' + esc(row.candidate_count == null ? row.candidateCount == null ? "--" : row.candidateCount : row.candidate_count) + '</td>' +
         '<td>' + esc(row.result_assessment || row.resultAssessment || "") + '</td>' +
         '</tr>').join("");
-      return '<div class="notice">' + esc(trace.sourceExpansionPolicy || "Trace of Pi discovery and source expansion calls.") + '</div>' +
-        '<div class="kv-grid">' +
-        '<div class="kv-box"><b>Trace summary</b>' + jsonBlock({
+      const traceNotice = isExternal
+        ? "Portfolio Watch is reading an external Breaking News feed, then reviewing only portfolio-specific mapping. The upstream feed owns market-wide discovery, source expansion, clustering, and source confidence."
+        : (trace.sourceExpansionPolicy || "Trace of Pi discovery and source expansion calls.");
+      const summaryPayload = isExternal ? {
+          sourceMode: trace.sourceMode || "external_feed",
+          externalFeedPath: trace.externalFeedPath || "",
+          externalReadPath: trace.externalReadPath || trace.externalFeedPath || "",
+          externalRowsRead: trace.externalRowsRead || 0,
+          deterministicMappedEventCount: trace.deterministicMappedEventCount || 0,
+          piReviewedEventCount: trace.piReviewedEventCount || 0,
+          toolCallCount: trace.toolCallCount || calls.length,
+          parsedEventCount: trace.parsedEventCount,
+          rawEventRecords: trace.rawEventRecords,
+          error: trace.error || "",
+        } : {
           agentCalled: trace.agentCalled,
           queryPlanning: trace.queryPlanning,
           toolCallCount: trace.toolCallCount,
@@ -1648,12 +1668,20 @@
           parsedEventCount: trace.parsedEventCount,
           rawEventRecords: trace.rawEventRecords,
           error: trace.error || "",
-        }) + '</div>' +
-        '<div class="kv-box"><b>Theme topic mappings</b>' + jsonBlock(trace.themeTopicMappings || []) + '</div>' +
+        };
+      return '<div class="notice">' + esc(traceNotice) + '</div>' +
+        '<div class="kv-grid">' +
+        '<div class="kv-box"><b>' + esc(isExternal ? "External feed + mapping summary" : "Trace summary") + '</b>' + jsonBlock(summaryPayload) + '</div>' +
+        '<div class="kv-box"><b>' + esc(isExternal ? "Mapping review audit" : "Theme topic mappings") + '</b>' + jsonBlock(isExternal ? {
+          agentCalled: trace.agentCalled,
+          queryPlanning: trace.queryPlanning,
+          sourceExpansionPolicy: trace.sourceExpansionPolicy || "",
+          searchAudit: trace.searchAudit || [],
+        } : (trace.themeTopicMappings || [])) + '</div>' +
         '</div>' +
         (indexedTopTweets.length ? '<details class="section" open style="margin-top:10px"><summary><h3>Indexed X Top Tweets</h3>' + badge(indexedTopTweets.length + " shown", "blue") + '</summary><div class="section-content"><div class="notice">Code fetched recent indexed X posts with no text query, paged backward through the configured window, ranked unique rows by engagement, and supplied the top list to Pi for breaking-news judgment.</div><div class="table-wrap"><table><thead><tr><th>Rank</th><th>Handle</th><th>Tweet</th><th>Score</th></tr></thead><tbody>' + indexedRows + '</tbody></table></div></div></details>' : '') +
         '<div class="table-wrap"><table><thead><tr><th>#</th><th>Tool / purpose</th><th>Query / filters</th><th>Rows</th><th>Status</th></tr></thead><tbody>' + (rows || '<tr><td colspan="5">No tool calls.</td></tr>') + '</tbody></table></div>' +
-        '<details class="section" style="margin-top:10px"><summary><h3>Pi Search Audit</h3>' + badge((trace.searchAudit || []).length + " rows", "blue") + '</summary><div class="section-content">' +
+        '<details class="section" style="margin-top:10px"><summary><h3>' + esc(isExternal ? "Mapping Review Audit" : "Pi Search Audit") + '</h3>' + badge((trace.searchAudit || []).length + " rows", "blue") + '</summary><div class="section-content">' +
         '<div class="table-wrap"><table><thead><tr><th>Lane</th><th>Theme</th><th>Query</th><th>Tools</th><th>Candidates</th><th>Assessment</th></tr></thead><tbody>' + (auditRows || '<tr><td colspan="6">No search_audit rows returned by Pi.</td></tr>') + '</tbody></table></div>' +
         '</div></details>';
     }
@@ -1894,7 +1922,7 @@
         '<div class="panel-body">' +
         legacyNotice +
         '<div class="metric-grid">' + metrics + '</div>' +
-        '<details class="section" open><summary><h3>Search Expansion Trace</h3>' + badge(searchExpansionTraceForRun(run).toolCallCount + " calls", "violet") + '</summary><div class="section-content">' + renderSearchExpansionTrace(run) + '</div></details>' +
+        '<details class="section" open><summary><h3>Breaking News Source Trace</h3>' + badge(searchExpansionTraceForRun(run).toolCallCount + " calls", "violet") + '</summary><div class="section-content">' + renderSearchExpansionTrace(run) + '</div></details>' +
         '<div class="artifact-grid">' +
         '<details class="section" open><summary><h3>Raw Events</h3>' + badge(rawEvents.length + " rows", "blue") + '</summary><div class="section-content">' + renderRawEvents(run) + '</div></details>' +
         '<details class="section" open><summary><h3>Event Candidates</h3>' + badge(eventCandidates.length + " items", "blue") + '</summary><div class="section-content">' + renderEventCandidates(run) + '</div></details>' +
@@ -1935,8 +1963,8 @@
         }) + '</div>' +
         '<div class="kv-box"><b>Macro freshness</b>' + jsonBlock(fetch.macroFreshness || []) + '</div>' +
         '<div class="kv-box"><b>Alva Ask theme extraction</b>' + jsonBlock(themeExtraction) + '</div>' +
-        '<div class="kv-box"><b>Pi event-search summary</b>' + jsonBlock(breaking) + '</div>' +
-        '<div class="kv-box"><b>Pi theme-news lane summary</b>' + jsonBlock(themeNews) + '</div>' +
+        '<div class="kv-box"><b>Breaking News feed + mapping summary</b>' + jsonBlock(breaking) + '</div>' +
+        '<div class="kv-box"><b>Theme-news lane summary (legacy/internal mode)</b>' + jsonBlock(themeNews) + '</div>' +
         '<div class="kv-box"><b>Market data coverage</b><table><thead><tr><th>Asset</th><th>1d bars</th><th>1min bars</th><th>1h bars</th><th>Latest 1d</th><th>Latest 1min</th><th>Latest 1h</th></tr></thead><tbody>' + (rows || '<tr><td colspan="7">No coverage rows.</td></tr>') + '</tbody></table></div>' +
         '</div>';
     }
@@ -1970,8 +1998,8 @@
       return '<div class="kv-grid">' +
         '<div class="kv-box"><b>Portfolio ingest / API read</b>' + jsonBlock(llm.portfolioReader || {}) + '</div>' +
         '<div class="kv-box"><b>Alva Ask theme extraction</b>' + jsonBlock(llm.themeExtractor || {}) + '</div>' +
-        '<div class="kv-box"><b>Pi event-search loop</b>' + jsonBlock(llm.breakingNews || {}) + '</div>' +
-        '<div class="kv-box"><b>Pi theme-news lane</b>' + jsonBlock(llm.themeNews || {}) + '</div>' +
+        '<div class="kv-box"><b>Breaking-news feed / mapping review</b>' + jsonBlock(llm.breakingNews || {}) + '</div>' +
+        '<div class="kv-box"><b>Theme-news lane (legacy/internal mode)</b>' + jsonBlock(llm.themeNews || {}) + '</div>' +
         '<div class="kv-box"><b>Alva Ask anomaly attribution agents</b>' + jsonBlock(llm.anomalyAttributionAgents || {}) + '</div>' +
         '<div class="kv-box"><b>Analyst gate</b>' + jsonBlock(llm.analyst || {}) + '</div>' +
         '</div>';
