@@ -53,8 +53,9 @@ feed id, cron id, aliases, themes, or run logs.
 Ask for or infer these from Alva workspace state:
 
 - `portfolioMode`: `dynamic` or `static`.
-- For `dynamic`: `accountId` or `connectedAccountId`, the user's connected
-  portfolio account id.
+- For `dynamic`: one or more connected portfolio account ids. Use `accountIds`
+  / `connectedAccountIds` / `portfolioAccountIds` for multi-broker setups, or
+  `accountId` / `connectedAccountId` for a single account.
 - For `static`: `staticPortfolioPath`, an ALFS JSON file that contains
   `holdings[]` or `tickers[]`.
 - `positionCompleteness`: `full_quantity` or `ticker_only`. Dynamic portfolios
@@ -79,7 +80,7 @@ Pass these through `env.args` when creating the automation:
   "feedName": "portfolio-watch-automation",
   "portfolioMode": "dynamic",
   "positionCompleteness": "full_quantity",
-  "accountId": "<CONNECTED_ACCOUNT_ID>",
+  "accountIds": ["<CONNECTED_ACCOUNT_ID_1>", "<CONNECTED_ACCOUNT_ID_2>"],
   "ownerUsername": "<ALVA_USERNAME>",
   "runSource": "cron_push_pipeline",
   "breakingNewsSourceMode": "external_feed",
@@ -107,16 +108,18 @@ Static ticker-only example:
 ```
 
 The source intentionally fails fast if the configured source is missing:
-dynamic mode requires `accountId` / `connectedAccountId`; static mode requires
-`staticPortfolioPath`.
+dynamic mode requires at least one configured account id; static mode requires
+`staticPortfolioPath`. When dynamic mode receives multiple account ids, it reads
+each connected snapshot and aggregates same-symbol holdings plus cash before any
+market-data, event, anomaly, or analyst step.
 
 ### Creation Steps
 
 1. Copy `src/portfolio-watch-automation.js` into an Alva automation.
 2. Set `env.args.feedName`, `env.args.portfolioMode`,
    `env.args.positionCompleteness`, and the matching source field
-   (`accountId` / `connectedAccountId` for dynamic, `staticPortfolioPath` for
-   static).
+   (`accountIds` / `connectedAccountIds` / `portfolioAccountIds` for dynamic,
+   or `staticPortfolioPath` for static).
 3. Schedule the automation hourly, for example `0 * * * *`.
 4. Create or update an audit playbook from `playbooks/audit-log/index.html`.
 5. Configure the audit playbook by editing constants or opening with query

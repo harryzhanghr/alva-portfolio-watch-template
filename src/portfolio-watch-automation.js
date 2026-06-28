@@ -14,6 +14,7 @@ const DEFAULT_TECHNICAL_EVENT_DETECTORS = ["breakout", "support_resistance", "rs
 const TECHNICAL_SEVERITY_RANK = { low: 1, medium: 2, high: 3 };
 const FEED_NAME = ARGS.feedName || "portfolio-watch-automation";
 const ACCOUNT_ID = ARGS.accountId || ARGS.connectedAccountId || "";
+const ACCOUNT_IDS = normalizeAccountIds(ARGS.accountIds || ARGS.connectedAccountIds || ARGS.portfolioAccountIds || ACCOUNT_ID);
 const OWNER_USERNAME = ARGS.ownerUsername || ARGS.username || "";
 const ALFS_USERNAME = (env && env.username) || OWNER_USERNAME || "";
 const PORTFOLIO_MODE = normalizePortfolioMode(ARGS.portfolioMode || (ARGS.staticPortfolioPath ? "static" : "dynamic"));
@@ -371,6 +372,37 @@ function normalizePositionCompleteness(value) {
   if (text === "ticker_only" || text === "tickers_only" || text === "ticker") return "ticker_only";
   if (text === "full_quantity" || text === "quantity" || text === "full") return "full_quantity";
   return "";
+}
+
+function normalizeAccountIds(value) {
+  const seen = {};
+  const out = [];
+  function add(item) {
+    if (Array.isArray(item)) {
+      item.forEach(add);
+      return;
+    }
+    if (item === undefined || item === null) return;
+    String(item).split(",").forEach((part) => {
+      const text = String(part || "").trim();
+      if (!text || seen[text]) return;
+      seen[text] = true;
+      out.push(text);
+    });
+  }
+  add(value);
+  return out;
+}
+
+function accountIdLabel(accountIds) {
+  const ids = normalizeAccountIds(accountIds);
+  if (!ids.length) return "";
+  if (ids.length === 1) return ids[0];
+  return "aggregate:" + ids.join(",");
+}
+
+function snapshotAccountId(snapshot) {
+  return (snapshot && snapshot.accountId) || accountIdLabel(ACCOUNT_IDS) || ACCOUNT_ID || "";
 }
 
 function portfolioCapabilities(positionCompleteness) {
@@ -1134,31 +1166,42 @@ function normalizeAssetClass(rawHolding, symbol) {
   return "equity";
 }
 
-function normalizeRawHolding(h, positionCompleteness) {
+function normalizeRawHolding(h, positionCompleteness, sourceAccountId) {
   const symbol = String((h && (h.symbol || h.ticker)) || "").trim().toUpperCase();
   if (!symbol) return null;
   const assetClass = normalizeAssetClass(h, symbol);
   const quantity = positionCompleteness === "full_quantity" ? amount(h && h.quantity) : null;
+  const currency = String((h && h.currency) || "USD");
+  const side = String((h && h.side) || "");
+  const sourceAccounts = sourceAccountId
+    ? [{ accountId: sourceAccountId, side, quantity, currency }]
+    : [];
   return {
     instrumentId: assetClass + ":" + symbol,
     symbol,
     assetClass,
-    side: String((h && h.side) || ""),
+    side,
     quantity,
     quantityKnown: Number.isFinite(quantity),
     currentPrice: null,
     marketValue: null,
     allocation: null,
-    currency: String((h && h.currency) || "USD"),
-    instrumentDetails: assetClass === "option" ? parseOptionSymbol(symbol) : {},
+    currency,
+    instrumentDetails: {
+      ...(assetClass === "option" ? parseOptionSymbol(symbol) : {}),
+      sourceAccounts,
+    },
   };
 }
 
 function finalizePortfolioSnapshot(normalizedHoldings, params) {
   const positionCompleteness = normalizePositionCompleteness(params.positionCompleteness) || "full_quantity";
+  const accountIds = normalizeAccountIds(params.accountIds || params.accountId);
   normalizedHoldings.sort((a, b) => String(a.symbol).localeCompare(String(b.symbol)));
   return {
-    accountId: params.accountId || "",
+    accountId: params.accountId || accountIdLabel(accountIds),
+    accountIds,
+    sourceAccounts: params.sourceAccounts || [],
     portfolioMode: params.portfolioMode,
     ingestSource: params.ingestSource,
     staticPortfolioPath: params.staticPortfolioPath || "",
@@ -1177,15 +1220,29 @@ function finalizePortfolioSnapshot(normalizedHoldings, params) {
   };
 }
 
-function normalizeConnectedPortfolio(parsed, runAtMs) {
+function signedHoldingQuantity(holding) {
+  const q = amount(holding && holding.quantity);
+  if (!Number.isFinite(q)) return null;
+  return String(holding && holding.side || "").toUpperCase() === "SHORT" ? -Math.abs(q) : q;
+}
+
+function normalizeConnectedPortfolio(parsed, runAtMs, accountId) {
   const holdings = Array.isArray(parsed.holdings) ? parsed.holdings : [];
   const cash = amount(parsed.cash);
   const parsedAsOfMs = amount(parsed.asOfMs);
   const normalizedHoldings = holdings
-    .map((h) => normalizeRawHolding(h, "full_quantity"))
+    .map((h) => normalizeRawHolding(h, "full_quantity", accountId))
     .filter((h) => h && h.symbol && Number.isFinite(h.quantity));
   return finalizePortfolioSnapshot(normalizedHoldings, {
-    accountId: ACCOUNT_ID,
+    accountId,
+    accountIds: [accountId],
+    sourceAccounts: [{
+      accountId,
+      holdingCount: normalizedHoldings.length,
+      cash,
+      asOfMs: parsedAsOfMs || null,
+      asOfMsEstimated: !parsedAsOfMs,
+    }],
     portfolioMode: "dynamic",
     ingestSource: "connected_snapshot",
     positionCompleteness: "full_quantity",
@@ -1193,11 +1250,106 @@ function normalizeConnectedPortfolio(parsed, runAtMs) {
     asOfMs: parsedAsOfMs,
     asOfMsEstimated: !parsedAsOfMs,
     runAtMs,
-	  });
+  });
 }
 
-function normalizeSummary(parsed, runAtMs) {
-  return normalizeConnectedPortfolio(parsed, runAtMs);
+function aggregateConnectedSnapshots(snapshots, runAtMs, warnings) {
+  const rows = (snapshots || []).filter(Boolean);
+  if (!rows.length) throw new Error("Dynamic portfolio ingest returned no connected snapshots");
+  if (rows.length === 1) return rows[0];
+
+  const accountIds = [];
+  let cash = null;
+  let cashMissing = 0;
+  const asOfValues = [];
+  let asOfMsEstimated = false;
+  const holdingsByInstrument = {};
+  const sourceAccounts = [];
+
+  rows.forEach((snapshot) => {
+    const ids = normalizeAccountIds(snapshot.accountIds || snapshot.accountId);
+    ids.forEach((id) => {
+      if (accountIds.indexOf(id) < 0) accountIds.push(id);
+    });
+    sourceAccounts.push.apply(sourceAccounts, snapshot.sourceAccounts || ids.map((id) => ({ accountId: id })));
+    if (Number.isFinite(snapshot.cash)) {
+      cash = (cash || 0) + snapshot.cash;
+    } else {
+      cashMissing += 1;
+    }
+    if (Number.isFinite(snapshot.asOfMs)) asOfValues.push(snapshot.asOfMs);
+    if (snapshot.asOfMsEstimated) asOfMsEstimated = true;
+
+    (snapshot.holdings || []).forEach((holding) => {
+      const signedQty = signedHoldingQuantity(holding);
+      if (!Number.isFinite(signedQty)) return;
+      const key = holding.instrumentId || ((holding.assetClass || "equity") + ":" + holding.symbol);
+      if (!holdingsByInstrument[key]) {
+        holdingsByInstrument[key] = {
+          instrumentId: key,
+          symbol: holding.symbol,
+          assetClass: holding.assetClass,
+          side: signedQty < 0 ? "SHORT" : "LONG",
+          quantity: 0,
+          quantityKnown: true,
+          currentPrice: null,
+          marketValue: null,
+          allocation: null,
+          currency: holding.currency || "USD",
+          instrumentDetails: {
+            ...(holding.instrumentDetails || {}),
+            sourceAccounts: [],
+          },
+          _signedQuantity: 0,
+        };
+      }
+      const target = holdingsByInstrument[key];
+      target._signedQuantity += signedQty;
+      const details = holding.instrumentDetails || {};
+      const sourceRows = Array.isArray(details.sourceAccounts) && details.sourceAccounts.length
+        ? details.sourceAccounts
+        : [{ accountId: snapshot.accountId, side: holding.side, quantity: holding.quantity, currency: holding.currency }];
+      target.instrumentDetails.sourceAccounts = (target.instrumentDetails.sourceAccounts || []).concat(sourceRows);
+      if (target.currency !== holding.currency && holding.currency) {
+        warnings.push({ source: "portfolio:aggregate:" + holding.symbol, error: "same holding appeared with mixed currencies across connected portfolios; kept first currency for display" });
+      }
+    });
+  });
+
+  if (cashMissing) {
+    warnings.push({ source: "portfolio:aggregate", error: cashMissing + " connected portfolio snapshot(s) did not provide cash; aggregate cash may be understated" });
+  }
+
+  const normalizedHoldings = Object.keys(holdingsByInstrument)
+    .map((key) => {
+      const holding = holdingsByInstrument[key];
+      const signedQty = holding._signedQuantity;
+      if (!Number.isFinite(signedQty) || Math.abs(signedQty) <= CONFIG.materiality.quantityEpsilon) return null;
+      const out = { ...holding };
+      delete out._signedQuantity;
+      out.side = signedQty < 0 ? "SHORT" : "LONG";
+      out.quantity = Math.abs(signedQty);
+      out.quantityKnown = true;
+      return out;
+    })
+    .filter(Boolean);
+
+  return finalizePortfolioSnapshot(normalizedHoldings, {
+    accountId: accountIdLabel(accountIds),
+    accountIds,
+    sourceAccounts,
+    portfolioMode: "dynamic",
+    ingestSource: "connected_snapshot_aggregate",
+    positionCompleteness: "full_quantity",
+    cash,
+    asOfMs: asOfValues.length ? Math.min.apply(null, asOfValues) : runAtMs,
+    asOfMsEstimated: asOfMsEstimated || !asOfValues.length,
+    runAtMs,
+  });
+}
+
+function normalizeSummary(parsed, runAtMs, accountId) {
+  return normalizeConnectedPortfolio(parsed, runAtMs, accountId);
 }
 
 function staticPortfolioRows(parsed) {
@@ -1248,14 +1400,18 @@ async function readStaticPortfolio(runAtMs, warnings) {
 
 async function ingestPortfolio(runAtMs, warnings) {
   if (CONFIG.portfolioMode === "static") return readStaticPortfolio(runAtMs, warnings);
-  if (!ACCOUNT_ID) {
-    throw new Error("portfolioMode=dynamic requires env.args.accountId or env.args.connectedAccountId");
+  if (!ACCOUNT_IDS.length) {
+    throw new Error("portfolioMode=dynamic requires env.args.accountIds, env.args.accountId, or env.args.connectedAccountId");
   }
-  const parsedPortfolio = await fetchPortfolioSummary(ACCOUNT_ID);
-  if (!parsedPortfolio || !Array.isArray(parsedPortfolio.holdings)) {
-    throw new Error("Connected portfolio API did not return usable holdings[]");
+  const snapshots = [];
+  for (const accountId of ACCOUNT_IDS) {
+    const parsedPortfolio = await fetchPortfolioSummary(accountId);
+    if (!parsedPortfolio || !Array.isArray(parsedPortfolio.holdings)) {
+      throw new Error("Connected portfolio API did not return usable holdings[] for " + accountId);
+    }
+    snapshots.push(normalizeConnectedPortfolio(parsedPortfolio, runAtMs, accountId));
   }
-  return normalizeConnectedPortfolio(parsedPortfolio, runAtMs);
+  return aggregateConnectedSnapshots(snapshots, runAtMs, warnings);
 }
 
 function markSnapshotToLatest(snapshot, priceSignals, warnings) {
@@ -1487,6 +1643,9 @@ function topHoldingsSummary(snapshot, limit) {
 
 function compactHoldingForAnalystInput(snapshot, h) {
   const canSize = canComputePortfolioSizing(snapshot);
+  const sourceAccounts = h && h.instrumentDetails && Array.isArray(h.instrumentDetails.sourceAccounts)
+    ? h.instrumentDetails.sourceAccounts
+    : [];
   return {
     symbol: h.symbol,
     assetClass: h.assetClass,
@@ -1496,6 +1655,7 @@ function compactHoldingForAnalystInput(snapshot, h) {
     marketValue: canSize ? round(h.marketValue, 2) : null,
     weight: canSize ? round(h.allocation, 4) : null,
     positionSizeAvailable: canSize,
+    sourceAccountCount: sourceAccounts.length || null,
     themes: themesForHolding(snapshot, h),
   };
 }
@@ -1510,7 +1670,13 @@ function buildThemeExtractionPrompt(snapshot, previous) {
     quantity: canComputeSizing ? h.quantity : null,
     weight: canComputeSizing ? round(h.allocation || 0, 4) : null,
     marketValue: canComputeSizing ? round(h.marketValue || 0, 2) : null,
-    instrumentDetails: h.instrumentDetails || {},
+    instrumentDetails: {
+      underlying: h.instrumentDetails && h.instrumentDetails.underlying || "",
+      optionType: h.instrumentDetails && h.instrumentDetails.optionType || "",
+      expiry: h.instrumentDetails && h.instrumentDetails.expiry || "",
+      strike: h.instrumentDetails && h.instrumentDetails.strike || null,
+      sourceAccountCount: h.instrumentDetails && Array.isArray(h.instrumentDetails.sourceAccounts) ? h.instrumentDetails.sourceAccounts.length : null,
+    },
     priorThemes: previousThemeMap[h.symbol] || fallbackThemesForSymbol(h.symbol),
   }));
   return [
@@ -4942,6 +5108,9 @@ function anomalyThemes(snapshot, anomaly) {
 function compactHoldingForAnomalyAgent(snapshot, anomaly) {
   const holding = bySymbol(snapshot)[anomaly && anomaly.symbol] || {};
   const canComputeSizing = canComputePortfolioSizing(snapshot);
+  const sourceAccounts = holding && holding.instrumentDetails && Array.isArray(holding.instrumentDetails.sourceAccounts)
+    ? holding.instrumentDetails.sourceAccounts
+    : [];
   return {
     symbol: holding.symbol || (anomaly && anomaly.symbol) || "",
     assetClass: holding.assetClass || "",
@@ -4951,6 +5120,7 @@ function compactHoldingForAnomalyAgent(snapshot, anomaly) {
     marketValue: canComputeSizing ? holding.marketValue : null,
     weight: canComputeSizing ? round(holding.allocation || 0, 4) : null,
     positionSizeAvailable: canComputeSizing,
+    sourceAccountCount: sourceAccounts.length || null,
     themes: anomalyThemes(snapshot, anomaly),
     marketDataSymbol: anomaly && anomaly.marketDataSymbol || holding.symbol || "",
     underlyingSymbol: anomaly && anomaly.underlyingSymbol || "",
@@ -5141,7 +5311,8 @@ function runAnomalyAttributionAgents(anomalies, context) {
 	    const canComputeSizingForPacket = canComputePortfolioSizing(context.snapshot || {});
 	    const promptInput = {
       run_at_hkt: context.runAtHkt || hkt(context.runAtMs),
-      account_id: ACCOUNT_ID,
+      account_id: snapshotAccountId(context.snapshot || {}),
+      account_ids: (context.snapshot && context.snapshot.accountIds) || [],
       anomaly_index: idx + 1,
       anomaly,
       holding: compactHoldingForAnomalyAgent(context.snapshot || {}, anomaly),
@@ -5380,7 +5551,7 @@ function buildAnalystPrompt(input) {
     "- Do not push routine price-target noise, broad market color with no portfolio implication, weak correlations, or not-qualified event candidates.",
 	    "",
 	    "5. Data contract",
-	    "- Dynamic mode reads a connected portfolio snapshot each run. Static mode reads the configured static portfolio file each run; holdings stay unchanged until setup/update writes a new file.",
+	    "- Dynamic mode reads one or more connected portfolio snapshots each run and aggregates holdings/cash before this analyst step. Static mode reads the configured static portfolio file each run; holdings stay unchanged until setup/update writes a new file.",
 	    "- full_quantity portfolios can use position quantity, Arrays latest 1min price, cash, weights, NAV deltas, and exposure percentages when coverage exists. ticker_only portfolios can use held tickers, themes, price/volume anomalies, event mapping, and related-holding logic, but must not invent weights, market value, NAV, or exposure percentages.",
 	    "- Broker/source currentPrice, marketValue, cost basis, realized P&L, and unrealized P&L are intentionally omitted. Valuation uses source quantity times Arrays latest 1min price when full_quantity is available, plus source cash when supplied.",
 	    "- Breaking-news source mode may read an external Breaking News feed instead of running Portfolio Watch's own market-wide news discovery. In external mode, relatedHoldings/affectedSymbols are produced by a code pre-map plus a Pi portfolio mapping review before this analyst step.",
@@ -5887,7 +6058,7 @@ function buildPersistDeltaRows(input) {
     },
   ];
   const auditRowsPlanned = rows.length + 2;
-  rows.push({
+	  rows.push({
     fileKey: "audit.run_log",
     fileLabel: "Run Audit Log",
     storageType: "feed_timeseries",
@@ -5906,11 +6077,11 @@ function buildPersistDeltaRows(input) {
     deltaSummary: "Added per-file delta rows for this run, including this audit file's own append.",
 	    delta: { runSource: RUN_SOURCE, portfolioMode: snapshot.portfolioMode, positionCompleteness: snapshot.positionCompleteness, trackedFileCount: auditRowsPlanned },
     pointer: { path: feedDataPath("audit", "persist_delta", "@last/500"), runAtMs },
-  });
-	  return rows.map((row) => ({
-	    date: runAtMs,
-	    accountId: ACCOUNT_ID,
-	    portfolioMode: snapshot.portfolioMode,
+	  });
+		  return rows.map((row) => ({
+		    date: runAtMs,
+		    accountId: snapshotAccountId(snapshot),
+		    portfolioMode: snapshot.portfolioMode,
 	    positionCompleteness: snapshot.positionCompleteness,
 	    runSource: RUN_SOURCE,
     fileKey: row.fileKey,
@@ -5984,12 +6155,15 @@ function buildRunAudit(input) {
 	  const llmDecision = {
 	    portfolioReader: {
 	      environment: "Code",
-	      call: CONFIG.portfolioMode === "dynamic" ? "fetchPortfolioSummary(ACCOUNT_ID)" : "alfs.readFile(staticPortfolioPath)",
+		      call: CONFIG.portfolioMode === "dynamic" ? "fetchPortfolioSummary(accountId) for each configured account id, then aggregate connected snapshots" : "alfs.readFile(staticPortfolioPath)",
 	      toolLoop: false,
 	      browsing: false,
-	      contract: "Dynamic mode reads the connected portfolio snapshot each run. Static mode reads the configured static portfolio file each run. No LLM portfolio interpretation.",
-	      output: {
-	        portfolioMode: snapshot.portfolioMode,
+	      contract: "Dynamic mode reads one or more connected portfolio snapshots each run and aggregates them before analysis. Static mode reads the configured static portfolio file each run. No LLM portfolio interpretation.",
+		      output: {
+		        accountId: snapshotAccountId(snapshot),
+		        accountIds: snapshot.accountIds || [],
+		        sourceAccountCount: (snapshot.sourceAccounts || []).length,
+		        portfolioMode: snapshot.portfolioMode,
 	        positionCompleteness: snapshot.positionCompleteness,
 	        portfolioCapabilities: snapshot.portfolioCapabilities,
 	        holdingCount: snapshot.holdingCount,
@@ -6143,11 +6317,11 @@ function buildRunAudit(input) {
 	      step: 1,
 	      node: "Portfolio source read",
 	      environment: "Code",
-	      input: { portfolioMode: CONFIG.portfolioMode, accountId: ACCOUNT_ID || "", staticPortfolioPath: resolveAlfsPath(CONFIG.staticPortfolioPath) || "", runSource: RUN_SOURCE },
+	      input: { portfolioMode: CONFIG.portfolioMode, accountId: ACCOUNT_ID || "", accountIds: ACCOUNT_IDS, staticPortfolioPath: resolveAlfsPath(CONFIG.staticPortfolioPath) || "", runSource: RUN_SOURCE },
 	      action: CONFIG.portfolioMode === "dynamic"
-	        ? "Call fetchPortfolioSummary(accountId), which uses GET /api/v1/portfolio/summary with X-Alva-Api-Key auth."
+	        ? "Call fetchPortfolioSummary(accountId) for each configured account id, then aggregate holdings/cash into one portfolio snapshot using GET /api/v1/portfolio/summary with X-Alva-Api-Key auth."
 	        : "Read the configured static portfolio JSON from ALFS.",
-	      output: { portfolioMode: snapshot.portfolioMode, positionCompleteness: snapshot.positionCompleteness, holdingCount: snapshot.holdingCount, snapshotAsOfHkt: hkt(snapshot.asOfMs), cash: snapshot.cash },
+	      output: { accountId: snapshotAccountId(snapshot), accountIds: snapshot.accountIds || [], portfolioMode: snapshot.portfolioMode, positionCompleteness: snapshot.positionCompleteness, holdingCount: snapshot.holdingCount, snapshotAsOfHkt: hkt(snapshot.asOfMs), cash: snapshot.cash },
 	      gate: "Portfolio state comes from the configured setup source only; no Alva Ask, memory, watchlists, or prior-run portfolio reconstruction.",
 	    },
 	    {
@@ -6433,7 +6607,8 @@ function buildRunAudit(input) {
       analyst.decision = buildFallbackDecision("no event candidate or asset anomaly was built");
     } else {
 	      const analystInput = {
-	        account_id: ACCOUNT_ID,
+	        account_id: snapshotAccountId(snapshot),
+	        account_ids: snapshot.accountIds || [],
 	        portfolio_mode: snapshot.portfolioMode,
 	        position_completeness: snapshot.positionCompleteness,
 	        portfolio_capabilities: snapshot.portfolioCapabilities,
@@ -6454,6 +6629,9 @@ function buildRunAudit(input) {
         prior_alert_history: priorAlertTimeline,
 	        portfolio_snapshot: {
 	          portfolioMode: snapshot.portfolioMode,
+	          accountId: snapshotAccountId(snapshot),
+	          accountIds: snapshot.accountIds || [],
+	          sourceAccountCount: (snapshot.sourceAccounts || []).length,
 	          ingestSource: snapshot.ingestSource,
 	          positionCompleteness: snapshot.positionCompleteness,
 	          portfolioCapabilities: snapshot.portfolioCapabilities,
@@ -6537,9 +6715,9 @@ function buildRunAudit(input) {
 	    const notifyBody = shouldPush ? pmNotificationMessage : SKIP;
 	    const notifyTitle = shouldPush ? "Portfolio Watch" : "Portfolio Watch Quiet";
 
-    await ctx.self.ts("portfolio", "snapshot").append([{
+	    await ctx.self.ts("portfolio", "snapshot").append([{
 	      date: runAtMs,
-	      accountId: ACCOUNT_ID,
+	      accountId: snapshotAccountId(snapshot),
 	      portfolioMode: snapshot.portfolioMode,
 	      positionCompleteness: snapshot.positionCompleteness,
 	      ingestSource: snapshot.ingestSource,
@@ -6556,9 +6734,9 @@ function buildRunAudit(input) {
       runAtMs,
     }]);
 
-    await ctx.self.ts("portfolio", "positions").append(snapshot.holdings.map((h) => ({
+	    await ctx.self.ts("portfolio", "positions").append(snapshot.holdings.map((h) => ({
 	      date: runAtMs,
-	      accountId: ACCOUNT_ID,
+	      accountId: snapshotAccountId(snapshot),
 	      portfolioMode: snapshot.portfolioMode,
 	      positionCompleteness: snapshot.positionCompleteness,
 	      instrumentId: h.instrumentId,
@@ -6616,7 +6794,7 @@ function buildRunAudit(input) {
 
 	    await ctx.self.ts("analysis", "decision").append([{
 	      date: runAtMs,
-	      accountId: ACCOUNT_ID,
+	      accountId: snapshotAccountId(snapshot),
 	      portfolioMode: snapshot.portfolioMode,
 	      positionCompleteness: snapshot.positionCompleteness,
 	      runSource: RUN_SOURCE,
@@ -6753,7 +6931,7 @@ function buildRunAudit(input) {
     });
 	    await ctx.self.ts("audit", "run_log").append([{
 	      date: runAtMs,
-	      accountId: ACCOUNT_ID,
+	      accountId: snapshotAccountId(snapshot),
 	      portfolioMode: snapshot.portfolioMode,
 	      positionCompleteness: snapshot.positionCompleteness,
 	      runSource: RUN_SOURCE,

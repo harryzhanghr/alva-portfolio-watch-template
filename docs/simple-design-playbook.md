@@ -28,8 +28,9 @@ In a deployed Alva account, the implemented automation is a private feed:
 - Feed id: assigned by Alva after creation
 - Portfolio mode: `dynamic` connected snapshot or `static` ALFS portfolio file
 - Position completeness: `full_quantity` or `ticker_only`
-- Dynamic connected account: supplied through `env.args.accountId` or
-  `env.args.connectedAccountId`
+- Dynamic connected account(s): supplied through `env.args.accountIds`,
+  `env.args.connectedAccountIds`, `env.args.portfolioAccountIds`, or single
+  account fallback `env.args.accountId` / `env.args.connectedAccountId`
 - Static portfolio: supplied through `env.args.staticPortfolioPath`
 - Cronjob: assigned by Alva after scheduling
 - Schedule: hourly, `0 * * * *`
@@ -44,7 +45,8 @@ decisions, final status reasons, and a `notify/message` push sidecar.
 Current production price / portfolio basis:
 
 - Portfolio ingest is deterministic code, not Alva Ask.
-- Dynamic mode reads the connected portfolio snapshot each run.
+- Dynamic mode reads one or more connected portfolio snapshots each run and
+  aggregates them into one portfolio before analysis.
 - Static mode reads the configured ALFS static portfolio file each run; holdings
   stay unchanged until setup/update writes a new file.
 - `full_quantity` mode can compute weights, NAV deltas, and exposure

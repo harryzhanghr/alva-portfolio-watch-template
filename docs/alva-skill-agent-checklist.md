@@ -5,8 +5,8 @@ Use this checklist when adapting the template for a new user's Alva account.
 ## Required Before Creation
 
 - Choose portfolio mode:
-  - `dynamic`: confirm the user has a connected portfolio account in Alva and
-    obtain the connected account id.
+  - `dynamic`: confirm the user has one or more connected portfolio accounts in
+    Alva and obtain the connected account ids.
   - `static`: create or confirm an ALFS static portfolio JSON file.
 - Choose position completeness: `full_quantity` or `ticker_only`.
   Dynamic portfolios are `full_quantity`; static portfolios can be either.
@@ -20,7 +20,8 @@ Use this checklist when adapting the template for a new user's Alva account.
 - `feedName`
 - `portfolioMode`
 - `positionCompleteness`
-- `accountId` or `connectedAccountId`
+- `accountIds` / `connectedAccountIds` / `portfolioAccountIds`, or single
+  account fallback `accountId` / `connectedAccountId`
 - `staticPortfolioPath` when `portfolioMode=static`
 - `ownerUsername`
 - `runSource`
@@ -50,8 +51,8 @@ After the first run, inspect:
 The run is healthy if:
 
 - portfolio ingest returns holdings;
-- dynamic mode pulls the connected snapshot, or static mode reads the configured
-  ALFS portfolio file;
+- dynamic mode pulls one or more connected snapshots and aggregates them, or
+  static mode reads the configured ALFS portfolio file;
 - `full_quantity` positions use source quantity and Arrays current price when
   available;
 - `ticker_only` runs keep quantity, market value, weight, NAV, and exposure
