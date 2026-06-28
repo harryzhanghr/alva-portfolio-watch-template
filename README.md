@@ -83,6 +83,14 @@ Pass these through `env.args` when creating the automation:
   "accountIds": ["<CONNECTED_ACCOUNT_ID_1>", "<CONNECTED_ACCOUNT_ID_2>"],
   "ownerUsername": "<ALVA_USERNAME>",
   "runSource": "cron_push_pipeline",
+  "timeouts": {
+    "runBudgetMs": 2700000,
+    "themeExtractionMs": 720000,
+    "externalBreakingMappingMs": 1200000,
+    "internalBreakingNewsMs": 1200000,
+    "anomalyAttributionMs": 900000,
+    "analystMs": 1200000
+  },
   "breakingNewsSourceMode": "external_feed",
   "externalBreakingNewsFeedPath": "/alva/home/harryzz/feeds/breaking-news/v1/data/events/current",
   "aliases": {
@@ -112,6 +120,9 @@ dynamic mode requires at least one configured account id; static mode requires
 `staticPortfolioPath`. When dynamic mode receives multiple account ids, it reads
 each connected snapshot and aggregates same-symbol holdings plus cash before any
 market-data, event, anomaly, or analyst step.
+Default timeout budgets are intentionally wide for larger multi-account
+portfolios; keep `timeouts` in the cron args when portfolios may contain many
+tickers.
 
 ### Creation Steps
 

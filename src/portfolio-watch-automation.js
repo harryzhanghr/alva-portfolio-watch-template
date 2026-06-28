@@ -65,6 +65,14 @@ const CONFIG = {
   maxAnalystPromptChars: 1000000,
   maxAnomalyAttributionPromptChars: 1000000,
   maxPiPromptContextChars: 1000000,
+  timeouts: {
+    runBudgetMs: numericArg(ARGS.runBudgetMs || (ARGS.timeouts && ARGS.timeouts.runBudgetMs), 45 * 60 * 1000),
+    themeExtractionMs: numericArg(ARGS.themeExtractionTimeoutMs || (ARGS.timeouts && ARGS.timeouts.themeExtractionMs), 12 * 60 * 1000),
+    externalBreakingMappingMs: numericArg(ARGS.externalBreakingMappingTimeoutMs || (ARGS.timeouts && ARGS.timeouts.externalBreakingMappingMs), 20 * 60 * 1000),
+    internalBreakingNewsMs: numericArg(ARGS.internalBreakingNewsTimeoutMs || (ARGS.timeouts && ARGS.timeouts.internalBreakingNewsMs), 20 * 60 * 1000),
+    anomalyAttributionMs: numericArg(ARGS.anomalyAttributionTimeoutMs || (ARGS.timeouts && ARGS.timeouts.anomalyAttributionMs), 15 * 60 * 1000),
+    analystMs: numericArg(ARGS.analystTimeoutMs || (ARGS.timeouts && ARGS.timeouts.analystMs), 20 * 60 * 1000),
+  },
   priorAlertTimelineDays: 7,
   maxPriorAlertTimelineRows: 200,
   maxAlertHistoryRows: 240,
@@ -1794,7 +1802,7 @@ async function extractPortfolioThemes(snapshot, previous, warnings, runAtMs) {
         thinkingLevel: "off",
       },
     });
-    const { message } = await agent.ask(buildThemeExtractionPrompt(snapshot, previous));
+    const { message } = await agent.ask(buildThemeExtractionPrompt(snapshot, previous), { timeoutMs: CONFIG.timeouts.themeExtractionMs });
     if (message && message.errorMessage) throw new Error("Theme extraction Pi agent error: " + message.errorMessage);
     const text = piMessageText(message);
     const parsed = safeParseJson(text);
@@ -4266,7 +4274,7 @@ async function reviewExternalBreakingMappings(events, snapshot, currentThemes, r
     };
     summary.agentCalled = true;
     summary.mappingAgentCalled = true;
-    const { message } = await agent.ask(buildExternalBreakingMappingPrompt(promptInput));
+    const { message } = await agent.ask(buildExternalBreakingMappingPrompt(promptInput), { timeoutMs: CONFIG.timeouts.externalBreakingMappingMs });
     summary.stopReason = message && message.stopReason ? String(message.stopReason) : "";
     if (message && message.model) summary.model = message.model;
     if (message && message.errorMessage) throw new Error("External breaking mapping agent error: " + message.errorMessage);
@@ -4820,7 +4828,7 @@ async function fetchInternalBreakingNews(snapshot, currentThemes, fetchStartMs, 
     ].join("\n");
     summary.agentCalled = true;
     summary.themeNewsSummary.agentCalled = true;
-    const { message } = await agent.ask(prompt);
+    const { message } = await agent.ask(prompt, { timeoutMs: CONFIG.timeouts.internalBreakingNewsMs });
     summary.stopReason = message && message.stopReason ? String(message.stopReason) : "";
     if (message && message.model) summary.model = message.model;
     if (message && message.errorMessage) throw new Error("Pi agent error: " + message.errorMessage);
@@ -5344,7 +5352,7 @@ function runAnomalyAttributionAgents(anomalies, context) {
     let rawText = "";
     let sessionId = "";
     try {
-      const result = ask(buildAnomalyAttributionPrompt(promptInput), { effort: "high" });
+      const result = ask(buildAnomalyAttributionPrompt(promptInput), { effort: "high", timeoutMs: CONFIG.timeouts.anomalyAttributionMs });
       rawText = String(result && result.text || "");
       sessionId = String(result && result.session_id || "");
       const parsed = safeParseJson(rawText);
@@ -6373,7 +6381,7 @@ function buildRunAudit(input) {
       input: { holdings: (snapshot.holdings || []).map((h) => h.symbol), windowStartHkt: hkt(input.fetchStartMs), windowEndHkt: hkt(input.runAtMs) },
 	      action: "For each holding, fetch daily bars, latest 1min extended-hours bars, hourly bars, market news, price-target news, earnings calendar, and optional computed technical_event rows. After price marking and current-theme extraction, fetch timestamped macro context, check Polymarket-implied Fed decision probability changes for the next three meetings, then read the external Breaking News feed for already source-expanded market-wide events. Code pre-maps direct ticker, option-underlying, theme, and macro/risk-bucket relevance; a Pi portfolio mapping agent reviews those mappings and cross-checks remaining events for source-grounded related holdings before final analyst review.",
       output: dataFetchSummary,
-      gate: "If more than 20% of holdings lack usable daily-bar price coverage, fail the run.",
+      gate: "If every holding lacks usable daily-bar price coverage, fail the run. Partial coverage gaps continue with warnings; unpriced holdings are excluded from marked valuation and exposure until coverage exists.",
     },
     {
       step: 6,
@@ -6567,8 +6575,14 @@ function buildRunAudit(input) {
       rawEvents.push.apply(rawEvents, await fetchPriceTargetNews(marketDataSymbol, fetchStartSec - 5 * 86400, fetchEndSec, warnings, holding.symbol));
       rawEvents.push.apply(rawEvents, await fetchEarnings(marketDataSymbol, fetchEndSec, warnings, holding.symbol));
     }
-    if (priceFailures / snapshot.holdings.length > 0.2) {
-      throw new Error("Price coverage blocker: " + priceFailures + " of " + snapshot.holdings.length + " holdings lacked usable daily bars");
+    if (priceFailures >= snapshot.holdings.length) {
+      throw new Error("Price coverage blocker: all " + snapshot.holdings.length + " holdings lacked usable daily bars");
+    }
+    if (priceFailures > 0 && priceFailures / snapshot.holdings.length > 0.2) {
+      warnings.push({
+        source: "price-coverage",
+        error: priceFailures + " of " + snapshot.holdings.length + " holdings lacked usable daily bars; continuing with covered holdings and excluding unpriced holdings from marked valuation/exposure",
+      });
     }
     snapshot = markSnapshotToLatest(snapshot, priceSignals, warnings);
     priceSignals = refreshSignalContributions(priceSignals, snapshot);
@@ -6679,12 +6693,13 @@ function buildRunAudit(input) {
           eventCandidates: CONFIG.maxPromptCandidates,
           analystPromptChars: CONFIG.maxAnalystPromptChars,
           anomalyAttributionPromptChars: CONFIG.maxAnomalyAttributionPromptChars,
+          timeouts: CONFIG.timeouts,
           priorAlertTimelineDays: CONFIG.priorAlertTimelineDays,
           priorAlertTimelineRows: CONFIG.maxPriorAlertTimelineRows,
         },
         outputSchema: ["eventCandidateStatuses[]", "eventImpactFindings[] with exposure_impact and decision_lens", "anomalyAttributionFindings[] with decision_lens", "decision.message_sections.event_exposure_impacts/anomaly_attributions", "decision.notification_message as chat-readable PM note"],
       };
-      const analystText = String(ask(buildAnalystPrompt(analystInput)).text || "");
+      const analystText = String(ask(buildAnalystPrompt(analystInput), { timeoutMs: CONFIG.timeouts.analystMs }).text || "");
       const parsedAnalyst = safeParseJson(analystText);
       if (!parsedAnalyst) throw new Error("Analyst prompt did not return parseable JSON");
       const parsedAnalystClean = normalizeEventTerminology(parsedAnalyst);
