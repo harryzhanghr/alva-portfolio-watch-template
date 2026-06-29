@@ -118,6 +118,7 @@ const CONFIG = {
   portfolioMode: PORTFOLIO_MODE,
   positionCompleteness: CONFIGURED_POSITION_COMPLETENESS,
   staticPortfolioPath: STATIC_PORTFOLIO_PATH,
+  allowEmptyConnectedAccounts: parseBoolArg(ARGS.allowEmptyConnectedAccounts, false),
   materiality: {
     quantityEpsilon: 0.00001,
     positionMvMovePct: 0.03,
@@ -1478,7 +1479,11 @@ async function ingestPortfolio(runAtMs, warnings) {
     if (!parsedPortfolio || !Array.isArray(parsedPortfolio.holdings)) {
       throw new Error("Connected portfolio API did not return usable holdings[] for " + accountId);
     }
-    snapshots.push(normalizeConnectedPortfolio(parsedPortfolio, runAtMs, accountId));
+    const connectedSnapshot = normalizeConnectedPortfolio(parsedPortfolio, runAtMs, accountId);
+    if (!CONFIG.allowEmptyConnectedAccounts && connectedSnapshot.holdingCount <= 0) {
+      throw new Error("Connected portfolio " + accountId + " returned zero usable holdings; refusing to silently run a partial aggregate");
+    }
+    snapshots.push(connectedSnapshot);
   }
   return aggregateConnectedSnapshots(snapshots, runAtMs, warnings);
 }

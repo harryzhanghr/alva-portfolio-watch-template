@@ -71,6 +71,10 @@ Ask for or infer these from Alva workspace state:
 - Optional `aliases`: ticker/company aliases for better event matching.
 - Optional `fallbackThemeMap`: continuity fallback only. The automation extracts
   current themes every run with Alva Ask, so do not overfit this map.
+- Optional `allowEmptyConnectedAccounts`: defaults to `false`. Keep the default
+  for aggregate portfolios so a configured connected account that returns zero
+  usable holdings fails loudly instead of running a partial portfolio. Set to
+  `true` only for intentionally empty or cash-only connected accounts.
 
 ### Runtime Args
 
@@ -97,6 +101,7 @@ Pass these through `env.args` when creating the automation:
   "externalBreakingNewsFeedPath": "~/feeds/breaking-news/v1/data/events/current",
   "externalBreakingNewsPiChunkSize": 20,
   "externalBreakingNewsPiRetryCount": 1,
+  "allowEmptyConnectedAccounts": false,
   "aliases": {
     "TICKER": ["TICKER", "Company Name", "$TICKER"]
   },
@@ -123,7 +128,10 @@ The source intentionally fails fast if the configured source is missing:
 dynamic mode requires at least one configured account id; static mode requires
 `staticPortfolioPath`. When dynamic mode receives multiple account ids, it reads
 each connected snapshot and aggregates same-symbol holdings plus cash before any
-market-data, event, anomaly, or analyst step.
+market-data, event, anomaly, or analyst step. By default, every configured
+connected account must return at least one usable holding; this keeps aggregate
+portfolio runs from silently analyzing only the accounts that happened to return
+data.
 Default timeout budgets are intentionally wide for larger multi-account
 portfolios; keep `timeouts` in the cron args when portfolios may contain many
 tickers.
