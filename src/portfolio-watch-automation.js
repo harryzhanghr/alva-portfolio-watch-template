@@ -37,12 +37,14 @@ const CONFIG = {
   latestPriceLimit: 2400,
   breakingNewsEnabled: true,
   breakingNewsSourceMode: String(ARGS.breakingNewsSourceMode || BREAKING_NEWS_ARGS.sourceMode || "external_feed").toLowerCase(),
-  externalBreakingNewsFeedPath: String(ARGS.externalBreakingNewsFeedPath || BREAKING_NEWS_ARGS.feedPath || "/alva/home/harryzz/feeds/breaking-news/v1/data/events/current"),
+  externalBreakingNewsFeedPath: String(ARGS.externalBreakingNewsFeedPath || BREAKING_NEWS_ARGS.feedPath || "~/feeds/breaking-news/v1/data/events/current"),
   externalBreakingNewsLookbackMinutes: numericArg(ARGS.externalBreakingNewsLookbackMinutes || BREAKING_NEWS_ARGS.lookbackMinutes, 180),
   externalBreakingNewsMaxRows: numericArg(ARGS.externalBreakingNewsMaxRows || BREAKING_NEWS_ARGS.maxRows, 160),
   externalBreakingNewsMaxMappedEvents: numericArg(ARGS.externalBreakingNewsMaxMappedEvents || BREAKING_NEWS_ARGS.maxMappedEvents, 40),
   externalBreakingNewsPiReviewEnabled: parseBoolArg(ARGS.externalBreakingNewsPiReviewEnabled !== undefined ? ARGS.externalBreakingNewsPiReviewEnabled : BREAKING_NEWS_ARGS.piReviewEnabled, true),
   externalBreakingNewsPiMaxEvents: numericArg(ARGS.externalBreakingNewsPiMaxEvents || BREAKING_NEWS_ARGS.piMaxEvents, 40),
+  externalBreakingNewsPiChunkSize: numericArg(ARGS.externalBreakingNewsPiChunkSize || BREAKING_NEWS_ARGS.piChunkSize, 20),
+  externalBreakingNewsPiRetryCount: numericArg(ARGS.externalBreakingNewsPiRetryCount || BREAKING_NEWS_ARGS.piRetryCount, 1),
   externalBreakingNewsIncludeHidden: parseBoolArg(ARGS.externalBreakingNewsIncludeHidden !== undefined ? ARGS.externalBreakingNewsIncludeHidden : BREAKING_NEWS_ARGS.includeHidden, false),
   maxBreakingNewsRecords: 30,
   maxBreakingNewsBraveCalls: 2,
@@ -61,7 +63,7 @@ const CONFIG = {
   firstRunWindowHours: 24,
   earningsCandidateLookaheadDays: 10,
   maxPromptEvents: 100,
-  maxPromptCandidates: 50,
+  maxPromptCandidates: 100,
   maxAnalystPromptChars: 1000000,
   maxAnomalyAttributionPromptChars: 1000000,
   maxPiPromptContextChars: 1000000,
@@ -72,6 +74,7 @@ const CONFIG = {
     internalBreakingNewsMs: numericArg(ARGS.internalBreakingNewsTimeoutMs || (ARGS.timeouts && ARGS.timeouts.internalBreakingNewsMs), 20 * 60 * 1000),
     anomalyAttributionMs: numericArg(ARGS.anomalyAttributionTimeoutMs || (ARGS.timeouts && ARGS.timeouts.anomalyAttributionMs), 15 * 60 * 1000),
     analystMs: numericArg(ARGS.analystTimeoutMs || (ARGS.timeouts && ARGS.timeouts.analystMs), 20 * 60 * 1000),
+    analystRepairMs: numericArg(ARGS.analystRepairTimeoutMs || (ARGS.timeouts && ARGS.timeouts.analystRepairMs), 6 * 60 * 1000),
   },
   priorAlertTimelineDays: 7,
   maxPriorAlertTimelineRows: 200,
@@ -269,6 +272,8 @@ feed.def("analysis", {
     str("candidateAuditJson"),
     str("anomalySignalsJson"),
     str("rawAnalystJson"),
+    str("analystDecisionJson"),
+    str("analystPromptCoverageJson"),
     num("runAtMs"),
   ]),
 });
@@ -306,6 +311,8 @@ feed.def("audit", {
     str("searchExpansionTraceJson"),
     str("candidateAuditJson"),
     str("anomalySignalsJson"),
+    str("analystDecisionJson"),
+    str("analystPromptCoverageJson"),
     str("notificationPreview"),
     str("warningsJson"),
     num("runStartedAtMs"),
@@ -635,6 +642,60 @@ function safeParseJson(text) {
     } catch (_) {}
   }
   return null;
+}
+
+function parseJsonLenient(text) {
+  const parsed = safeParseJson(text);
+  if (parsed) return parsed;
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  const normalized = raw
+    .replace(/^\uFEFF/, "")
+    .replace(/[\u201C\u201D]/g, "\"")
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/,\s*([}\]])/g, "$1");
+  if (normalized !== raw) return safeParseJson(normalized);
+  return null;
+}
+
+function chunkArray(items, chunkSize) {
+  const rows = Array.isArray(items) ? items : [];
+  const size = Math.max(1, Number.isFinite(chunkSize) ? Math.floor(chunkSize) : rows.length || 1);
+  const chunks = [];
+  for (let i = 0; i < rows.length; i += size) chunks.push(rows.slice(i, i + size));
+  return chunks;
+}
+
+function warningItemsForAnalystInput(warnings) {
+  const rows = Array.isArray(warnings) ? warnings : [];
+  const priority = [];
+  const other = [];
+  rows.forEach((warning) => {
+    const text = String((warning && warning.source) || "") + " " + String((warning && warning.error) || "");
+    if (/external-breaking|mapping|analyst|parse|timeout|deadline|context|agent/i.test(text)) priority.push(warning);
+    else other.push(warning);
+  });
+  const out = priority.concat(other).slice(0, 30);
+  const omitted = Math.max(0, rows.length - out.length);
+  if (omitted > 0) out.push({ source: "warnings-summary", error: omitted + " lower-priority warnings omitted from analyst input." });
+  return out;
+}
+
+function candidateSeenBefore(candidate) {
+  const status = String((candidate && candidate.dedupeStatus) || "").toLowerCase();
+  if (status === "seen_before" || status === "duplicate") return true;
+  const reason = String((candidate && candidate.reason) || "").toLowerCase();
+  return reason.indexOf("dedupestatus=seen_before") >= 0 || reason.indexOf("seen_before") >= 0 || reason.indexOf("seen before") >= 0;
+}
+
+function orderEventCandidatesForAnalystPrompt(candidates) {
+  return (Array.isArray(candidates) ? candidates : [])
+    .map((candidate, idx) => ({ candidate, idx, seenBefore: candidateSeenBefore(candidate) }))
+    .sort((a, b) => {
+      if (a.seenBefore !== b.seenBefore) return a.seenBefore ? 1 : -1;
+      return a.idx - b.idx;
+    })
+    .map((row) => row.candidate);
 }
 
 function compactAnomalySignalForAudit(signal) {
@@ -4252,39 +4313,71 @@ async function reviewExternalBreakingMappings(events, snapshot, currentThemes, r
   if (!CONFIG.externalBreakingNewsPiReviewEnabled || !events.length) return {};
   try {
     const { Agent, getModel } = require("@alva/pi");
-    const agent = new Agent({
-      initialState: {
-        systemPrompt: "You map already sourced market events to a current portfolio. Return JSON only.",
-        model: getModel("openai", "gpt-5.5"),
-        tools: [],
-        thinkingLevel: "off",
-      },
-    });
-    const promptInput = {
-      run_at_hkt: hkt(runAtMs),
-      source_contract: {
-        external_feed: resolveAlfsPath(CONFIG.externalBreakingNewsFeedPath),
-        event_fact_layer: "Standalone Breaking News feed already handled discovery, source expansion, event clustering, and source confidence.",
-        portfolio_mapping_layer: "This agent only reviews deterministic portfolio mappings and finds source-grounded related holdings.",
-      },
-      current_portfolio_holdings: buildPiHoldingContexts(snapshot),
-      current_portfolio_theme_context: buildPiThemeContexts(snapshot, currentThemes),
-      portfolio_capabilities: snapshot.portfolioCapabilities || {},
-      external_breaking_events: events.map(compactExternalEventForMappingAgent),
-    };
     summary.agentCalled = true;
     summary.mappingAgentCalled = true;
-    const { message } = await agent.ask(buildExternalBreakingMappingPrompt(promptInput), { timeoutMs: CONFIG.timeouts.externalBreakingMappingMs });
-    summary.stopReason = message && message.stopReason ? String(message.stopReason) : "";
-    if (message && message.model) summary.model = message.model;
-    if (message && message.errorMessage) throw new Error("External breaking mapping agent error: " + message.errorMessage);
-    const text = piMessageText(message);
-    summary.rawTextPreview = clean(text, 900);
-    const parsed = safeParseJson(text);
-    if (!parsed) throw new Error("External breaking mapping agent did not return parseable JSON");
-    const normalized = normalizeExternalMappingRows(parsed, events, snapshot);
-    summary.piReviewedEventCount = Object.keys(normalized).length;
-    return normalized;
+    const chunks = chunkArray(events, CONFIG.externalBreakingNewsPiChunkSize);
+    const merged = {};
+    const chunkErrors = [];
+    const retryCount = Math.max(0, Math.floor(CONFIG.externalBreakingNewsPiRetryCount));
+    const perAttemptTimeoutMs = Math.max(120000, Math.floor(CONFIG.timeouts.externalBreakingMappingMs / Math.max(1, chunks.length * (retryCount + 1))));
+    summary.piReviewChunkCount = chunks.length;
+    summary.piReviewChunkSize = CONFIG.externalBreakingNewsPiChunkSize;
+    summary.piReviewRetryCount = retryCount;
+    summary.piReviewPerAttemptTimeoutMs = perAttemptTimeoutMs;
+    summary.piReviewStopReasons = [];
+    for (let chunkIdx = 0; chunkIdx < chunks.length; chunkIdx += 1) {
+      const chunk = chunks[chunkIdx];
+      let chunkDone = false;
+      let lastError = "";
+      for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+        try {
+          const agent = new Agent({
+            initialState: {
+              systemPrompt: "You map already sourced market events to a current portfolio. Return JSON only.",
+              model: getModel("openai", "gpt-5.5"),
+              tools: [],
+              thinkingLevel: "off",
+            },
+          });
+          const promptInput = {
+            run_at_hkt: hkt(runAtMs),
+            review_chunk: { index: chunkIdx + 1, count: chunks.length, attempt: attempt + 1 },
+            source_contract: {
+              external_feed: resolveAlfsPath(CONFIG.externalBreakingNewsFeedPath),
+              event_fact_layer: "Standalone Breaking News feed already handled discovery, source expansion, event clustering, and source confidence.",
+              portfolio_mapping_layer: "This agent only reviews deterministic portfolio mappings and finds source-grounded related holdings.",
+            },
+            current_portfolio_holdings: buildPiHoldingContexts(snapshot),
+            current_portfolio_theme_context: buildPiThemeContexts(snapshot, currentThemes),
+            portfolio_capabilities: snapshot.portfolioCapabilities || {},
+            external_breaking_events: chunk.map(compactExternalEventForMappingAgent),
+          };
+          const { message } = await agent.ask(buildExternalBreakingMappingPrompt(promptInput), { timeoutMs: perAttemptTimeoutMs });
+          const stopReason = message && message.stopReason ? String(message.stopReason) : "";
+          if (stopReason) summary.piReviewStopReasons.push({ chunk: chunkIdx + 1, attempt: attempt + 1, stopReason });
+          summary.stopReason = stopReason || summary.stopReason || "";
+          if (message && message.model) summary.model = message.model;
+          if (message && message.errorMessage) throw new Error("External breaking mapping agent error: " + message.errorMessage);
+          const text = piMessageText(message);
+          summary.rawTextPreview = clean(text, 900);
+          const parsed = parseJsonLenient(text);
+          if (!parsed) throw new Error("External breaking mapping agent did not return parseable JSON");
+          const normalized = normalizeExternalMappingRows(parsed, chunk, snapshot);
+          Object.keys(normalized).forEach((key) => { merged[key] = normalized[key]; });
+          chunkDone = true;
+          break;
+        } catch (err) {
+          lastError = String(err && err.message ? err.message : err).slice(0, 260);
+        }
+      }
+      if (!chunkDone) chunkErrors.push("chunk " + (chunkIdx + 1) + "/" + chunks.length + ": " + lastError);
+    }
+    summary.piReviewedEventCount = Object.keys(merged).length;
+    if (chunkErrors.length) {
+      summary.error = chunkErrors.join(" | ").slice(0, 900);
+      warnings.push({ source: "external-breaking-mapping-agent", error: summary.error });
+    }
+    return merged;
   } catch (err) {
     summary.error = String(err && err.message ? err.message : err).slice(0, 260);
     warnings.push({ source: "external-breaking-mapping-agent", error: summary.error });
@@ -5632,6 +5725,18 @@ function buildAnalystPrompt(input) {
   ].join("\n");
 }
 
+function buildAnalystJsonRepairPrompt(rawText) {
+  return [
+    "The previous Portfolio Watch analyst response was intended to be JSON but was not parseable.",
+    "Repair it into one valid JSON object. Preserve substantive content; do not add new facts, prices, links, holdings, or recommendations.",
+    "Top-level keys must be eventCandidateStatuses, eventImpactFindings, anomalyAttributionFindings, and decision.",
+    "Return JSON only. It MUST begin with { and end with }.",
+    "",
+    "Raw response:",
+    cleanMultiline(rawText, 120000),
+  ].join("\n");
+}
+
 function normalizeAnalyst(parsed, candidates, runAtMs) {
   parsed = normalizeEventTerminology(parsed);
   const candidateIdSet = {};
@@ -5781,6 +5886,11 @@ function buildLaneArtifacts(eventCandidates, anomalies, analyst, anomalyAttribut
   (analyst.eventCandidateStatuses || []).forEach((row) => {
     if (row && row.candidateId) analystStatusByCandidate[row.candidateId] = row;
   });
+  const promptCandidateIdSet = {};
+  const hasPromptCandidateSet = Array.isArray(analyst.promptCandidateIds);
+  (analyst.promptCandidateIds || []).forEach((candidateId) => {
+    if (candidateId) promptCandidateIdSet[String(candidateId)] = true;
+  });
   const finalEventStatusByCandidate = {};
   eventFindings.forEach((finding) => {
     const selected = assessmentSelected(finding, decision);
@@ -5796,17 +5906,24 @@ function buildLaneArtifacts(eventCandidates, anomalies, analyst, anomalyAttribut
   (eventCandidates || []).forEach((candidate) => {
     if (finalEventStatusByCandidate[candidate.candidateId]) return;
     const analystStatus = analystStatusByCandidate[candidate.candidateId];
-    const analystStatusValue = analystStatus
-      ? (((analystStatus.status === "selected" || analystStatus.status === "suppressed") && !analystStatus.linkedEventFindingId)
+    let analystStatusValue = "";
+    let reason = "";
+    if (analystStatus) {
+      analystStatusValue = ((analystStatus.status === "selected" || analystStatus.status === "suppressed") && !analystStatus.linkedEventFindingId)
         ? "not_qualified"
-        : analystStatus.status)
-      : "not_qualified";
+        : analystStatus.status;
+      reason = analystStatus.reason || "";
+    } else if (hasPromptCandidateSet && !promptCandidateIdSet[candidate.candidateId]) {
+      analystStatusValue = "not_reviewed_prompt_cap";
+      reason = "Candidate was outside the analyst prompt cap, so it was preserved for audit but not treated as analyst-qualified.";
+    } else {
+      analystStatusValue = "not_reviewed_missing_status";
+      reason = "Candidate was inside the analyst prompt but no analyst status was returned, so it was preserved for audit but not treated as analyst-qualified.";
+    }
     finalEventStatusByCandidate[candidate.candidateId] = {
       candidateId: candidate.candidateId,
       status: analystStatusValue,
-      reason: analystStatus && analystStatus.reason
-        ? analystStatus.reason
-        : "No analyst status was returned for this candidate. It may have been outside the analyst prompt cap or omitted by the analyst response; keep it in the long-list audit, but do not treat it as a qualified event.",
+      reason,
       linkedEventFindingId: analystStatus ? analystStatus.linkedEventFindingId : "",
     };
   });
@@ -5814,7 +5931,7 @@ function buildLaneArtifacts(eventCandidates, anomalies, analyst, anomalyAttribut
     ...compactEventCandidateForAudit(candidate),
     finalStatus: finalEventStatusByCandidate[candidate.candidateId] || {
       candidateId: candidate.candidateId,
-      status: "not_qualified",
+      status: "not_reviewed_missing_status",
       reason: "No analyst status returned.",
       linkedEventFindingId: "",
     },
@@ -6205,6 +6322,7 @@ function buildRunAudit(input) {
       toolLoop: false,
       browsing: false,
       promptContract: input.analystPromptSummary || {},
+      promptCoverage: input.analystPromptCoverage || {},
       parsedDecision: decision,
       selectedFindings: selectedFindings.map((f) => ({ findingId: f.findingId, type: f.findingType, primaryAsset: f.primaryAsset, summary: f.summary })),
       eventCandidateStatuses: laneArtifacts.finalStatuses.eventCandidates,
@@ -6617,9 +6735,30 @@ function buildRunAudit(input) {
     const reviewItemCount = eventCandidates.length + anomalies.length;
     let analyst = { findings: [], decision: buildFallbackDecision("no_material_candidates") };
     let rawAnalystJson = "";
+    let analystParseStatus = "not_called";
+    let analystPromptCoverage = {
+      totalEventCandidates: eventCandidates.length,
+      promptEventCandidates: 0,
+      outsidePromptCapEventCandidates: eventCandidates.length,
+      maxPromptCandidates: CONFIG.maxPromptCandidates,
+      sortPolicy: "stable_original_order_except_seen_before_after_non_seen_before",
+      promptCandidateIds: [],
+    };
     if (!reviewItemCount) {
       analyst.decision = buildFallbackDecision("no event candidate or asset anomaly was built");
     } else {
+      const analystEventCandidates = orderEventCandidatesForAnalystPrompt(eventCandidates).slice(0, CONFIG.maxPromptCandidates);
+      const analystPromptCandidateIds = analystEventCandidates.map((candidate) => candidate && candidate.candidateId).filter(Boolean);
+      analystPromptCoverage = {
+        totalEventCandidates: eventCandidates.length,
+        promptEventCandidates: analystEventCandidates.length,
+        outsidePromptCapEventCandidates: Math.max(0, eventCandidates.length - analystEventCandidates.length),
+        maxPromptCandidates: CONFIG.maxPromptCandidates,
+        sortPolicy: "stable_original_order_except_seen_before_after_non_seen_before",
+        seenBeforePromptCandidates: analystEventCandidates.filter(candidateSeenBefore).length,
+        seenBeforeTotalEventCandidates: eventCandidates.filter(candidateSeenBefore).length,
+        promptCandidateIds: analystPromptCandidateIds,
+      };
 	      const analystInput = {
 	        account_id: snapshotAccountId(snapshot),
 	        account_ids: snapshot.accountIds || [],
@@ -6627,7 +6766,14 @@ function buildRunAudit(input) {
 	        position_completeness: snapshot.positionCompleteness,
 	        portfolio_capabilities: snapshot.portfolioCapabilities,
 	        run_at_hkt: hkt(runAtMs),
-        event_candidates_to_review: eventCandidates.slice(0, CONFIG.maxPromptCandidates).map(compactEventCandidateForAnalyst),
+        event_candidates_to_review: analystEventCandidates.map(compactEventCandidateForAnalyst),
+        event_candidate_prompt_coverage: {
+          total_event_candidates: analystPromptCoverage.totalEventCandidates,
+          prompt_event_candidates: analystPromptCoverage.promptEventCandidates,
+          outside_prompt_cap_event_candidates: analystPromptCoverage.outsidePromptCapEventCandidates,
+          max_prompt_candidates: CONFIG.maxPromptCandidates,
+          sort_policy: analystPromptCoverage.sortPolicy,
+        },
         asset_anomalies: anomalies,
         anomaly_attribution_packets: anomalyAttributionPackets.map(compactAnomalyAttributionPacketForAnalyst),
         asset_anomaly_metrics: priceSignals
@@ -6666,9 +6812,9 @@ function buildRunAudit(input) {
 	          note: canComputePortfolioSizing(snapshot)
 	            ? "Portfolio delta and theme exposure are context only, not standalone candidates or required alert sections."
 	            : "Portfolio delta and theme exposure are context only. Position sizing is unavailable, so do not state true exposure percentages, NAV impact, market value, or portfolio-weight contribution.",
-	        },
+        },
         macro_context: macro,
-        coverage_warnings: warnings.slice(0, 20),
+        coverage_warnings: warningItemsForAnalystInput(warnings),
       };
       analystCallMode = "alva_ask";
       analystPromptSummary = {
@@ -6680,6 +6826,9 @@ function buildRunAudit(input) {
 	        requiredInputs: ["portfolio_mode", "position_completeness", "portfolio_capabilities", "prior_alert_history", "event_candidates_to_review", "asset_anomalies", "anomaly_attribution_packets", "asset_anomaly_metrics", "portfolio_context"],
         inputCounts: {
           eventCandidates: eventCandidates.length,
+          eventCandidatesInPrompt: analystEventCandidates.length,
+          eventCandidatesOutsidePromptCap: analystPromptCoverage.outsidePromptCapEventCandidates,
+          seenBeforeEventCandidatesInPrompt: analystPromptCoverage.seenBeforePromptCandidates,
           assetAnomalies: anomalies.length,
           anomalyAttributionPackets: anomalyAttributionPackets.length,
           totalReviewItems: reviewItemCount,
@@ -6691,6 +6840,7 @@ function buildRunAudit(input) {
         caps: {
           eventRecords: CONFIG.maxPromptEvents,
           eventCandidates: CONFIG.maxPromptCandidates,
+          eventCandidateSortPolicy: analystPromptCoverage.sortPolicy,
           analystPromptChars: CONFIG.maxAnalystPromptChars,
           anomalyAttributionPromptChars: CONFIG.maxAnomalyAttributionPromptChars,
           timeouts: CONFIG.timeouts,
@@ -6700,11 +6850,33 @@ function buildRunAudit(input) {
         outputSchema: ["eventCandidateStatuses[]", "eventImpactFindings[] with exposure_impact and decision_lens", "anomalyAttributionFindings[] with decision_lens", "decision.message_sections.event_exposure_impacts/anomaly_attributions", "decision.notification_message as chat-readable PM note"],
       };
       const analystText = String(ask(buildAnalystPrompt(analystInput), { timeoutMs: CONFIG.timeouts.analystMs }).text || "");
-      const parsedAnalyst = safeParseJson(analystText);
-      if (!parsedAnalyst) throw new Error("Analyst prompt did not return parseable JSON");
-      const parsedAnalystClean = normalizeEventTerminology(parsedAnalyst);
-      rawAnalystJson = compactJson(parsedAnalystClean, 24000);
-      analyst = normalizeAnalyst(parsedAnalystClean, candidates, runAtMs);
+      let parsedAnalyst = parseJsonLenient(analystText);
+      analystParseStatus = parsedAnalyst ? "parsed_initial" : "initial_parse_failed";
+      if (!parsedAnalyst) {
+        warnings.push({ source: "analyst-json-parse", error: "Initial analyst response was not parseable JSON; attempting JSON repair.", rawTextPreview: cleanMultiline(analystText, 1200) });
+        try {
+          const repairText = String(ask(buildAnalystJsonRepairPrompt(analystText), { timeoutMs: CONFIG.timeouts.analystRepairMs }).text || "");
+          parsedAnalyst = parseJsonLenient(repairText);
+          analystParseStatus = parsedAnalyst ? "repaired" : "repair_parse_failed";
+          if (!parsedAnalyst) warnings.push({ source: "analyst-json-repair", error: "Analyst JSON repair response was still not parseable.", rawTextPreview: cleanMultiline(repairText, 1200) });
+        } catch (err) {
+          analystParseStatus = "repair_error";
+          warnings.push({ source: "analyst-json-repair", error: String(err && err.message ? err.message : err).slice(0, 260) });
+        }
+      }
+      if (parsedAnalyst) {
+        const parsedAnalystClean = normalizeEventTerminology(parsedAnalyst);
+        parsedAnalystClean._parse_status = analystParseStatus;
+        rawAnalystJson = compactJson(parsedAnalystClean, 60000);
+        analyst = normalizeAnalyst(parsedAnalystClean, candidates, runAtMs);
+      } else {
+        const reason = "analyst_parse_error: final analyst output was not parseable JSON";
+        rawAnalystJson = compactJson({ _parse_status: analystParseStatus, error: reason, rawTextPreview: cleanMultiline(analystText, 6000) }, 12000);
+        analyst = { findings: [], decision: buildFallbackDecision(reason), eventCandidateStatuses: [] };
+        warnings.push({ source: "analyst-json-parse", error: reason });
+      }
+      analyst.promptCandidateIds = analystPromptCandidateIds;
+      analystPromptCoverage.analystParseStatus = analystParseStatus;
     }
 
     const selectedFindings = analyst.findings.filter((f) => analyst.decision.selectedFindingIds.indexOf(f.findingId) >= 0);
@@ -6836,6 +7008,8 @@ function buildRunAudit(input) {
       candidateAuditJson: compactJson(decisionAuditArtifacts.candidateAudit),
       anomalySignalsJson: compactJson(decisionAuditArtifacts.anomalySignals),
       rawAnalystJson,
+      analystDecisionJson: compactJson(analyst.decision || {}, 60000),
+      analystPromptCoverageJson: compactJson(analystPromptCoverage, 40000),
       runAtMs,
     }]);
 
@@ -6937,6 +7111,7 @@ function buildRunAudit(input) {
       analyst,
       analystCallMode,
       analystPromptSummary,
+      analystPromptCoverage,
       rawAnalystJson,
       shouldPush,
       notifyTitle,
@@ -6970,6 +7145,8 @@ function buildRunAudit(input) {
       searchExpansionTraceJson: compactJson(audit.searchExpansionTrace, 120000),
       candidateAuditJson: compactJson(audit.auditArtifacts.candidateAudit),
       anomalySignalsJson: compactJson(audit.auditArtifacts.anomalySignals),
+      analystDecisionJson: compactJson(analyst.decision || {}, 60000),
+      analystPromptCoverageJson: compactJson(analystPromptCoverage, 40000),
       notificationPreview: clean(notifyBody === SKIP ? "SKIP_NOTIFICATION sentinel" : notifyBody, 1600),
       warningsJson: compactJson(warnings, 12000),
       runStartedAtMs: runAtMs,

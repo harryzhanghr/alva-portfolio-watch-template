@@ -19,8 +19,9 @@ This playbook documents a configurable portfolio watch automation as a plain-lan
 - Rate repricing lane: Polymarket public market data checks the next three Fed decision markets, compares current probability with 24 hours earlier, and appends `rate_repricing_event` rows when the probability move crosses `rateRepricingEvents.probabilityChangeThresholdPct`. If material repricing is found, the lane adds up to three `rate_repricing_news` rows from recent market commentary. Market volume, liquidity, and open-interest fields are passed through for analyst judgment. The only lane config is `rateRepricingEvents.enabled` and `rateRepricingEvents.probabilityChangeThresholdPct`.
 - Dynamic theme extraction: a Pi Agent receives the current marked portfolio snapshot every run and returns current holding themes used for theme exposure context, analyst exposure-impact reasoning, and theme-news search. `priorThemes` are only weak continuity hints; the current run's extracted themes are supplied to downstream event mapping before event analysis.
 - External Breaking News feed: code reads the configured full event stream
-  (`/alva/home/harryzz/feeds/breaking-news/v1/data/events/current` by
-  default) over the configured lookback using `@range/<fromMs>..<toMs>`.
+  (`~/feeds/breaking-news/v1/data/events/current` by default, resolved under
+  the deploying Alva user) over the configured lookback using
+  `@range/<fromMs>..<toMs>`.
   The upstream feed already handles market-wide discovery, source expansion,
   event clustering, source confidence, and event fields such as
   `tickersMentionedJson`, `marketTagsJson`, and `assetClassesJson`. Portfolio

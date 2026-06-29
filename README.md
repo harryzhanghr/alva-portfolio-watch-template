@@ -64,9 +64,10 @@ Ask for or infer these from Alva workspace state:
 - `feedName`: desired feed name. Default recommendation:
   `portfolio-watch-automation`.
 - Push target / notification wiring, if the user's Alva environment requires it.
-- Optional `externalBreakingNewsFeedPath`. By default the template reads the
-  public market-wide Breaking News source at
-  `/alva/home/harryzz/feeds/breaking-news/v1/data/events/current`.
+- Optional `externalBreakingNewsFeedPath`. By default the template reads
+  `~/feeds/breaking-news/v1/data/events/current`, resolved under the deploying
+  Alva user. Set an absolute `/alva/home/<username>/...` path to use a shared
+  Breaking News feed instead.
 - Optional `aliases`: ticker/company aliases for better event matching.
 - Optional `fallbackThemeMap`: continuity fallback only. The automation extracts
   current themes every run with Alva Ask, so do not overfit this map.
@@ -89,10 +90,13 @@ Pass these through `env.args` when creating the automation:
     "externalBreakingMappingMs": 1200000,
     "internalBreakingNewsMs": 1200000,
     "anomalyAttributionMs": 900000,
-    "analystMs": 1200000
+    "analystMs": 1200000,
+    "analystRepairMs": 360000
   },
   "breakingNewsSourceMode": "external_feed",
-  "externalBreakingNewsFeedPath": "/alva/home/harryzz/feeds/breaking-news/v1/data/events/current",
+  "externalBreakingNewsFeedPath": "~/feeds/breaking-news/v1/data/events/current",
+  "externalBreakingNewsPiChunkSize": 20,
+  "externalBreakingNewsPiRetryCount": 1,
   "aliases": {
     "TICKER": ["TICKER", "Company Name", "$TICKER"]
   },
