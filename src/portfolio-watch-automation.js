@@ -118,7 +118,6 @@ const CONFIG = {
   portfolioMode: PORTFOLIO_MODE,
   positionCompleteness: CONFIGURED_POSITION_COMPLETENESS,
   staticPortfolioPath: STATIC_PORTFOLIO_PATH,
-  allowEmptyConnectedAccounts: parseBoolArg(ARGS.allowEmptyConnectedAccounts, false),
   materiality: {
     quantityEpsilon: 0.00001,
     positionMvMovePct: 0.03,
@@ -1480,12 +1479,19 @@ async function ingestPortfolio(runAtMs, warnings) {
       throw new Error("Connected portfolio API did not return usable holdings[] for " + accountId);
     }
     const connectedSnapshot = normalizeConnectedPortfolio(parsedPortfolio, runAtMs, accountId);
-    if (!CONFIG.allowEmptyConnectedAccounts && connectedSnapshot.holdingCount <= 0) {
-      throw new Error("Connected portfolio " + accountId + " returned zero usable holdings; refusing to silently run a partial aggregate");
+    if (connectedSnapshot.holdingCount <= 0) {
+      warnings.push({
+        source: "portfolio:connected:" + accountId,
+        error: "connected portfolio returned zero usable holdings; continuing with other configured accounts and marking aggregate coverage degraded",
+      });
     }
     snapshots.push(connectedSnapshot);
   }
-  return aggregateConnectedSnapshots(snapshots, runAtMs, warnings);
+  const aggregate = aggregateConnectedSnapshots(snapshots, runAtMs, warnings);
+  if (aggregate.holdingCount <= 0) {
+    throw new Error("Dynamic portfolio ingest returned zero usable holdings across all configured accounts: " + ACCOUNT_IDS.join(", "));
+  }
+  return aggregate;
 }
 
 function markSnapshotToLatest(snapshot, priceSignals, warnings) {
@@ -5658,6 +5664,7 @@ function buildAnalystPrompt(input) {
 	    "",
 	    "5. Data contract",
 	    "- Dynamic mode reads one or more connected portfolio snapshots each run and aggregates holdings/cash before this analyst step. Static mode reads the configured static portfolio file each run; holdings stay unchanged until setup/update writes a new file.",
+	    "- When any dynamic source account has holdingCount=0, portfolio coverage is degraded. Analyze the loaded holdings, but scope any weight, bps drag, NAV, cash, totalValue, or exposure number as the loaded snapshot rather than the full aggregate; omit the number if that wording would be awkward. If you send a push during degraded coverage, include one concise coverage note.",
 	    "- full_quantity portfolios can use position quantity, Arrays latest 1min price, cash, weights, NAV deltas, and exposure percentages when coverage exists. ticker_only portfolios can use held tickers, themes, price/volume anomalies, event mapping, and related-holding logic, but must not invent weights, market value, NAV, or exposure percentages.",
 	    "- Broker/source currentPrice, marketValue, cost basis, realized P&L, and unrealized P&L are intentionally omitted. Valuation uses source quantity times Arrays latest 1min price when full_quantity is available, plus source cash when supplied.",
 	    "- Breaking-news source mode may read an external Breaking News feed instead of running Portfolio Watch's own market-wide news discovery. In external mode, relatedHoldings/affectedSymbols are produced by a code pre-map plus a Pi portfolio mapping review before this analyst step.",
@@ -6452,17 +6459,30 @@ function buildRunAudit(input) {
 	      action: CONFIG.portfolioMode === "dynamic"
 	        ? "Call fetchPortfolioSummary(accountId) for each configured account id, then aggregate holdings/cash into one portfolio snapshot using GET /api/v1/portfolio/summary with X-Alva-Api-Key auth."
 	        : "Read the configured static portfolio JSON from ALFS.",
-	      output: { accountId: snapshotAccountId(snapshot), accountIds: snapshot.accountIds || [], portfolioMode: snapshot.portfolioMode, positionCompleteness: snapshot.positionCompleteness, holdingCount: snapshot.holdingCount, snapshotAsOfHkt: hkt(snapshot.asOfMs), cash: snapshot.cash },
-	      gate: "Portfolio state comes from the configured setup source only; no Alva Ask, memory, watchlists, or prior-run portfolio reconstruction.",
+		      output: {
+		        accountId: snapshotAccountId(snapshot),
+		        accountIds: snapshot.accountIds || [],
+		        sourceAccounts: (snapshot.sourceAccounts || []).map((row) => ({
+		          accountId: row.accountId || "",
+		          holdingCount: row.holdingCount,
+		          asOfHkt: hkt(row.asOfMs),
+		        })),
+		        portfolioMode: snapshot.portfolioMode,
+		        positionCompleteness: snapshot.positionCompleteness,
+		        holdingCount: snapshot.holdingCount,
+		        snapshotAsOfHkt: hkt(snapshot.asOfMs),
+		        cash: snapshot.cash,
+		      },
+		      gate: "Portfolio state comes from the configured setup source only; no Alva Ask, memory, watchlists, or prior-run portfolio reconstruction.",
 	    },
 	    {
 	      step: 2,
 	      node: "Validate portfolio payload",
 	      environment: "Code",
 	      input: { portfolioMode: CONFIG.portfolioMode, requiredShape: ["holdings[] or tickers[]"], positionCompleteness: snapshot.positionCompleteness },
-	      action: "Require a usable portfolio input before any market-data or event work starts. full_quantity requires usable quantities; ticker_only requires tickers.",
-	      output: { holdingCount: snapshot.holdingCount, snapshotAsOfHkt: hkt(snapshot.asOfMs), cash: snapshot.cash },
-	      gate: "If the configured portfolio source is missing or empty, the run fails instead of fabricating a portfolio.",
+		      action: "Require at least one usable holding across the configured portfolio input before any market-data or event work starts. full_quantity requires usable quantities; ticker_only requires tickers.",
+		      output: { holdingCount: snapshot.holdingCount, snapshotAsOfHkt: hkt(snapshot.asOfMs), cash: snapshot.cash },
+		      gate: "If all configured portfolio sources are missing or empty, the run fails instead of fabricating a portfolio. If one dynamic connected account returns empty while another has holdings, the run continues with an explicit coverage warning.",
 	    },
 	    {
 	      step: 3,
@@ -6792,12 +6812,21 @@ function buildRunAudit(input) {
           .slice(0, CONFIG.maxPromptEvents)
           .map(compactRawEventForAnalyst),
         prior_alert_history: priorAlertTimeline,
-	        portfolio_snapshot: {
-	          portfolioMode: snapshot.portfolioMode,
-	          accountId: snapshotAccountId(snapshot),
-	          accountIds: snapshot.accountIds || [],
-	          sourceAccountCount: (snapshot.sourceAccounts || []).length,
-	          ingestSource: snapshot.ingestSource,
+		        portfolio_snapshot: {
+		          portfolioMode: snapshot.portfolioMode,
+		          accountId: snapshotAccountId(snapshot),
+		          accountIds: snapshot.accountIds || [],
+		          sourceAccounts: (snapshot.sourceAccounts || []).map((row) => ({
+		            accountId: row.accountId || "",
+		            holdingCount: row.holdingCount,
+		            cash: row.cash,
+		            asOfHkt: hkt(row.asOfMs),
+		          })),
+		          sourceAccountCount: (snapshot.sourceAccounts || []).length,
+		          sourceCoverageStatus: (snapshot.sourceAccounts || []).some((row) => Number(row.holdingCount) <= 0)
+		            ? "degraded_source_account_empty"
+		            : "loaded_sources_complete",
+		          ingestSource: snapshot.ingestSource,
 	          positionCompleteness: snapshot.positionCompleteness,
 	          portfolioCapabilities: snapshot.portfolioCapabilities,
 	          totalValue: snapshot.totalValue,
@@ -6814,9 +6843,11 @@ function buildRunAudit(input) {
 	        portfolio_context: {
 	          current_portfolio_delta: delta,
 	          theme_exposure: currentThemes,
-	          note: canComputePortfolioSizing(snapshot)
-	            ? "Portfolio delta and theme exposure are context only, not standalone candidates or required alert sections."
-	            : "Portfolio delta and theme exposure are context only. Position sizing is unavailable, so do not state true exposure percentages, NAV impact, market value, or portfolio-weight contribution.",
+		          note: (snapshot.sourceAccounts || []).some((row) => Number(row.holdingCount) <= 0)
+		            ? "Portfolio delta and theme exposure are context only. One or more dynamic source accounts returned zero holdings, so sizing/exposure numbers describe the loaded snapshot only, not the full aggregate."
+		            : (canComputePortfolioSizing(snapshot)
+		              ? "Portfolio delta and theme exposure are context only, not standalone candidates or required alert sections."
+		              : "Portfolio delta and theme exposure are context only. Position sizing is unavailable, so do not state true exposure percentages, NAV impact, market value, or portfolio-weight contribution."),
         },
         macro_context: macro,
         coverage_warnings: warningItemsForAnalystInput(warnings),
