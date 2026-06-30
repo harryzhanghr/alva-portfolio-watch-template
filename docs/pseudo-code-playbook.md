@@ -52,11 +52,11 @@ For every current holding, Node 3 first resolves `marketDataSymbol`: ordinary US
 - External breaking-news mapping runs after the per-holding source loop,
   latest-price marking, and current dynamic theme extraction. Code reads the
   configured Breaking News feed over the breaking-news lookback, parses source
-  tickers/tags/classes/sources, and pre-maps direct ticker, option-underlying,
-  theme, and macro/risk-bucket relevance. Pi then reviews those deterministic
-  mappings and cross-checks remaining external events for source-grounded
-  related holdings. This Pi step has no search tools and does not create new
-  news events.
+  tickers/tags/classes plus source evidence from primary source, `sourcesJson`,
+  and `xCandidatesJson`, and pre-maps direct ticker, option-underlying, theme,
+  and macro/risk-bucket relevance. Pi then reviews those deterministic mappings
+  and cross-checks remaining external events for source-grounded related
+  holdings. This Pi step has no search tools and does not create new news events.
 
 For external breaking-news rows, `reportedAt` / `sourceEventTime` is the
 upstream feed's event time, `observedAt` is when that feed first created the
@@ -76,11 +76,11 @@ The page is organized as nodes that mirror the production automation:
 - Node 4 computes price and volume anomaly metrics, marks holdings to Arrays latest price, recomputes market value/weights only when `full_quantity` sizing exists, and calls a Pi Agent once to extract current holding themes from the latest marked portfolio. US-listed holdings and US equity options use hourly regular-session cumulative volume up to the latest regular-session bar, capped at the 16:00 ET market close after hours, compared with historical median cumulative volume at the same point of the trading day. Direct crypto assets use UTC-day cumulative volume.
 - Node 5 fetches timestamped macro context, checks rate repricing for the next
   three Fed decisions, reads the external Breaking News feed, pre-maps direct
-  ticker/theme/macro relevance, and runs a Pi portfolio mapping review for
-  source-grounded related holdings. The node also normalizes event records with
-  dedupe status.
+  ticker/theme/macro relevance, preserves feed source evidence, and runs a Pi
+  portfolio mapping review for source-grounded related holdings. The node also
+  normalizes event records with dedupe status.
 - Node 6 builds two separate lane inputs: event-impact candidates from all non-duplicate event records, including portfolio-level macro/policy/risk/rate-repricing events with no exact holding symbol, and computed `asset_anomalies` from current price/volume anomaly triggers. Portfolio delta and theme-exposure change are context only, not candidates.
-- Node 7 loops through every computed asset anomaly and calls one Alva Ask Anomaly Attribution Agent for that asset. The agent receives the computed anomaly, holding context, related event records, related event candidates, macro context, top portfolio context, and prior user-visible alert history. It should use the Skill Hub why-the-move methodology when available and return an attribution packet with status, driver split, supporting events, confidence, and data-quality notes. This node does not decide push/no-push.
+- Node 7 loops through every computed asset anomaly and calls one Alva Ask Anomaly Attribution Agent for that asset. The agent receives the computed anomaly, holding context, related event records with source evidence when available, related event candidates, macro context, top portfolio context, and prior user-visible alert history. It should use the Skill Hub why-the-move methodology when available and return an attribution packet with status, driver split, supporting events, confidence, and data-quality notes. This node does not decide push/no-push.
 - Node 8 builds the final analyst packet and prompt, calls Alva Ask only when event candidates or anomalies exist, validates the JSON response, and decides push vs no-push. Alva Ask keeps event exposure impact and anomaly attribution as separate flows and final message sections. It qualifies event candidates, estimates event exposure impact itself from the supplied portfolio snapshot and theme context, converts anomaly attribution packets into final anomaly-attribution findings, records the final status/reason for every item, and adds a `decision_lens` to selected findings with thesis impact, risk direction, key levels, scenarios, watch-next items, and optional compliant action framing.
 - Node 9 persists all audit outputs and KV state, including quiet no-push decisions.
 
@@ -89,9 +89,9 @@ The page is organized as nodes that mirror the production automation:
 - Most nodes are deterministic runtime code: config load, Arrays/Polymarket API calls, price and volume calculations, event normalization, dedupe, candidate construction, table appends, and KV writes.
 - The production implementation has two Pi Agent call types through `@alva/pi`:
   - Theme extraction: code calls `agent.ask(buildThemeExtractionPrompt(snapshot, previous))` every run after latest-price marking. It receives supplied portfolio JSON only, uses no tools, and returns themes for current holdings.
-  - External breaking-news portfolio mapping: code reads already source-expanded external events and pre-maps obvious direct ticker, option-underlying, theme, and macro/risk-bucket relevance. Pi reviews code's deterministic mapping, removes wrong links, and adds source-grounded direct, peer, supplier/customer, option-underlying, or high-confidence second-order/value-chain related holdings when supported. It does not search for news, call Brave, expand sources, or decide push/no-push.
+  - External breaking-news portfolio mapping: code reads already source-expanded external events, preserves their source evidence, and pre-maps obvious direct ticker, option-underlying, theme, and macro/risk-bucket relevance. Pi reviews code's deterministic mapping, removes wrong links, and adds source-grounded direct, peer, supplier/customer, option-underlying, or high-confidence second-order/value-chain related holdings when supported. It does not search for news, call Brave, expand sources, or decide push/no-push.
 - The production implementation has two Alva Ask (LLM) call types through `@alva/alvaask`:
-  - Per-asset anomaly attribution: code loops over computed `asset_anomalies` and calls `ask(buildAnomalyAttributionPrompt(anomalyInput), { effort: "high" })` once per anomalous asset. The prompt asks the agent to use the Skill Hub why-the-move methodology when available, verify stale or thin facts with available tools when useful, and return attribution JSON only. These packets are analysis inputs, not final findings.
+  - Per-asset anomaly attribution: code loops over computed `asset_anomalies` and calls `ask(buildAnomalyAttributionPrompt(anomalyInput), { effort: "high" })` once per anomalous asset. The prompt asks the agent to use the Skill Hub why-the-move methodology when available, inspect related source evidence/source text, verify stale or thin facts with available tools when useful, and return attribution JSON only. These packets are analysis inputs, not final findings.
   - Final analyst gate: code calls `ask(buildAnalystPrompt(analystInput))` whenever event-impact candidates or computed asset anomalies exist. First run is context in `portfolio_context.current_portfolio_delta.firstRun`, not an automatic skip. The final analyst now acts as a low-noise PM note generator: selected findings include `decision_lens`, and `notification_message` chooses a compact single-finding note or one bullet per finding for multiple selected findings, with short-link anchors and explicit thesis/risk, key levels, and watch-next.
 - Portfolio reading is deterministic code, not an LLM call: dynamic mode calls the connected-account portfolio API with `X-Alva-Api-Key` auth once per configured account id and aggregates the results; static mode reads the configured ALFS JSON file. The run requires usable `holdings[]` or `tickers[]`.
 - The final analyst gate does not use Pi or ADK and does not run a separate reflection/self-retry loop. It is still an Alva Ask call; if Alva Ask has managed tools available, the prompt permits it to verify suspicious or stale facts before returning JSON.
@@ -108,7 +108,8 @@ The page is organized as nodes that mirror the production automation:
   history is included, persisted finding history is not sent to the analyst,
   and the compact prompt JSON is capped at 1,000,000 characters. The Pi
   external-breaking mapping context JSON is also capped at 1,000,000 characters
-  so current holdings, themes, and source text are visible for mapping.
+  so current holdings, themes, source evidence, and source text are visible for
+  mapping.
 - Completion is checked by code: portfolio JSON must parse and include holdings; analyst JSON must parse and is normalized into stable finding/decision objects. Code no longer applies a separate deterministic repeat override after the analyst decision.
 
 ## Alva Ask Prompt
@@ -153,7 +154,7 @@ The final analyst prompt is intentionally shorter than a full debug spec. It ask
 - write the user-ready notification message;
 - treat event candidates as a long list that must become `selected`, `suppressed`, or `not_qualified` with a reason;
 - estimate event exposure impact inside event findings;
-- use per-asset anomaly attribution packets as the starting point for anomaly findings;
+- use per-asset anomaly attribution packets as the starting point for anomaly findings, while treating computed held-asset anomalies as objective portfolio signals even when attribution is weak;
 - avoid repeats using only user-visible prior alert history, not prior suppressed reasoning;
 - use available tools when submitted facts look wrong, stale, or worth deeper confirmation;
 - write concise user-facing copy without internal workflow words.
@@ -177,7 +178,7 @@ The final analyst prompt is intentionally shorter than a full debug spec. It ask
 - Cost basis, realized P&L, and unrealized P&L are out of scope in this version because broker definitions are not stable enough across providers and tax-lot/accounting methods.
 - Price anomaly triggers are based on `oneDayPct` and return z-score. Current 1D movement uses latest 1min extended-hours price versus the previous regular-session close when newer 1min data exists. For options, this is the underlying equity's latest 1min price versus its previous regular-session close. `fiveDayPct` is retained as context only and does not trigger an anomaly.
 - Volume anomaly triggers are based on `cumulativeVolumeMultiple`: current-day hourly cumulative volume divided by historical median cumulative volume at the same point of the day. For US-listed equities/ETFs and options on US equities, theme does not change the market structure: crypto-related equities still use the US regular session and market-close cap. The old current-hour multiple and current-hour z-score triggers are not used.
-- Anomaly attribution is asset-level. If either price or volume triggers fire for a held asset, code first creates one computed anomaly for that asset. Node 7 then runs one per-asset Alva Ask Anomaly Attribution Agent for that anomaly. The final analyst receives the attribution packet and should produce one final attribution for that asset, not separate price and volume narratives.
+- Anomaly attribution is asset-level. If either price or volume triggers fire for a held asset, code first creates one computed anomaly for that asset. Node 7 then runs one per-asset Alva Ask Anomaly Attribution Agent for that anomaly. The final analyst receives the attribution packet and should produce one final attribution for that asset, not separate price and volume narratives. Weak or unexplained attribution should be labeled with a watch-next rather than suppressed solely because attribution is incomplete.
 - Exposure estimates are not computed as a code step. Alva Ask estimates direct and related portfolio exposure impact inside event-impact findings only when `portfolio_capabilities.canComputeExposurePct` is true. In `ticker_only` mode, the analyst may describe affected holdings/themes but must not invent percentages. Exposure still must not be used to explain anomalies.
 - Repeated push suppression is not a deterministic post-analyst code override. Prior alert history is passed to Alva Ask, while finding history remains persisted for audit/state continuity. The analyst decides whether a repeated narrative has enough new event information or stronger attribution to justify a push.
 
@@ -196,7 +197,7 @@ The code-level event candidate gate is intentionally narrow:
 - Do not require an exact current holding symbol; portfolio-level macro/policy/risk/rate-repricing events can proceed without `affectedSymbols[]`.
 - Keep `seen_before` rows and pass `dedupeStatus`, first/last seen times, optional source timestamp, and source metadata to the analyst.
 - Do not create candidates for portfolio quantity/cash deltas, mark-to-market portfolio deltas, or theme-exposure changes. Those are included only as analyst context.
-- Do not suppress an asset anomaly just because its prior anomaly bucket was similar. If the current asset signal is abnormal, it becomes a computed anomaly for analyst attribution; Alva Ask handles whether it is repeated, weak, or not worth telling the user.
+- Do not suppress an asset anomaly just because attribution is weak, its prior anomaly bucket was similar, or the position is small. If the current asset signal is abnormal, it becomes a computed anomaly for analyst attribution; the final analyst handles repetition and tone using user-visible prior alert history. Prior broad theme, event, or portfolio-bucket notes are context, not prior anomaly coverage.
 - Do not reject candidates for missing `publishedAtMs`, weak keywords, corporate-event date distance, allocation size, or alias ambiguity.
 
 The analyst prompt receives only event records that are referenced by event candidates, capped at 100 rows, and event candidates are capped at 50. It also receives every computed asset anomaly from the current run. The analyst then decides semantic relevance, freshness, novelty, materiality, event exposure impact, anomaly attribution strength, and whether `seen_before` is just stale context or still useful.

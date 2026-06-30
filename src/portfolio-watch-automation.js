@@ -810,6 +810,26 @@ function rawAffectedThemes(item) {
   ).map(normalizeThemeName).filter(Boolean);
 }
 
+function compactSourceEvidenceRows(rows, limit) {
+  return (Array.isArray(rows) ? rows : [])
+    .slice(0, limit || 6)
+    .map((source) => ({
+      kind: clean(source && source.kind || "", 40),
+      publisher: clean(source && source.publisher || "", 80),
+      handle: clean(source && source.handle || "", 80),
+      title: clean(source && source.title || "", 140),
+      url: source && source.url || "",
+      published_at: source && source.published_at || "",
+      source_role: clean(source && source.source_role || "", 60),
+      official_source: !!(source && source.official_source),
+      supports_event: !(source && source.supports_event === false),
+      credibility: clean(source && source.credibility || "", 40),
+      engagement_score: amount(source && source.engagement_score) || 0,
+      evidence_summary: clean(source && source.evidence_summary || "", 220),
+      text_excerpt: clean(source && source.text_excerpt || "", 220),
+    }));
+}
+
 function compactEventCandidateForAudit(candidate) {
   const row = candidate || {};
   const sourceOrigin = row.sourceOrigin || sourceOriginForType(row.candidateType);
@@ -827,6 +847,7 @@ function compactEventCandidateForAudit(candidate) {
     portfolioExposurePct: row.portfolioExposurePct == null ? null : round(row.portfolioExposurePct, 4),
     portfolioExposureText: row.portfolioExposureText || "",
     sourceLinks: row.sourceLinks || [],
+    sourceEvidence: compactSourceEvidenceRows(row.sourceEvidence, 10),
     mappingReason: clean(row.mappingReason || "", 360),
     portfolioLevelEvent: !!row.portfolioLevelEvent,
     riskFactors: row.riskFactors || [],
@@ -871,7 +892,8 @@ function compactEventCandidateForAnalyst(candidate) {
     sourceEventTime: row.sourceEventTime === undefined ? "" : row.sourceEventTime,
     firstSeenAtMs: row.firstSeenAtMs || null,
     lastSeenAtMs: row.lastSeenAtMs || null,
-	    sourceLinks: (row.sourceLinks || (row.url ? [row.url] : [])).slice(0, 2),
+	    sourceLinks: (row.sourceLinks || (row.url ? [row.url] : [])).slice(0, 6),
+	    sourceEvidence: compactSourceEvidenceRows(row.sourceEvidence, 6),
 	    mappingReason: clean(row.mappingReason || row.reason || "", 180),
 	    portfolioLevelEvent: !!row.portfolioLevelEvent,
 	    riskFactors: row.riskFactors || [],
@@ -889,6 +911,7 @@ function compactRawEventForAudit(item) {
   const row = item || {};
   const metadata = row.metadata || {};
   const sourceOrigin = sourceOriginFromEvent(row);
+  const sourceEvidence = metadata.sourceEvidence || metadata.evidenceSources || row.sourceEvidence || [];
   return {
     eventKey: row.eventKey || "",
     sourceType: row.sourceType || "",
@@ -901,6 +924,7 @@ function compactRawEventForAudit(item) {
     affectedSymbols: rawAffectedSymbols(row),
     affectedThemes: rawAffectedThemes(row),
     sourceLinks: row.sourceLinks || metadata.sourceLinks || [],
+    sourceEvidence: compactSourceEvidenceRows(sourceEvidence, 10),
     mappingReason: clean(row.mappingReason || metadata.mappingReason || metadata.whyRelevant || "", 360),
     portfolioLevelEvent: !!metadata.portfolioLevelEvent,
     riskFactors: metadata.riskFactors || [],
@@ -928,6 +952,7 @@ function compactRawEventForAnalyst(item) {
   const row = item || {};
   const metadata = row.metadata || {};
   const sourceOrigin = sourceOriginFromEvent(row);
+  const sourceEvidence = metadata.sourceEvidence || metadata.evidenceSources || row.sourceEvidence || [];
   return {
     eventKey: row.eventKey || "",
     sourceType: row.sourceType || "",
@@ -939,7 +964,8 @@ function compactRawEventForAnalyst(item) {
     affectedThemes: rawAffectedThemes(row),
     sourceOrigin,
     url: row.url || "",
-    sourceLinks: (row.sourceLinks || metadata.sourceLinks || (row.url ? [row.url] : [])).slice(0, 2),
+    sourceLinks: (row.sourceLinks || metadata.sourceLinks || (row.url ? [row.url] : [])).slice(0, 6),
+    sourceEvidence: compactSourceEvidenceRows(sourceEvidence, 6),
     publishedAtMs: row.publishedAtMs || null,
     sourceTimeLabel: metadata.sourceTimeLabel || "",
     sourceEventTime: metadata.sourceEventTime === undefined ? "" : metadata.sourceEventTime,
@@ -1138,6 +1164,19 @@ function mergeUniqueStrings(a, b, maxLen) {
   return uniqueCompactStrings([].concat(a || []).concat(b || []), maxLen || 240);
 }
 
+function mergeSourceEvidenceRows(a, b, limit) {
+  const seen = {};
+  const out = [];
+  [].concat(a || []).concat(b || []).forEach((source) => {
+    if (!source) return;
+    const key = clean(source.url || source.platform_id || source.candidate_id || source.title || source.text_excerpt || "", 500).toLowerCase();
+    if (!key || seen[key]) return;
+    seen[key] = true;
+    out.push(source);
+  });
+  return compactSourceEvidenceRows(out, limit || 12);
+}
+
 function mergeEventMetadata(existing, raw) {
   const metadata = { ...((existing && existing.metadata) || {}) };
   const incoming = (raw && raw.metadata) || {};
@@ -1163,7 +1202,7 @@ function mergeEventMetadata(existing, raw) {
   metadata.riskFactors = mergeUniqueStrings(metadata.riskFactors || [], incoming.riskFactors || [], 80);
   metadata.themes = mergeUniqueStrings(metadata.themes || [], incoming.themes || [], 80);
   metadata.affectedThemes = mergeUniqueStrings(metadata.affectedThemes || [], incoming.affectedThemes || [], 80);
-  metadata.sourceLinks = mergeUniqueStrings(
+	  metadata.sourceLinks = mergeUniqueStrings(
     []
       .concat(metadata.sourceLinks || [])
       .concat(existing && existing.url ? [existing.url] : []),
@@ -1171,9 +1210,15 @@ function mergeEventMetadata(existing, raw) {
       .concat(incoming.sourceLinks || [])
       .concat(raw && raw.sourceLinks ? raw.sourceLinks : [])
       .concat(raw && raw.url ? [raw.url] : []),
-    500
+	    500
+	  );
+  metadata.sourceEvidence = mergeSourceEvidenceRows(
+    metadata.sourceEvidence || metadata.evidenceSources || [],
+    incoming.sourceEvidence || incoming.evidenceSources || raw && raw.sourceEvidence || [],
+    12
   );
-  if (incoming.rateRepricingSupport || String(raw && raw.sourceType || "").toLowerCase() === "rate_repricing_news") {
+  metadata.evidenceSources = metadata.sourceEvidence;
+	  if (incoming.rateRepricingSupport || String(raw && raw.sourceType || "").toLowerCase() === "rate_repricing_news") {
     metadata.rateRepricingSupport = true;
   }
   if (incoming.supportingRateMoveEventIds || metadata.supportingRateMoveEventIds) {
@@ -3995,14 +4040,118 @@ function normalizeExternalList(value) {
   }), 80).map(normalizeThemeName).filter(Boolean);
 }
 
+function pushExternalEvidenceSource(target, item) {
+  const url = clean(item && item.url || "", 500);
+  const title = clean(item && item.title || "", 180);
+  const evidenceSummary = clean(item && item.evidence_summary || item && item.evidenceSummary || "", 280);
+  const textExcerpt = clean(item && item.text_excerpt || item && item.textExcerpt || "", 280);
+  if (!url && !title && !evidenceSummary && !textExcerpt) return;
+  const key = url || normalizeKey([item && item.kind, item && item.publisher, item && item.handle, title, textExcerpt]);
+  if (!key) return;
+  const existing = target.find((row) => row._key === key);
+  const row = {
+    _key: key,
+    _priority: amount(item && item.priority) || 0,
+    kind: clean(item && item.kind || "", 40),
+    publisher: clean(item && item.publisher || item && item.source_name || "", 80),
+    handle: clean(item && item.handle || item && item.username || item && item.author_handle || "", 80),
+    title,
+    url,
+    published_at: item && item.published_at || item && item.publishedAt || "",
+    source_role: clean(item && item.source_role || item && item.sourceRole || "", 60),
+    official_source: boolValue(item && (item.official_source || item.officialSource || item.official || item.is_official)),
+    supports_event: item && item.supports_event === false ? false : true,
+    credibility: clean(item && item.credibility || "", 40),
+    engagement_score: amount(item && item.engagement_score || item && item.engagementScore) || 0,
+    evidence_summary: evidenceSummary,
+    text_excerpt: textExcerpt,
+  };
+  if (existing) {
+    Object.keys(row).forEach((field) => {
+      if (field === "_key") return;
+      if (field === "_priority") existing[field] = Math.max(existing[field] || 0, row[field] || 0);
+      else if (field === "official_source") existing[field] = !!(existing[field] || row[field]);
+      else if (field === "supports_event") existing[field] = existing[field] !== false && row[field] !== false;
+      else if (!existing[field] && row[field]) existing[field] = row[field];
+    });
+    return;
+  }
+  target.push(row);
+}
+
+function compactExternalEvidenceSource(row) {
+  return {
+    kind: row.kind || "",
+    publisher: row.publisher || "",
+    handle: row.handle || "",
+    title: row.title || "",
+    url: row.url || "",
+    published_at: row.published_at || "",
+    source_role: row.source_role || "",
+    official_source: !!row.official_source,
+    supports_event: row.supports_event !== false,
+    credibility: row.credibility || "",
+    engagement_score: row.engagement_score || 0,
+    evidence_summary: row.evidence_summary || "",
+    text_excerpt: row.text_excerpt || "",
+  };
+}
+
+function externalEvidenceSourcesFromEvent(event) {
+  const rows = [];
+  if (event && event.primarySourceUrl) {
+    pushExternalEvidenceSource(rows, {
+      kind: "primary_source",
+      publisher: event.primarySourceName || "",
+      title: event.title || "",
+      url: event.primarySourceUrl,
+      source_role: "primary",
+      supports_event: true,
+      priority: 120,
+    });
+  }
+  (event && event.sources || []).forEach((source) => {
+    const official = boolValue(source && (source.official_source || source.officialSource || source.official));
+    const role = clean(source && (source.source_role || source.sourceRole) || "", 60);
+    const supportsEvent = !(source && source.supports_event === false);
+    pushExternalEvidenceSource(rows, {
+      kind: "feed_source",
+      publisher: source && source.publisher || "",
+      title: source && source.title || "",
+      url: source && source.url || "",
+      source_role: role,
+      official_source: official,
+      supports_event: supportsEvent,
+      credibility: source && source.credibility || "",
+      evidence_summary: source && (source.evidence_summary || source.evidenceSummary) || "",
+      published_at: source && (source.published_at || source.publishedAt) || "",
+      priority: (official ? 115 : 0) + (role === "primary" ? 20 : 0) + (supportsEvent ? 60 : 20),
+    });
+  });
+  (event && event.xCandidates || []).forEach((candidate) => {
+    const official = boolValue(candidate && (candidate.official_source || candidate.officialSource || candidate.official || candidate.is_official));
+    const engagement = amount(candidate && (candidate.engagement_score || candidate.engagementScore)) || 0;
+    pushExternalEvidenceSource(rows, {
+      kind: "x_candidate",
+      handle: candidate && (candidate.handle || candidate.username || candidate.author_handle) || "",
+      title: candidate && (candidate.title || candidate.headline) || "",
+      url: candidate && candidate.url || "",
+      published_at: candidate && (candidate.published_at || candidate.publishedAt) || "",
+      official_source: official,
+      supports_event: candidate && candidate.supports_event === false ? false : true,
+      engagement_score: engagement,
+      text_excerpt: candidate && (candidate.text_excerpt || candidate.textExcerpt || candidate.text || candidate.summary) || "",
+      priority: (official ? 110 : 70) + Math.min(30, Math.log10(Math.max(1, engagement)) * 10),
+    });
+  });
+  return rows
+    .sort((a, b) => (b._priority || 0) - (a._priority || 0))
+    .slice(0, 12)
+    .map(compactExternalEvidenceSource);
+}
+
 function sourceLinksFromExternalEvent(event) {
-  return uniqueCompactStrings(
-    []
-      .concat(event.primarySourceUrl ? [event.primarySourceUrl] : [])
-      .concat((event.sources || []).map((source) => source && source.url))
-      .concat((event.xCandidates || []).map((candidate) => candidate && candidate.url)),
-    500
-  ).slice(0, 8);
+  return uniqueCompactStrings(externalEvidenceSourcesFromEvent(event).map((source) => source && source.url), 500).slice(0, 10);
 }
 
 function normalizeExternalBreakingEvent(row, idx, runAtMs) {
@@ -4013,11 +4162,14 @@ function normalizeExternalBreakingEvent(row, idx, runAtMs) {
   const tickersMentioned = normalizeTickerRows(parseJsonArrayField(row && (row.tickersMentionedJson || row.tickersMentioned)));
   const eventType = normalizeThemeName(row && row.eventType);
   const reportedAtMs = externalBreakingEventTimeMs(row) || runAtMs;
-  const sourceLinks = sourceLinksFromExternalEvent({
-    primarySourceUrl: row && row.primarySourceUrl || "",
-    sources,
-    xCandidates,
-  });
+  const sourceEvidence = externalEvidenceSourcesFromEvent({
+    title: row && row.canonicalHeadline || "",
+    primarySourceName: row && row.primarySourceName || "",
+	    primarySourceUrl: row && row.primarySourceUrl || "",
+	    sources,
+	    xCandidates,
+	  });
+  const sourceLinks = uniqueCompactStrings(sourceEvidence.map((source) => source && source.url), 500).slice(0, 10);
   const sourceText = clean(
     [
       row && row.canonicalHeadline,
@@ -4053,12 +4205,13 @@ function normalizeExternalBreakingEvent(row, idx, runAtMs) {
     marketTags,
     assetClasses,
     tickersMentioned,
-    sources,
-    xCandidates,
-    sourceLinks,
-    sourceText,
-    raw: row || {},
-  };
+	    sources,
+	    xCandidates,
+	    sourceEvidence,
+	    sourceLinks,
+	    sourceText,
+	    raw: row || {},
+	  };
 }
 
 function externalMacroRiskFactors(event) {
@@ -4214,11 +4367,12 @@ function compactExternalEventForMappingAgent(event) {
     breaking_score: event.breakingScore,
     attention_score: event.attentionScore,
     novelty_score: event.noveltyScore,
-    reported_at: event.reportedAt,
-    updated_at: event.updatedAt,
-    primary_source_name: event.primarySourceName,
-    primary_source_url: event.primarySourceUrl,
-    sources: (event.sources || []).slice(0, 5).map((source) => ({
+	    reported_at: event.reportedAt,
+	    updated_at: event.updatedAt,
+	    primary_source_name: event.primarySourceName,
+	    primary_source_url: event.primarySourceUrl,
+	    source_evidence: compactSourceEvidenceRows(event.sourceEvidence, 8),
+	    sources: (event.sources || []).slice(0, 5).map((source) => ({
       publisher: clean(source && source.publisher || "", 80),
       title: clean(source && source.title || "", 180),
       url: source && source.url || "",
@@ -4228,8 +4382,8 @@ function compactExternalEventForMappingAgent(event) {
       credibility: source && source.credibility || "",
       evidence_summary: clean(source && source.evidence_summary || "", 280),
     })),
-    x_candidates: (event.xCandidates || []).slice(0, 3).map((candidate) => ({
-      handle: clean(candidate && candidate.handle || "", 80),
+	    x_candidates: (event.xCandidates || []).slice(0, 6).map((candidate) => ({
+	      handle: clean(candidate && candidate.handle || "", 80),
       url: candidate && candidate.url || "",
       published_at: candidate && candidate.published_at || "",
       engagement_score: amount(candidate && candidate.engagement_score) || 0,
@@ -4435,6 +4589,8 @@ function mergeExternalMapping(event, piMapping) {
 function externalMappingToRawEvent(event, mapping, snapshot) {
   const holdingLevel = holdingLevelRelatedHoldings(mapping.relatedHoldings || []);
   const contextual = contextOnlyRelatedHoldings(mapping.relatedHoldings || []);
+  const sourceEvidence = event.sourceEvidence || externalEvidenceSourcesFromEvent(event);
+  const sourceLinks = uniqueCompactStrings(sourceEvidence.map((source) => source && source.url), 500).slice(0, 10);
   const affectedSymbols = uniqueSymbols(
     []
       .concat(mapping.affectedSymbols || [])
@@ -4457,13 +4613,13 @@ function externalMappingToRawEvent(event, mapping, snapshot) {
     affectedSymbols,
     affectedThemes,
     sourceRecordId: event.externalEventKey || event.externalEventId,
-    title: event.title,
-    summary: event.summary,
-    source: "External Breaking News feed: " + (event.primarySourceName || "breaking-news"),
-    url: event.primarySourceUrl || event.sourceLinks[0] || "",
-    publishedAtMs: event.reportedAtMs,
-    mappingReason: mapping.mappingReason || mapping.portfolioRelevanceBasis || event.whyMarketCares || "",
-    sourceLinks: event.sourceLinks,
+	    title: event.title,
+	    summary: event.summary,
+	    source: "External Breaking News feed: " + (event.primarySourceName || "breaking-news"),
+	    url: event.primarySourceUrl || sourceLinks[0] || "",
+	    publishedAtMs: event.reportedAtMs,
+	    mappingReason: mapping.mappingReason || mapping.portfolioRelevanceBasis || event.whyMarketCares || "",
+	    sourceLinks,
     metadata: {
       sourceOrigin: "external_breaking_news_feed",
       sourceLane: "external_breaking_news",
@@ -4493,10 +4649,12 @@ function externalMappingToRawEvent(event, mapping, snapshot) {
       allRelatedHoldings: mapping.relatedHoldings || [],
       sourceRelatedTickers: event.tickersMentioned,
       tickers: event.tickersMentioned,
-      sourceText: event.sourceText,
-      sources: event.sources,
-      xCandidates: event.xCandidates,
-      sourceLinks: event.sourceLinks,
+	      sourceText: event.sourceText,
+	      sources: event.sources,
+	      xCandidates: event.xCandidates,
+	      sourceEvidence,
+	      evidenceSources: sourceEvidence,
+	      sourceLinks,
       sourceTweetId: sourceTweet.platform_id || sourceTweet.candidate_id || "",
       sourceTweetUrl: sourceTweet.url || "",
       sourceTweetRank: null,
@@ -5356,6 +5514,7 @@ function buildAnomalyAttributionPrompt(input) {
 	    "- A current event is not automatically the cause. It must fit timing, direction, and size.",
 	    "- A narrative can be context, but not a fresh catalyst unless there is a dated new fact or clear same-session market reaction.",
 	    "- related_event_records and event_candidates_for_context are possible context, not causal evidence. Do not treat a portfolio-level or context-only thematic event as a supporting event for this asset unless the source directly names the asset, its product market, peer, customer/supplier chain, or there is clear same-session market reaction in this asset group.",
+	    "- When related records include sourceEvidence or sourceText, review those primary/supporting/X source items before labeling the event stale, rumor, or unsupported.",
 	    "- Broad data-center power/capex or AI-infrastructure buildout news is not by itself a memory, semiconductor, server, or networking catalyst. If it lacks direct product-market transmission or a specific high-confidence second-order value-chain transmission, classify it as background context or weak_correlation, not plausible/confirmed attribution.",
 	    "- If attribution is not strong, return weak_correlation or unexplained and say what the best grounded guess is.",
     "",
@@ -5559,9 +5718,10 @@ function buildEventCandidates(snapshot, eventRecords) {
       affectedSymbols,
       affectedThemes,
       portfolioExposurePct,
-      portfolioExposureText: exposureText,
-      sourceLinks: item.sourceLinks || metadata.sourceLinks || (item.url ? [item.url] : []),
-      mappingReason: item.mappingReason || metadata.mappingReason || metadata.whyRelevant || "",
+	      portfolioExposureText: exposureText,
+	      sourceLinks: item.sourceLinks || metadata.sourceLinks || (item.url ? [item.url] : []),
+	      sourceEvidence: metadata.sourceEvidence || metadata.evidenceSources || item.sourceEvidence || [],
+	      mappingReason: item.mappingReason || metadata.mappingReason || metadata.whyRelevant || "",
       portfolioLevelEvent,
       riskFactors: metadata.riskFactors || [],
       portfolioRelevanceBasis: metadata.portfolioRelevanceBasis || "",
@@ -5614,12 +5774,14 @@ function buildAnalystPrompt(input) {
     "1. Role",
     "- This is portfolio monitoring, not a daily news digest.",
     "- Use the supplied JSON as the base packet. If something looks wrong, stale, or worth deeper confirmation, you may use tools available to verify it. Do not invent facts, prices, catalysts, or source links.",
-    "",
-    "2. Decision mission",
-    "- Judge whether current holdings may be affected, and why.",
-    "- Push only for a material selected event exposure impact or a meaningful selected held-asset anomaly attribution.",
-    "- Do not reject a source because it is opinion, preview, commentary, analyst content, or a calendar item. Judge whether it is a real signal: source authority, specificity, novelty, market influence, changed expectations, near-term catalyst relevance, and portfolio exposure.",
-    "- Choose no_push when the underlying signal or setup is weak, stale, generic, already known, unsupported, low-authority, repetitive, or not portfolio-relevant.",
+	    "",
+	    "2. Decision mission",
+	    "- Judge whether current holdings may be affected, and why.",
+	    "- Select user-visible findings for either material event exposure impacts or held-asset anomalies that add a new user-facing move, attribution, uncertainty, or watchpoint.",
+	    "- Do not reject a source because it is opinion, preview, commentary, analyst content, or a calendar item. Judge whether it is a real signal: source authority, specificity, novelty, market influence, changed expectations, near-term catalyst relevance, and portfolio exposure.",
+	    "- Choose no_push when every available signal is stale, generic, already user-visible, unsupported by the supplied data, semantically wrong, or not relevant to current holdings/themes.",
+	    "- When asset_anomalies is non-empty, no_push is valid only if every computed anomaly fails the anomaly lane selection rule because the data looks wrong or the same asset's abnormal move/watchpoint was already user-visible.",
+	    "- Position size calibrates tone, urgency, and exposure language; it is not by itself a suppression reason.",
     "",
     "3. Two separate lanes",
     "A) Event lane",
@@ -5639,12 +5801,14 @@ function buildAnalystPrompt(input) {
     "",
     "B) Anomaly lane",
     "- asset_anomalies are already computed anomalies, not candidates.",
-    "- anomaly_attribution_packets are prepared by one per-asset Alva Ask Anomaly Attribution Agent using the Skill Hub why-the-move methodology when available.",
-    "- Use those packets as the attribution starting point. Do not redo attribution from scratch unless the packet looks wrong, stale, or weak enough to verify with tools.",
-    "- Produce one final anomalyAttributionFinding for every asset anomaly when possible, combining price and volume triggers for that asset.",
-    "- If the dedicated packet says weak_correlation, unexplained, or agent_error, still return an attribution with that uncertainty clearly labeled.",
-    "- Asset anomalies are worth reporting even when attribution is not confirmed. If attribution is weak, say it is weak and offer the best grounded guess only as a guess.",
-    "- Do not merge event-impact and anomaly-attribution lanes into one causal story unless there is first- or high-confidence second-order evidence. A broad portfolio/theme event may be worth noting separately while an asset move remains continuation, weak_correlation, or unexplained.",
+	    "- anomaly_attribution_packets are prepared by one per-asset Alva Ask Anomaly Attribution Agent using the Skill Hub why-the-move methodology when available.",
+	    "- Use those packets as the attribution starting point. Do not redo attribution from scratch unless the packet looks wrong, stale, or weak enough to verify with tools.",
+	    "- Produce one final anomalyAttributionFinding for every asset anomaly, combining price and volume triggers for that asset.",
+	    "- A computed held-asset anomaly is an objective portfolio signal. Select it unless the data looks wrong or prior_alert_history shows the user already received the same asset move and same attribution/watchpoint.",
+	    "- Prior coverage for an anomaly means the user already received the same asset's abnormal price/volume move or anomaly watchpoint. Prior broad theme, event, or portfolio-bucket notes are context, not prior anomaly coverage.",
+	    "- Weak attribution, low volume confirmation, small position size, or lack of a confirmed catalyst changes confidence, urgency, and wording; it does not change anomaly selection.",
+	    "- If the dedicated packet says weak_correlation, unexplained, or agent_error, still summarize the move with uncertainty clearly labeled and a watch_next item that would confirm or reject the best grounded guess.",
+	    "- Do not merge event-impact and anomaly-attribution lanes into one causal story unless there is first- or high-confidence second-order evidence. A broad portfolio/theme event may be worth noting separately while an asset move remains continuation, weak_correlation, or unexplained.",
     "",
     "4. Novelty and materiality gate",
     "- prior_alert_history is the past 7 days of user-visible run timeline. Empty runs show only that no push was sent; they are not prior suppressed reasoning.",
@@ -5653,14 +5817,14 @@ function buildAnalystPrompt(input) {
     "- A repeated narrative is pushable only if there is genuinely new information, higher urgency, changed uncertainty, or stronger attribution.",
     "- Decide selected/suppressed status before drafting notification_message. Message shape follows the selected findings.",
     "- A repeated portfolio risk bucket can be selected when the current run materially changes the direction of the prior read, such as escalation risk shifting to easing risk premium.",
-    "- A direct held-asset anomaly is selected when the current run adds a material new attribution, thesis change, urgency change, or portfolio impact.",
+	    "- A direct held-asset anomaly is selected when it is new to the user, even if attribution remains weak or unexplained; use lower urgency and clearer uncertainty when sizing or attribution is limited.",
     "- A major macro, geopolitical, regulatory, war/peace, FOMC, CPI, jobs, sanctions, export-control, credit/liquidity, market-structure, or very large company event can be selected even without a clear surprise versus expectations, if it materially changes portfolio risk context.",
     "- Treat major rate-change or rate-expectation repricing as highly important portfolio-level information. If a rate hike, rate cut, Fed path, or market-implied probability change is material and relevant to current holdings, avoid suppressing it merely because it is broad macro or not tied to one company.",
     "- Source records may be new, updated, or seen_before; seen_before is context, not an automatic decision.",
     "- For known upcoming catalysts, avoid hourly repeats. One setup alert is enough unless timing is now closer, expectations changed, positioning/price/volume changed, or new evidence changes what the investor should watch.",
     "- For external_breaking_news records, the standalone Breaking News feed has already handled market-wide discovery, source expansion, source confidence, and event clustering. Treat reportedAt/sourceEventTime as the feed's event time, observedAt as when that feed first created the event, and updatedAt as when it last merged new evidence. Your job is portfolio materiality and notification judgment, not re-discovering the news.",
     "- For indexed-X breaking_news records, publishedAtMs/sourceTimeLabel should reflect the X post freshness when Pi returned it, while metadata.sourceEventTime/sourceEventAtMs is the original/official or earliest credible source time. Compare them; if the X post is fresh but sourceEventTime is old, treat it as resurfaced/newly discussed unless there is clear new information or new market reaction.",
-    "- Do not push routine price-target noise, broad market color with no portfolio implication, weak correlations, or not-qualified event candidates.",
+	    "- Do not push routine price-target noise, broad market color with no portfolio implication, semantically wrong/stale event candidates, or weak-correlation event narratives that are not backed by a current held-asset anomaly.",
 	    "",
 	    "5. Data contract",
 	    "- Dynamic mode reads one or more connected portfolio snapshots each run and aggregates holdings/cash before this analyst step. Static mode reads the configured static portfolio file each run; holdings stay unchanged until setup/update writes a new file.",
@@ -5677,7 +5841,7 @@ function buildAnalystPrompt(input) {
     "- notification_message is user-facing. Private decision fields may mention push/no_push, selected, suppressed, candidates, qualification, or why this run is worth interrupting; notification_message should not.",
     "- Focus on what the investor needs to know now, not why the automation decided to send a notification.",
     "- Choose the message shape based on the selected findings.",
-    "- For one selected finding, write 2-3 short sentences as a compact PM note. Cover what happened, why it matters, portfolio impact when material, and one watchpoint or invalidation. Target 350-600 characters. Use at most one source link.",
+	    "- For one selected finding, write 2-3 short sentences as a compact PM note. Cover what happened, why it matters, portfolio impact when material, and one watchpoint or invalidation. Target 250-450 characters. Use at most one source link.",
     "- For multiple selected findings, use real newlines and '- ' bullets. Use one bullet per selected event_impact or anomaly_attribution finding. Each bullet should be self-contained: event/anomaly, insight, portfolio relevance, thesis/risk read, and watchpoint.",
     "- Use an opening line when it adds synthesis or transition: updating a prior alert, summarizing multiple selected findings, or naming a portfolio-level risk-direction shift. Keep it short and transition-only; reserve detailed numbers and links for the finding text.",
     "- Write like a real portfolio analyst sending a concise note after checking the book. Vary tone based on the situation: sometimes direct, sometimes cautious, sometimes slightly conversational, but it should not feel like a fixed template.",
