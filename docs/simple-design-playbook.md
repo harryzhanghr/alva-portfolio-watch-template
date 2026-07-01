@@ -111,6 +111,10 @@ Current production price / portfolio basis:
   scenarios, watch-next items, and optional compliant action framing. This is
   downstream PM-note framing; sector/cohort anomaly attribution remains owned
   by the upstream why-the-move layer.
+- The final analyst may read an optional per-user
+  `portfolio_watch_preferences.md` file. This is an analyst-only instruction
+  plugin for attention priorities, thesis/risk emphasis, watch-next language,
+  and writing/framing preferences.
 - Pushed notifications are written as chat-readable PM notes: single selected
   findings use 2-3 compact sentences; multiple selected findings use one bullet
   per finding. Each selected event finding carries a short specific source link

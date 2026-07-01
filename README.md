@@ -35,6 +35,9 @@ static portfolio file maintained during setup.
   Short deployment and verification checklist for Alva Skill Agents.
 - `examples/env.args.example.json`  
   Example Alva runtime args. Replace every placeholder before deployment.
+- `examples/portfolio_watch_preferences.example.md`  
+  Optional analyst-only preference plugin template. Copy its contents into the
+  user's own ALFS preferences file when desired.
 
 ## For Alva Skill Agents
 
@@ -68,6 +71,10 @@ Ask for or infer these from Alva workspace state:
   `~/feeds/breaking-news/v1/data/events/current`, resolved under the deploying
   Alva user. Set an absolute `/alva/home/<username>/...` path to use a shared
   Breaking News feed instead.
+- Optional `portfolioWatchPreferencesPath`. By default the analyst reads
+  `~/portfolio-watch/portfolio_watch_preferences.md` when that file exists.
+  This is a lightweight per-user instruction plugin for attention priorities,
+  thesis/risk emphasis, watch-next language, and writing/framing preferences.
 - Optional `aliases`: ticker/company aliases for better event matching.
 - Optional `fallbackThemeMap`: continuity fallback only. The automation extracts
   current themes every run with Alva Ask, so do not overfit this map.
@@ -95,6 +102,8 @@ Pass these through `env.args` when creating the automation:
   },
   "breakingNewsSourceMode": "external_feed",
   "externalBreakingNewsFeedPath": "~/feeds/breaking-news/v1/data/events/current",
+  "portfolioWatchPreferencesPath": "~/portfolio-watch/portfolio_watch_preferences.md",
+  "portfolioWatchPreferencesMaxChars": 30000,
   "externalBreakingNewsPiChunkSize": 20,
   "externalBreakingNewsPiRetryCount": 1,
   "aliases": {
@@ -139,18 +148,20 @@ tickers.
    (`accountIds` / `connectedAccountIds` / `portfolioAccountIds` for dynamic,
    or `staticPortfolioPath` for static).
 3. Schedule the automation hourly, for example `0 * * * *`.
-4. Create or update an audit playbook from `playbooks/audit-log/index.html`.
-5. Configure the audit playbook by editing constants or opening with query
+4. Optionally create `~/portfolio-watch/portfolio_watch_preferences.md` with
+   user-specific analyst preferences. Missing preference files are allowed.
+5. Create or update an audit playbook from `playbooks/audit-log/index.html`.
+6. Configure the audit playbook by editing constants or opening with query
    params:
 
 ```text
 ?username=<ALVA_USERNAME>&feed_name=portfolio-watch-automation&feed_id=<FEED_ID>&cronjob_id=<CRONJOB_ID>
 ```
 
-6. Run one manual dry run before enabling push behavior.
-7. Inspect `audit.run_log`, `analysis.decision`, `event.items`, and
+7. Run one manual dry run before enabling push behavior.
+8. Inspect `audit.run_log`, `analysis.decision`, `event.items`, and
    `notify.message`.
-8. Confirm quiet runs write `<|SKIP_NOTIFICATION|>` and do not emit duplicate
+9. Confirm quiet runs write `<|SKIP_NOTIFICATION|>` and do not emit duplicate
    user-visible alerts.
 
 ### Non-Negotiable Implementation Rules
@@ -189,6 +200,10 @@ tickers.
   final analyst pass.
 - Alva Ask analyst decides event qualification, final anomaly wording,
   selected/suppressed status, decision-lens PM framing, and final push/no-push.
+- The final analyst may read an optional per-user preferences Markdown file.
+  Preferences guide attention and framing, but they are not market facts and do
+  not override source evidence, portfolio facts, source constraints, or
+  compliance framing.
 - Pushed notifications should read like short PM notes: single selected findings
   use 2-3 compact sentences, while multiple selected findings use one bullet per
   finding. Each selected event finding should carry a short source link when
@@ -212,7 +227,8 @@ tickers.
 │   ├── alva-skill-agent-checklist.md
 │   └── breaking-news-origin-source-requirement.md
 └── examples/
-    └── env.args.example.json
+    ├── env.args.example.json
+    └── portfolio_watch_preferences.example.md
 ```
 
 ## Human Overview
