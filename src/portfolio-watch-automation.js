@@ -67,6 +67,9 @@ const CONFIG = {
   maxAnalystPromptChars: 1000000,
   maxAnomalyAttributionPromptChars: 1000000,
   maxPiPromptContextChars: 1000000,
+  portfolioWatchPreferencesEnabled: parseBoolArg(ARGS.portfolioWatchPreferencesEnabled, true),
+  portfolioWatchPreferencesPath: String(ARGS.portfolioWatchPreferencesPath || "~/portfolio-watch/portfolio_watch_preferences.md"),
+  portfolioWatchPreferencesMaxChars: numericArg(ARGS.portfolioWatchPreferencesMaxChars, 30000),
   timeouts: {
     runBudgetMs: numericArg(ARGS.runBudgetMs || (ARGS.timeouts && ARGS.timeouts.runBudgetMs), 45 * 60 * 1000),
     themeExtractionMs: numericArg(ARGS.themeExtractionTimeoutMs || (ARGS.timeouts && ARGS.timeouts.themeExtractionMs), 12 * 60 * 1000),
@@ -274,6 +277,7 @@ feed.def("analysis", {
     str("rawAnalystJson"),
     str("analystDecisionJson"),
     str("analystPromptCoverageJson"),
+    str("portfolioWatchPreferencesJson"),
     num("runAtMs"),
   ]),
 });
@@ -313,6 +317,7 @@ feed.def("audit", {
     str("anomalySignalsJson"),
     str("analystDecisionJson"),
     str("analystPromptCoverageJson"),
+    str("portfolioWatchPreferencesJson"),
     str("notificationPreview"),
     str("warningsJson"),
     num("runStartedAtMs"),
@@ -445,6 +450,65 @@ function resolveAlfsPath(path) {
     return "/alva/home/" + ALFS_USERNAME + raw.slice(1);
   }
   return raw;
+}
+
+function simpleTextHash(text) {
+  const raw = String(text || "");
+  let hash = 2166136261;
+  for (let i = 0; i < raw.length; i += 1) {
+    hash ^= raw.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function compactPortfolioWatchPreferencesForAudit(preferences) {
+  const row = preferences || {};
+  return {
+    enabled: !!row.enabled,
+    loaded: !!row.loaded,
+    path: row.path || "",
+    chars: Number(row.chars) || 0,
+    truncated: !!row.truncated,
+    hash: row.hash || "",
+    error: row.error || "",
+  };
+}
+
+async function readPortfolioWatchPreferences(warnings) {
+  const enabled = !!CONFIG.portfolioWatchPreferencesEnabled;
+  const path = resolveAlfsPath(CONFIG.portfolioWatchPreferencesPath);
+  const base = { enabled, loaded: false, path, chars: 0, truncated: false, hash: "", error: "", text: "" };
+  if (!enabled || !path) return base;
+  try {
+    const rawText = String(await alfs.readFile(path) || "");
+    let text = cleanMultiline(rawText);
+    const originalChars = text.length;
+    const truncated = CONFIG.portfolioWatchPreferencesMaxChars > 0 && text.length > CONFIG.portfolioWatchPreferencesMaxChars;
+    if (truncated) text = text.slice(0, CONFIG.portfolioWatchPreferencesMaxChars - 3).trim() + "...";
+    if (truncated && Array.isArray(warnings)) {
+      warnings.push({
+        source: "portfolio-watch-preferences",
+        error: "preferences file truncated from " + originalChars + " to " + text.length + " chars for analyst input",
+      });
+    }
+    return {
+      enabled,
+      loaded: !!text,
+      path,
+      chars: text.length,
+      truncated,
+      hash: text ? simpleTextHash(text) : "",
+      error: "",
+      text,
+    };
+  } catch (err) {
+    const error = String(err && err.message ? err.message : err).slice(0, 260);
+    if (!/not found|no such file|404/i.test(error) && Array.isArray(warnings)) {
+      warnings.push({ source: "portfolio-watch-preferences", error: "optional preferences file not loaded: " + error });
+    }
+    return { ...base, error };
+  }
 }
 
 function parseTechnicalDetectors(value) {
@@ -5774,6 +5838,9 @@ function buildAnalystPrompt(input) {
     "1. Role",
     "- This is portfolio monitoring, not a daily news digest.",
     "- Use the supplied JSON as the base packet. If something looks wrong, stale, or worth deeper confirmation, you may use tools available to verify it. Do not invent facts, prices, catalysts, or source links.",
+    "- If portfolio_watch_preferences_note is supplied, treat it as this user's Portfolio Watch instruction plugin. Prioritize it for attention priorities, writing/framing choices, thesis/risk emphasis, and watch-next language.",
+    "- If portfolio_watch_preferences_note conflicts with generic analyst instructions, follow the user preferences while still respecting supplied evidence, portfolio facts, source constraints, and compliance framing.",
+    "- Preferences are instructions, not market facts; do not invent facts from them.",
 	    "",
 	    "2. Decision mission",
 	    "- Judge whether current holdings may be affected, and why.",
@@ -6315,10 +6382,11 @@ function buildPersistDeltaRows(input) {
         eventCandidateCount: (input.eventCandidates || []).length,
         qualifiedEventCount: laneArtifacts.qualifiedEvents.length,
         selectedEventCount: laneArtifacts.selectedEvents.length,
-        anomalyCount: (input.anomalies || []).length,
-        anomalyAttributionCount: laneArtifacts.anomalyAttributions.length,
-        abnormalAssets: (input.priceSignals || []).filter((s) => s && s.abnormal).map((s) => s.symbol),
-      },
+	        anomalyCount: (input.anomalies || []).length,
+	        anomalyAttributionCount: laneArtifacts.anomalyAttributions.length,
+	        abnormalAssets: (input.priceSignals || []).filter((s) => s && s.abnormal).map((s) => s.symbol),
+	        portfolioWatchPreferences: compactPortfolioWatchPreferencesForAudit(input.portfolioWatchPreferences || {}),
+	      },
       pointer: { path: feedDataPath("analysis", "decision", "@last/50"), runAtMs },
     },
     {
@@ -6409,8 +6477,9 @@ function buildRunAudit(input) {
   const candidates = input.candidates || eventCandidates.concat(anomalies.map(anomalyAsLegacyCandidate));
   const analyst = input.analyst || { findings: [], decision: buildFallbackDecision("unknown") };
   const decision = analyst.decision || {};
-  const laneArtifacts = input.laneArtifacts || buildLaneArtifacts(eventCandidates, anomalies, analyst, input.anomalyAttributionPackets || []);
-  const abnormalSignals = priceSignals
+	  const laneArtifacts = input.laneArtifacts || buildLaneArtifacts(eventCandidates, anomalies, analyst, input.anomalyAttributionPackets || []);
+	  const portfolioWatchPreferences = compactPortfolioWatchPreferencesForAudit(input.portfolioWatchPreferences || {});
+	  const abnormalSignals = priceSignals
     .filter((signal) => signal && signal.abnormal)
     .map((signal) => ({
       symbol: signal.symbol,
@@ -6449,10 +6518,11 @@ function buildRunAudit(input) {
     normalizedEventCount: eventRecords.length,
     normalizedEventDedupeCounts: eventStatusCounts,
     macroKeys: Object.keys(input.macro || {}).filter((key) => key !== "_meta"),
-    macroFreshness: macroFreshnessSummary(input.macro || {}),
-    searchExpansionTrace,
-    warningCount: (input.warnings || []).length,
-  };
+	    macroFreshness: macroFreshnessSummary(input.macro || {}),
+	    searchExpansionTrace,
+	    portfolioWatchPreferences,
+	    warningCount: (input.warnings || []).length,
+	  };
 	  const llmDecision = {
 	    portfolioReader: {
 	      environment: "Code",
@@ -6497,9 +6567,10 @@ function buildRunAudit(input) {
       skipReason: input.analystCallMode === "alva_ask" ? "" : (decision.skipReason || decision.reason || ""),
       toolLoop: false,
       browsing: false,
-      promptContract: input.analystPromptSummary || {},
-      promptCoverage: input.analystPromptCoverage || {},
-      parsedDecision: decision,
+	      promptContract: input.analystPromptSummary || {},
+	      promptCoverage: input.analystPromptCoverage || {},
+	      portfolioWatchPreferences,
+	      parsedDecision: decision,
       selectedFindings: selectedFindings.map((f) => ({ findingId: f.findingId, type: f.findingType, primaryAsset: f.primaryAsset, summary: f.summary })),
       eventCandidateStatuses: laneArtifacts.finalStatuses.eventCandidates,
       anomalyStatuses: laneArtifacts.finalStatuses.anomalies,
@@ -6829,15 +6900,16 @@ function buildRunAudit(input) {
 	    warnings.push.apply(warnings, ingestWarnings);
 	    if (snapshot.asOfMsEstimated) {
 	      warnings.push({ source: "portfolio:asOfMs", error: "portfolio snapshot did not provide asOfMs; runAtMs used for audit only" });
-	    } else if (Number.isFinite(snapshot.asOfMs)) {
-	      const snapshotAgeHours = (runAtMs - snapshot.asOfMs) / 3600000;
-	      if (snapshotAgeHours > CONFIG.portfolioSnapshotStaleWarningHours) {
-	        warnings.push({
-	          source: "portfolio:asOfMs",
-	          error: "portfolio snapshot is " + round(snapshotAgeHours, 1) + "h old; configured holdings/cash may lag recent changes",
-	        });
-	      }
-	    }
+		    } else if (Number.isFinite(snapshot.asOfMs)) {
+		      const snapshotAgeHours = (runAtMs - snapshot.asOfMs) / 3600000;
+		      if (snapshotAgeHours > CONFIG.portfolioSnapshotStaleWarningHours) {
+		        warnings.push({
+		          source: "portfolio:asOfMs",
+		          error: "portfolio snapshot is " + round(snapshotAgeHours, 1) + "h old; configured holdings/cash may lag recent changes",
+		        });
+		      }
+		    }
+		    const portfolioWatchPreferences = await readPortfolioWatchPreferences(warnings);
     if (previous && previous.markVersion !== CONFIG.snapshotMarkVersion) {
       warnings.push({ source: "lastSnapshot", error: "previous snapshot schema migrated; suppressing one-run portfolio delta baseline" });
       previous = null;
@@ -6931,8 +7003,9 @@ function buildRunAudit(input) {
       outsidePromptCapEventCandidates: eventCandidates.length,
       maxPromptCandidates: CONFIG.maxPromptCandidates,
       sortPolicy: "stable_original_order_except_seen_before_after_non_seen_before",
-      promptCandidateIds: [],
-    };
+	      promptCandidateIds: [],
+	      portfolioWatchPreferences: compactPortfolioWatchPreferencesForAudit(portfolioWatchPreferences),
+	    };
     if (!reviewItemCount) {
       analyst.decision = buildFallbackDecision("no event candidate or asset anomaly was built");
     } else {
@@ -6944,18 +7017,21 @@ function buildRunAudit(input) {
         outsidePromptCapEventCandidates: Math.max(0, eventCandidates.length - analystEventCandidates.length),
         maxPromptCandidates: CONFIG.maxPromptCandidates,
         sortPolicy: "stable_original_order_except_seen_before_after_non_seen_before",
-        seenBeforePromptCandidates: analystEventCandidates.filter(candidateSeenBefore).length,
-        seenBeforeTotalEventCandidates: eventCandidates.filter(candidateSeenBefore).length,
-        promptCandidateIds: analystPromptCandidateIds,
-      };
-	      const analystInput = {
-	        account_id: snapshotAccountId(snapshot),
-	        account_ids: snapshot.accountIds || [],
-	        portfolio_mode: snapshot.portfolioMode,
-	        position_completeness: snapshot.positionCompleteness,
-	        portfolio_capabilities: snapshot.portfolioCapabilities,
-	        run_at_hkt: hkt(runAtMs),
-        event_candidates_to_review: analystEventCandidates.map(compactEventCandidateForAnalyst),
+	        seenBeforePromptCandidates: analystEventCandidates.filter(candidateSeenBefore).length,
+	        seenBeforeTotalEventCandidates: eventCandidates.filter(candidateSeenBefore).length,
+	        promptCandidateIds: analystPromptCandidateIds,
+	        portfolioWatchPreferences: compactPortfolioWatchPreferencesForAudit(portfolioWatchPreferences),
+	      };
+		      const analystInput = {
+		        account_id: snapshotAccountId(snapshot),
+		        account_ids: snapshot.accountIds || [],
+		        portfolio_mode: snapshot.portfolioMode,
+		        position_completeness: snapshot.positionCompleteness,
+		        portfolio_capabilities: snapshot.portfolioCapabilities,
+		        run_at_hkt: hkt(runAtMs),
+		        portfolio_watch_preferences_note: portfolioWatchPreferences.text || "",
+		        portfolio_watch_preferences_source: compactPortfolioWatchPreferencesForAudit(portfolioWatchPreferences),
+	        event_candidates_to_review: analystEventCandidates.map(compactEventCandidateForAnalyst),
         event_candidate_prompt_coverage: {
           total_event_candidates: analystPromptCoverage.totalEventCandidates,
           prompt_event_candidates: analystPromptCoverage.promptEventCandidates,
@@ -7023,8 +7099,9 @@ function buildRunAudit(input) {
         toolLoop: "alva_ask_managed_if_needed",
         browsing: "alva_ask_managed_if_needed",
         suppliedJsonOnly: false,
-	        requiredInputs: ["portfolio_mode", "position_completeness", "portfolio_capabilities", "prior_alert_history", "event_candidates_to_review", "asset_anomalies", "anomaly_attribution_packets", "asset_anomaly_metrics", "portfolio_context"],
-        inputCounts: {
+		        requiredInputs: ["portfolio_mode", "position_completeness", "portfolio_capabilities", "prior_alert_history", "event_candidates_to_review", "asset_anomalies", "anomaly_attribution_packets", "asset_anomaly_metrics", "portfolio_context"],
+		        optionalInputs: ["portfolio_watch_preferences_note"],
+	        inputCounts: {
           eventCandidates: eventCandidates.length,
           eventCandidatesInPrompt: analystEventCandidates.length,
           eventCandidatesOutsidePromptCap: analystPromptCoverage.outsidePromptCapEventCandidates,
@@ -7034,19 +7111,22 @@ function buildRunAudit(input) {
           totalReviewItems: reviewItemCount,
           eventRecords: analystInput.event_records.length,
           priorAlertHistoryRows: analystInput.prior_alert_history.length,
-          rateRepricingComputedEvents: (rateRepricing.summary && rateRepricing.summary.computedEventCount) || 0,
-          rateRepricingNewsEvents: (rateRepricing.summary && rateRepricing.summary.newsEventCount) || 0,
-        },
-        caps: {
+	          rateRepricingComputedEvents: (rateRepricing.summary && rateRepricing.summary.computedEventCount) || 0,
+	          rateRepricingNewsEvents: (rateRepricing.summary && rateRepricing.summary.newsEventCount) || 0,
+	          portfolioWatchPreferencesLoaded: !!portfolioWatchPreferences.loaded,
+	          portfolioWatchPreferencesChars: portfolioWatchPreferences.chars || 0,
+	        },
+	        caps: {
           eventRecords: CONFIG.maxPromptEvents,
           eventCandidates: CONFIG.maxPromptCandidates,
           eventCandidateSortPolicy: analystPromptCoverage.sortPolicy,
           analystPromptChars: CONFIG.maxAnalystPromptChars,
           anomalyAttributionPromptChars: CONFIG.maxAnomalyAttributionPromptChars,
-          timeouts: CONFIG.timeouts,
-          priorAlertTimelineDays: CONFIG.priorAlertTimelineDays,
-          priorAlertTimelineRows: CONFIG.maxPriorAlertTimelineRows,
-        },
+	          timeouts: CONFIG.timeouts,
+	          priorAlertTimelineDays: CONFIG.priorAlertTimelineDays,
+	          priorAlertTimelineRows: CONFIG.maxPriorAlertTimelineRows,
+	          portfolioWatchPreferencesChars: CONFIG.portfolioWatchPreferencesMaxChars,
+	        },
         outputSchema: ["eventCandidateStatuses[]", "eventImpactFindings[] with exposure_impact and decision_lens", "anomalyAttributionFindings[] with decision_lens", "decision.message_sections.event_exposure_impacts/anomaly_attributions", "decision.notification_message as chat-readable PM note"],
       };
       const analystText = String(ask(buildAnalystPrompt(analystInput), { timeoutMs: CONFIG.timeouts.analystMs }).text || "");
@@ -7207,11 +7287,12 @@ function buildRunAudit(input) {
       candidateSummaryJson: compactJson({ eventCandidates, qualifiedEvents: laneArtifacts.qualifiedEvents, selectedEvents: laneArtifacts.selectedEvents, anomalies, anomalyAttributionPackets, anomalyAttributions: laneArtifacts.anomalyAttributions, finalStatuses: laneArtifacts.finalStatuses, candidates, priceSignals }, 160000),
       candidateAuditJson: compactJson(decisionAuditArtifacts.candidateAudit),
       anomalySignalsJson: compactJson(decisionAuditArtifacts.anomalySignals),
-      rawAnalystJson,
-      analystDecisionJson: compactJson(analyst.decision || {}, 60000),
-      analystPromptCoverageJson: compactJson(analystPromptCoverage, 40000),
-      runAtMs,
-    }]);
+	      rawAnalystJson,
+	      analystDecisionJson: compactJson(analyst.decision || {}, 60000),
+	      analystPromptCoverageJson: compactJson(analystPromptCoverage, 40000),
+	      portfolioWatchPreferencesJson: compactJson(compactPortfolioWatchPreferencesForAudit(portfolioWatchPreferences), 4000),
+	      runAtMs,
+	    }]);
 
     await ctx.self.ts("notify", "message").append([{
       date: runAtMs,
@@ -7278,9 +7359,10 @@ function buildRunAudit(input) {
       notifyTitle,
       notifyBody,
       alertEntry,
-      alertHistorySize: alertHistory.length,
-      findingHistorySize: findingHistory.length,
-    });
+	      alertHistorySize: alertHistory.length,
+	      findingHistorySize: findingHistory.length,
+	      portfolioWatchPreferences,
+	    });
     const runCompletedAtMs = Date.now();
     const audit = buildRunAudit({
       runAtMs,
@@ -7310,9 +7392,10 @@ function buildRunAudit(input) {
       candidates,
       analyst,
       analystCallMode,
-      analystPromptSummary,
-      analystPromptCoverage,
-      rawAnalystJson,
+	      analystPromptSummary,
+	      analystPromptCoverage,
+	      portfolioWatchPreferences,
+	      rawAnalystJson,
       shouldPush,
       notifyTitle,
       notifyBody,
@@ -7345,9 +7428,10 @@ function buildRunAudit(input) {
       searchExpansionTraceJson: compactJson(audit.searchExpansionTrace, 120000),
       candidateAuditJson: compactJson(audit.auditArtifacts.candidateAudit),
       anomalySignalsJson: compactJson(audit.auditArtifacts.anomalySignals),
-      analystDecisionJson: compactJson(analyst.decision || {}, 60000),
-      analystPromptCoverageJson: compactJson(analystPromptCoverage, 40000),
-      notificationPreview: clean(notifyBody === SKIP ? "SKIP_NOTIFICATION sentinel" : notifyBody, 1600),
+	      analystDecisionJson: compactJson(analyst.decision || {}, 60000),
+	      analystPromptCoverageJson: compactJson(analystPromptCoverage, 40000),
+	      portfolioWatchPreferencesJson: compactJson(compactPortfolioWatchPreferencesForAudit(portfolioWatchPreferences), 4000),
+	      notificationPreview: clean(notifyBody === SKIP ? "SKIP_NOTIFICATION sentinel" : notifyBody, 1600),
       warningsJson: compactJson(warnings, 12000),
       runStartedAtMs: runAtMs,
       runCompletedAtMs,
