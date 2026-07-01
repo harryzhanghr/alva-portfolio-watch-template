@@ -113,8 +113,8 @@ Current production price / portfolio basis:
   by the upstream why-the-move layer.
 - Pushed notifications are written as chat-readable PM notes: single selected
   findings use 2-3 compact sentences; multiple selected findings use one bullet
-  per finding. Both forms keep short specific link anchors and explicit
-  thesis/risk/key-level/watch-next framing.
+  per finding. Each selected event finding carries a short specific source link
+  when available, alongside explicit thesis/risk/key-level/watch-next framing.
 - `prior_alert_history` sent to the analyst is a past-7-day user-visible run
   timeline. Empty runs only show the run time and `userReceivedPush=false`;
   pushed runs carry the user-facing notification message and selected IDs.
