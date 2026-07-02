@@ -195,6 +195,8 @@ tickers.
   Fed decisions and adds only material probability changes to the event lane.
 - Event lane and anomaly lane are separate.
 - Event candidates are a review long list, not pre-approved findings.
+- Event candidates are judged on thesis/risk/watchpoint and portfolio exposure
+  impact; they do not need to explain a same-session asset anomaly.
 - Anomalies are computed facts, not event candidates.
 - Each computed anomaly gets a per-asset Alva Ask attribution packet before the
   final analyst pass.

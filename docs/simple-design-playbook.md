@@ -97,6 +97,9 @@ Current production price / portfolio basis:
   holdings, including peer, supplier/customer, and high-confidence
   second-order/value-chain links. This mapper does not search for news, expand
   sources, or decide push/no-push.
+- Event-impact findings are judged on thesis/risk/watchpoint and portfolio
+  exposure impact, not on whether the event explains the same-session price
+  anomaly. Price-move attribution remains in the separate anomaly lane.
 - Mark-to-market movement is explicitly not treated as a user trade and is
   context only unless the asset also has a current anomaly trigger.
 - `cashChangeUsd` is tracked separately from cash percentage drift, so
